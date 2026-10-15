@@ -117,7 +117,10 @@ class SimulatedUser(AgentAdapter):
         if classification not in CLASSIFICATIONS:
             raise ModelReplyError(f"Unknown classification from the simulated user: {data!r}")
         self.classifications.append(classification)
-        if data.get("revealed_hidden_step") is True:
+        # A claimed reveal counts only while unrevealed hidden steps remain.
+        if data.get("revealed_hidden_step") is True and self.hints_used < len(
+            self._task.metadata.hidden_steps
+        ):
             self.hints_used += 1
         if data.get("give_up") is True:
             self.gave_up = True

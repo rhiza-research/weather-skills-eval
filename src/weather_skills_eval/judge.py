@@ -107,6 +107,6 @@ def rate_answer(
     )
     data = reply_json(response)
     score = data.get("score")
-    if not isinstance(score, int) or not 1 <= score <= 5:
+    if isinstance(score, bool) or not isinstance(score, int) or not 1 <= score <= 5:
         raise ValueError(f"Answer quality is not an integer from 1 to 5: {data!r}")
     return score, str(data.get("reasoning") or "")

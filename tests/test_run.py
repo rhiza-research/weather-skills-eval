@@ -3,12 +3,24 @@ fake Docker, fake Langfuse and fake harness models."""
 
 import textwrap
 
+import docker.errors
 import pytest
-from fakes import FakeApp, FakeClock, FakeContainer, FakeDocker, FakeGateway, FakeModels, Reply
+from fakes import (
+    APP_REPOSITORY,
+    FakeApp,
+    FakeClock,
+    FakeContainer,
+    FakeDocker,
+    FakeGateway,
+    FakeModels,
+    Reply,
+    broadcast_observations,
+)
 
 from weather_skills_eval.config import ConfigError
 from weather_skills_eval.instance import AppStartError
-from weather_skills_eval.runner import run
+from weather_skills_eval.runner import DatasetError, run
+from weather_skills_eval.tasks import TaskError
 
 ENVIRON = {
     "LANGFUSE_PUBLIC_KEY": "pk-test",
@@ -77,13 +89,13 @@ def progress(message="go on", classification="progress", hint=False):
 
 
 class Harness:
-    def __init__(self, tmp_path, items, reply, user_replies=None, container=None):
+    def __init__(self, tmp_path, items, reply, user_replies=None, container=None, **docker_options):
         self.clock = FakeClock()
         self.app = FakeApp(reply, self.clock)
         self.models = FakeModels(user_replies)
         self.gateway = FakeGateway(items, self.models)
         self.container = container or FakeContainer(["running"])
-        self.docker = FakeDocker(self.container)
+        self.docker = FakeDocker(self.container, **docker_options)
         self.config_path = tmp_path / "production-agent.yaml"
         self.config_path.write_text(CONFIG)
         self.health_checks = 0
@@ -150,14 +162,25 @@ def test_run_plays_every_task_into_one_experiment_and_removes_the_container(tmp_
     for index in range(3):
         assert harness.scores(index)["goal_reached"] == 1.0
     metadata = experiment["metadata"]
-    assert metadata["image_digest"] == "ghcr.io/x/app@sha256:abc"
+    # The configured image is pulled, and the digest of its repository recorded.
+    assert harness.docker.pulled == ["ghcr.io/rhiza-research/weather-skills-chat:test"]
+    assert metadata["image_digest"] == f"{APP_REPOSITORY}@sha256:abc"
     assert "OPENAI_API_KEYS" in metadata["env_var_names"].split(",")
     assert "1234567" in metadata["skill_packs"]
+    assert metadata["tool_ids"] == "plot-2,fetch"
+    assert metadata["harness_commit"] == "unrecorded"
+    assert metadata["dataset"] == "weather-tasks"
+    assert metadata["dataset_version"] == "latest"
+    assert metadata["dataset_items"] == "3"
     assert all(isinstance(v, str) for v in metadata.values())
     assert summary.items == 3 and summary.goals_reached == 3
     assert harness.gateway.linked == ["chat-1", "chat-2", "chat-3"]
+    assert harness.gateway.flushed
+    for index in range(3):
+        assert harness.output(index)["trace_scores"] == "complete"
     # Highest version per skill name, other tools kept.
     assert harness.app.completions[0]["tool_ids"] == ["plot-2", "fetch"]
+    assert harness.docker.list_filters == [{"label": "weather-skills-eval=app"}]
 
 
 def test_goal_met_records_turns_cost_tokens_and_time(tmp_path):
@@ -236,6 +259,8 @@ def test_turn_limit_ends_as_failure_with_its_scores(tmp_path):
     assert scores["turns_to_goal"] == 3
     assert scores["model_calls_to_goal"] == 6
     assert "time_to_answer_seconds" in scores
+    # The judge's last check ends the reasoning.
+    assert "(last check: verdict failed)" in output["reasoning"]
 
 
 def test_user_gives_up_ends_as_failure(tmp_path):
@@ -294,11 +319,15 @@ def test_chat_error_fails_that_play_and_others_continue(tmp_path):
     assert failed["outcome"] == "chat_error"
     assert "Model not found" in failed["error"]
     assert harness.scores(0)["goal_reached"] == 0.0
+    # The failed turn reached the app, so its trace is awaited; no reply, no rating.
+    assert harness.gateway.observation_requests[0] == ("chat-1", 1)
+    assert "answer_quality" not in harness.scores(0)
+    assert harness.scores(0)["time_to_answer_seconds"] == 0.0
     assert harness.output(1)["outcome"] == "goal_reached"
     assert harness.container.removed
 
 
-def test_chat_http_error_fails_that_play(tmp_path):
+def test_chat_http_error_fails_that_play_without_waiting_for_traces(tmp_path):
     items = [task("t1", "rain forecast kenya")]
 
     def reply(opening, number, text):
@@ -310,6 +339,175 @@ def test_chat_http_error_fails_that_play(tmp_path):
     output = harness.output()
     assert output["outcome"] == "chat_error"
     assert "429" in output["error"]
+    # The completion request was refused, so no trace is awaited.
+    assert harness.gateway.observation_requests == []
+    assert output["trace_scores"] == "missing: no turn reached the app"
+    assert "answer_quality" not in harness.scores()
+
+
+def test_later_failed_turn_waits_only_for_turns_that_reached_the_app(tmp_path):
+    items = [task("t1", "rain forecast kenya", turn_limit=4)]
+
+    def reply(opening, number, text):
+        if number == 2:
+            return Reply(error="busy", http_status=409)
+        return Reply("Which region do you need?")
+
+    harness = Harness(tmp_path, items, reply)
+    harness.run()
+
+    assert harness.output()["outcome"] == "chat_error"
+    assert harness.gateway.observation_requests == [("chat-1", 1)]
+    scores = harness.scores()
+    assert scores["turns_to_goal"] == 2
+    assert scores["time_to_answer_seconds"] == 5.0
+    # The first turn got a reply, so the answer is still rated.
+    assert scores["answer_quality"] == 4
+
+
+def test_langfuse_error_keeps_the_other_scores(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+
+    def fail(chat_id, turns):
+        raise RuntimeError("Langfuse is down")
+
+    harness.gateway.observations = fail
+    harness.run()
+
+    scores = harness.scores()
+    output = harness.output()
+    assert scores["goal_reached"] == 1.0
+    assert scores["turns_to_goal"] == 1
+    assert "model_calls_to_goal" not in scores
+    assert output["trace_scores"].startswith("missing: Langfuse could not be read")
+    comment = harness.gateway.experiments[0]["items"][0].evaluations[0].comment
+    assert "trace scores missing" in comment
+
+
+def test_traces_that_never_arrive_are_recorded_as_missing(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.gateway.observations = lambda chat_id, turns: ([], False)
+    harness.run()
+
+    assert harness.output()["trace_scores"] == "missing: no app traces arrived"
+    assert harness.scores()["goal_reached"] == 1.0
+
+
+def test_broadcast_generations_use_metadata_cache_counts(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.gateway.observations = lambda chat_id, turns: (broadcast_observations(chat_id), True)
+    harness.run()
+
+    scores = harness.scores()
+    # A fully cached 80k call and a 60k call that missed the cache.
+    assert scores["tokens_cache_read"] == 80000
+    assert scores["tokens_cache_write"] == 60000
+    assert scores["tokens_uncached_input"] == 0
+    assert scores["cache_miss_calls"] == 1
+    # cost_details has no total on one call: its total cost is used.
+    assert scores["cost_to_goal_usd"] == pytest.approx(0.016 + 0.2)
+
+
+def test_hints_never_exceed_the_hidden_steps(tmp_path):
+    items = [task("t1", "rain forecast kenya", turn_limit=4, hidden=["Use the weekly total"])]
+    harness = Harness(
+        tmp_path,
+        items,
+        reply_done_on(99),
+        user_replies={"rain forecast kenya": [progress("hint", hint=True)] * 3},
+    )
+    harness.run()
+
+    assert harness.scores()["hints_used"] == 1
+
+
+def test_image_pull_failure_stops_the_run(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(
+        tmp_path,
+        items,
+        reply_done_on(1),
+        pull_error=docker.errors.ImageNotFound("manifest unknown"),
+    )
+
+    with pytest.raises(AppStartError, match="could not be pulled"):
+        harness.run()
+
+    assert harness.docker.run_calls == []
+    assert harness.gateway.experiments == []
+    assert harness.gateway.flushed
+
+
+def test_container_start_failure_removes_the_container_by_name(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(
+        tmp_path,
+        items,
+        reply_done_on(1),
+        run_error=docker.errors.APIError("network not found"),
+    )
+
+    with pytest.raises(AppStartError, match="network not found"):
+        harness.run()
+
+    assert harness.container.removed
+
+
+def test_cleanup_error_does_not_replace_the_start_error(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    container = FakeContainer(
+        ["exited"], logs=b"bad SKILL_PACKS", remove_error=docker.errors.APIError("busy")
+    )
+    harness = Harness(tmp_path, items, reply_done_on(1), container=container)
+
+    with pytest.raises(AppStartError, match="bad SKILL_PACKS"):
+        harness.run()
+
+
+def test_container_that_disappears_stops_the_run(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1), container=FakeContainer(["gone"]))
+
+    with pytest.raises(AppStartError, match="disappeared"):
+        harness.run()
+
+
+def test_leftover_containers_are_removed_at_start(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    leftover = FakeContainer(["exited"], name="weather-skills-eval-app-old")
+    harness = Harness(tmp_path, items, reply_done_on(1), leftovers=[leftover])
+    harness.run()
+
+    assert leftover.removed
+
+
+def test_missing_dataset_does_not_start_the_run(tmp_path):
+    harness = Harness(tmp_path, [], reply_done_on(1))
+    harness.gateway.dataset_error = RuntimeError("404 dataset not found")
+
+    with pytest.raises(DatasetError, match="could not be read"):
+        harness.run()
+    assert harness.docker.run_calls == []
+
+
+def test_empty_dataset_does_not_start_the_run(tmp_path):
+    harness = Harness(tmp_path, [], reply_done_on(1))
+
+    with pytest.raises(DatasetError, match="has no items"):
+        harness.run()
+    assert harness.docker.run_calls == []
+
+
+def test_duplicate_item_ids_do_not_start_the_run(tmp_path):
+    items = [task("t1", "rain forecast kenya"), task("t1", "weekly rain")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+
+    with pytest.raises(TaskError, match="more than once"):
+        harness.run()
+    assert harness.docker.run_calls == []
 
 
 def test_app_container_exits_stops_the_run_with_logs(tmp_path):

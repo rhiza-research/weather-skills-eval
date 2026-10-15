@@ -136,48 +136,97 @@ class FakeApp:
 
 
 class FakeContainer:
-    def __init__(self, statuses: list[str], logs: bytes = b""):
+    """``statuses`` are returned by successive reloads; the status ``gone``
+    makes reload raise NotFound, as for a container removed from outside."""
+
+    def __init__(
+        self,
+        statuses: list[str],
+        logs: bytes = b"",
+        name: str = "app",
+        remove_error: Exception | None = None,
+    ):
         self._statuses = statuses
         self.status = "created"
         self._logs = logs
+        self.name = name
+        self.remove_error = remove_error
         self.removed = False
 
     def reload(self) -> None:
         if self._statuses:
             self.status = self._statuses.pop(0)
+        if self.status == "gone":
+            raise docker.errors.NotFound("container gone")
 
     def logs(self, tail: int = 200) -> bytes:
         return self._logs
 
     def remove(self, force: bool = False, v: bool = False) -> None:
+        if self.remove_error:
+            raise self.remove_error
         self.removed = True
 
 
+APP_REPOSITORY = "ghcr.io/rhiza-research/weather-skills-chat"
+
+
 class FakeDocker:
-    def __init__(self, container: FakeContainer, local_image: bool = True):
+    """Docker with one image. ``pull_error`` fails the pull; ``run_error`` fails
+    ``containers.run`` after the container was created; ``leftovers`` are
+    labeled containers from an earlier run."""
+
+    def __init__(
+        self,
+        container: FakeContainer,
+        *,
+        pull_error: Exception | None = None,
+        run_error: Exception | None = None,
+        leftovers: list[FakeContainer] | None = None,
+    ):
         self.container = container
-        self.local_image = local_image
         self.run_calls: list[dict] = []
         self.pulled: list[str] = []
+        self.list_filters: list[dict] = []
+        self.created: dict[str, FakeContainer] = {}
+        self.leftovers = leftovers or []
         image = SimpleNamespace(
-            id="sha256:image", attrs={"RepoDigests": ["ghcr.io/x/app@sha256:abc"]}
+            id="sha256:image",
+            attrs={
+                "RepoDigests": [
+                    "ghcr.io/other/mirror@sha256:111",
+                    f"{APP_REPOSITORY}@sha256:abc",
+                ]
+            },
         )
         outer = self
 
         class Images:
             def get(self, ref):
-                if not outer.local_image:
-                    raise docker.errors.ImageNotFound("missing")
-                return image
+                raise AssertionError("the harness must pull, not use a local tag")
 
             def pull(self, ref):
                 outer.pulled.append(ref)
+                if pull_error:
+                    raise pull_error
                 return image
 
         class Containers:
             def run(self, image_id, **kwargs):
                 outer.run_calls.append({"image": image_id, **kwargs})
+                outer.created[kwargs["name"]] = outer.container
+                if run_error:
+                    raise run_error
                 return outer.container
+
+            def get(self, name):
+                if name not in outer.created:
+                    raise docker.errors.NotFound(name)
+                return outer.created[name]
+
+            def list(self, all=False, filters=None):
+                outer.list_filters.append(filters)
+                return outer.leftovers
 
         self.images = Images()
         self.containers = Containers()
@@ -301,6 +350,51 @@ def app_observations(chat_id: str, turns: int) -> list[dict]:
     return observations
 
 
+def broadcast_observations(chat_id: str) -> list[dict]:
+    """One app trace with two OpenRouter Broadcast generations, shaped like the
+    real ones: usage_details holds only input, output and total (input being
+    the whole prompt), and the cache counts are in metadata attributes."""
+    trace = f"{chat_id}-trace-0"
+
+    def generation(obs_id, cached, cache_write, cost_details, total_cost):
+        return {
+            "id": obs_id,
+            "trace_id": trace,
+            "type": "GENERATION",
+            "name": "llm",
+            "level": "DEFAULT",
+            "usage_details": {
+                "input": cached + cache_write,
+                "output": 50,
+                "total": cached + cache_write + 50,
+            },
+            "cost_details": cost_details,
+            "total_cost": total_cost,
+            "metadata": {
+                "attributes": {
+                    "gen_ai.usage.input_tokens.cached": str(cached),
+                    "gen_ai.usage.input_tokens.cache_write": str(cache_write),
+                }
+            },
+        }
+
+    return [
+        {
+            "id": f"{trace}-root",
+            "trace_id": trace,
+            "type": "SPAN",
+            "name": "weather-skills-chat",
+            "level": "DEFAULT",
+            "usage_details": {},
+            "cost_details": {},
+            "total_cost": None,
+            "metadata": {},
+        },
+        generation("b1", 80000, 0, {"input": 0.016}, 0.016),
+        generation("b2", 0, 60000, {"total": 0.2}, 0.2),
+    ]
+
+
 class FakeGateway:
     def __init__(self, items: list[dict], models: FakeModels):
         self.items = [
@@ -316,9 +410,15 @@ class FakeGateway:
         self.experiments: list[dict] = []
         self.linked: list[str] = []
         self.flushed = False
+        self.observation_requests: list[tuple[str, int]] = []
+        # Replace to change what the app's traces hold, or to raise.
+        self.observations = lambda chat_id, turns: (app_observations(chat_id, turns), True)
+        self.dataset_error: Exception | None = None
 
     def dataset(self, name: str):
-        return SimpleNamespace(name=name, items=self.items)
+        if self.dataset_error:
+            raise self.dataset_error
+        return SimpleNamespace(name=name, items=self.items, version=None)
 
     def run_experiment(self, *, dataset, name, task, metadata, concurrency):
         results = []
@@ -335,7 +435,8 @@ class FakeGateway:
         return self.models(role, session_id, **kwargs)
 
     async def chat_observations(self, chat_id: str, turns: int):
-        return app_observations(chat_id, turns), True
+        self.observation_requests.append((chat_id, turns))
+        return self.observations(chat_id, turns)
 
     def link_item_to_chat(self, chat_id: str) -> None:
         self.linked.append(chat_id)

@@ -1,5 +1,6 @@
 """The harness's own settings, each read from one environment variable."""
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -20,6 +21,8 @@ class Settings:
     trace_timeout: float
     trace_settle: float
     concurrency: int
+    model_retries: int
+    harness_commit: str
 
 
 # Read by the Langfuse SDK and LiteLLM themselves; checked here so a run fails
@@ -34,7 +37,10 @@ def _required(environ: Mapping[str, str], name: str) -> str:
     return value
 
 
-def _number(environ: Mapping[str, str], name: str, default: float) -> float:
+def _number(
+    environ: Mapping[str, str], name: str, default: float, *, minimum: float | None = None
+) -> float:
+    """A finite number; greater than 0, or at least ``minimum`` when given."""
     raw = environ.get(name)
     if raw is None or raw.strip() == "":
         return default
@@ -42,20 +48,34 @@ def _number(environ: Mapping[str, str], name: str, default: float) -> float:
         value = float(raw)
     except ValueError as exc:
         raise SettingsError(f"{name} is not a number: {raw!r}") from exc
-    if value <= 0:
+    if not math.isfinite(value):
+        raise SettingsError(f"{name} must be a finite number: {raw!r}")
+    if minimum is None and value <= 0:
         raise SettingsError(f"{name} must be greater than 0")
+    if minimum is not None and value < minimum:
+        raise SettingsError(f"{name} must be at least {minimum:g}")
     return value
+
+
+def _whole(environ: Mapping[str, str], name: str, default: int, *, minimum: int) -> int:
+    value = _number(environ, name, default, minimum=minimum)
+    if value != int(value):
+        raise SettingsError(f"{name} must be a whole number")
+    return int(value)
 
 
 def load_settings(environ: Mapping[str, str]) -> Settings:
     for name in REQUIRED_PASSTHROUGH:
         _required(environ, name)
     environment = _required(environ, "LANGFUSE_TRACING_ENVIRONMENT")
-    if environment == "production":
+    if environment.strip().lower() == "production":
         raise SettingsError("LANGFUSE_TRACING_ENVIRONMENT must not be production")
-    concurrency = _number(environ, "EVAL_CONCURRENCY", 1)
-    if concurrency != int(concurrency):
-        raise SettingsError("EVAL_CONCURRENCY must be a whole number")
+    trace_timeout = _number(environ, "EVAL_TRACE_TIMEOUT_SECONDS", 600)
+    trace_settle = _number(environ, "EVAL_TRACE_SETTLE_SECONDS", 60)
+    if trace_settle >= trace_timeout:
+        raise SettingsError(
+            "EVAL_TRACE_SETTLE_SECONDS must be less than EVAL_TRACE_TIMEOUT_SECONDS"
+        )
     return Settings(
         simulated_user_model=_required(environ, "EVAL_SIMULATED_USER_MODEL"),
         judge_model=_required(environ, "EVAL_JUDGE_MODEL"),
@@ -64,7 +84,10 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         app_start_timeout=_number(environ, "EVAL_APP_START_TIMEOUT_SECONDS", 600),
         turn_timeout=_number(environ, "EVAL_TURN_TIMEOUT_SECONDS", 1800),
         poll_interval=_number(environ, "EVAL_POLL_INTERVAL_SECONDS", 2),
-        trace_timeout=_number(environ, "EVAL_TRACE_TIMEOUT_SECONDS", 600),
-        trace_settle=_number(environ, "EVAL_TRACE_SETTLE_SECONDS", 60),
-        concurrency=int(concurrency),
+        trace_timeout=trace_timeout,
+        trace_settle=trace_settle,
+        concurrency=_whole(environ, "EVAL_CONCURRENCY", 1, minimum=1),
+        model_retries=_whole(environ, "EVAL_MODEL_RETRIES", 2, minimum=0),
+        # Set at image build time from the harness checkout; see compose.yaml.
+        harness_commit=environ.get("EVAL_HARNESS_COMMIT", "").strip(),
     )

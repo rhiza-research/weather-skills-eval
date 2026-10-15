@@ -1,13 +1,18 @@
 """Everything the harness reads from or writes to Langfuse.
 
+The app and the harness must use the same Langfuse project: the harness
+reads the app's traces from the project its own keys belong to.
+
 - The task suite: a Langfuse dataset.
 - The run: one experiment on that dataset (``DatasetClient.run_experiment``),
-  with one item per task and the play's scores on each item.
+  with one item per task and the play's scores on each item. Each item's
+  trace carries the chat id as its session id.
 - The simulated user's and the judge's model calls: each call is its own
   trace, with user id ``simulated-user`` or ``judge``, session id = the chat
   id, in the harness's Langfuse environment.
-- The app's traces: one per chat turn, session id = the chat id. They are
-  read back through the observations API once they stop changing.
+- The app's traces: one per chat turn, named ``weather-skills-chat``, with
+  session id = the chat id. They are read back through the observations API
+  once they stop changing.
 """
 
 import asyncio
@@ -17,12 +22,21 @@ from collections.abc import Awaitable, Callable
 import litellm
 from langfuse import Evaluation, Langfuse, propagate_attributes
 from opentelemetry import context as otel_context
+from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
 
 from .scoring import APP_TRACE_NAME
 
-OBSERVATION_FIELDS = "core,basic,usage"
+OBSERVATION_FIELDS = "core,basic,usage,metadata"
+# Broadcast generations keep their cache counts in metadata["attributes"],
+# which the API truncates unless it is expanded.
+EXPANDED_METADATA = "attributes"
 PAGE_SIZE = 1000
+SESSION_ATTRIBUTE = "session.id"
+
+
+class TraceReadError(Exception):
+    """The app's traces could not be read from Langfuse."""
 
 
 def _usage(response) -> dict[str, int]:
@@ -57,6 +71,7 @@ def _normalize(observation) -> dict:
         "usage_details": observation.usage_details or {},
         "cost_details": observation.cost_details or {},
         "total_cost": observation.total_cost,
+        "metadata": observation.metadata or {},
     }
 
 
@@ -76,6 +91,7 @@ class LangfuseGateway:
         trace_timeout: float,
         trace_settle: float,
         poll_interval: float,
+        model_retries: int = 2,
         client: Langfuse | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -87,6 +103,7 @@ class LangfuseGateway:
         self._trace_timeout = trace_timeout
         self._trace_settle = trace_settle
         self._poll_interval = poll_interval
+        self._model_retries = model_retries
         self._clock = clock
         self._sleep = sleep
 
@@ -103,13 +120,21 @@ class LangfuseGateway:
         )
 
     def link_item_to_chat(self, chat_id: str) -> None:
-        """Give the current experiment item's trace the chat id as its session."""
+        """Give the current experiment item's trace the chat id as its session.
+
+        Called inside the experiment task. The task span gets the session
+        attribute directly, and a ``chat`` child span is created under it
+        with the session propagated, so the trace carries it either way.
+        """
+        otel_trace.get_current_span().set_attribute(SESSION_ATTRIBUTE, chat_id)
         with propagate_attributes(session_id=chat_id):
-            pass
+            with self.client.start_as_current_observation(name="chat", input={"chat_id": chat_id}):
+                pass
 
     def traced_completion(self, role: str, session_id: str | None, **kwargs):
         # A fresh context makes the call a trace of its own instead of a child
         # of the experiment item, so it carries its own user id.
+        kwargs.setdefault("num_retries", self._model_retries)
         token = otel_context.attach(otel_context.Context())
         try:
             with propagate_attributes(
@@ -136,19 +161,26 @@ class LangfuseGateway:
             otel_context.detach(token)
 
     def _pages(self, **filters) -> list:
-        observations, cursor = [], None
+        observations, cursor, seen = [], None, set()
         while True:
             page = self.client.api.observations.get_many(
-                fields=OBSERVATION_FIELDS, limit=PAGE_SIZE, cursor=cursor, **filters
+                fields=OBSERVATION_FIELDS,
+                expand_metadata=EXPANDED_METADATA,
+                limit=PAGE_SIZE,
+                cursor=cursor,
+                **filters,
             )
             observations.extend(page.data)
             cursor = page.meta.cursor
-            if not cursor:
+            if not cursor or cursor in seen:
                 return observations
+            seen.add(cursor)
 
     def _app_observations(self, chat_id: str) -> list[dict]:
+        # Only the app's traces: the session also holds the simulated user's
+        # and the judge's traces, and the experiment item's.
         roots = self._pages(session_id=chat_id, name=APP_TRACE_NAME)
-        trace_ids = sorted({o.trace_id for o in roots if o.trace_id})
+        trace_ids = sorted({o.trace_id for o in roots if o.trace_id and o.name == APP_TRACE_NAME})
         observations = []
         for trace_id in trace_ids:
             observations.extend(_normalize(o) for o in self._pages(trace_id=trace_id))
@@ -157,15 +189,20 @@ class LangfuseGateway:
     async def chat_observations(self, chat_id: str, turns: int) -> tuple[list[dict], bool]:
         """The app's observations for a chat once they stop changing.
 
-        Waits until there is one app trace per turn and the set of
-        observations has not changed for the settle time. Returns what it has,
-        with ``False``, when the timeout passes first.
+        ``turns`` is the number of turns the app accepted. Waits until there
+        is one app trace per such turn and the set of observations has not
+        changed for the settle time. Returns what it has, with ``False``, when
+        the timeout passes first. Raises ``TraceReadError`` when Langfuse
+        cannot be read.
         """
         deadline = self._clock() + self._trace_timeout
         last_signature = None
         stable_since = self._clock()
         while True:
-            observations = await asyncio.to_thread(self._app_observations, chat_id)
+            try:
+                observations = await asyncio.to_thread(self._app_observations, chat_id)
+            except Exception as exc:
+                raise TraceReadError(f"{type(exc).__name__}: {exc}") from exc
             traces = {o["trace_id"] for o in observations}
             signature = tuple(sorted((o["id"], o["end_time"] is not None) for o in observations))
             if signature != last_signature:

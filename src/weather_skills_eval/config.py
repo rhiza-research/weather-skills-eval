@@ -1,9 +1,13 @@
 """The configuration file: which app image to run and the environment it runs with.
 
 A value may reference one of the harness's own environment variables as
-``${NAME}``. A variable whose name looks like a secret (it contains KEY,
-SECRET, PASSWORD or TOKEN) must be exactly one such reference, so no secret
-is ever written into a configuration file.
+``${NAME}``. A variable, or a key inside a mapping value, whose name looks
+like a secret (one of its words is key, secret, password or token, singular
+or plural, except "tokens") must be exactly one such reference, so no secret
+is ever written into a configuration file. Words are separated by
+underscores, hyphens, dots and case changes, so ``OPENAI_API_KEYS`` and
+``apiKey`` are secret names and ``max_tokens`` and ``TIKTOKEN_ENCODING_NAME``
+are not.
 """
 
 import json
@@ -26,7 +30,8 @@ REQUIRED_ENV = (
     "BOOTSTRAP_ADMIN_API_KEY",
 )
 
-SECRET_NAME = re.compile(r"KEY|SECRET|PASSWORD|TOKEN", re.IGNORECASE)
+SECRET_WORDS = {"key", "keys", "secret", "secrets", "password", "passwords", "token", "apikey"}
+_WORD = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
 REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # The image listens on PORT, 8080 unless the configuration sets it.
@@ -69,22 +74,62 @@ def _text(raw: Mapping, key: str) -> str:
     return value.strip()
 
 
-def _resolve(field: str, value: str, environ: Mapping[str, str]) -> str:
-    def substitute(match: re.Match) -> str:
-        name = match.group(1)
-        if name not in environ:
-            raise ConfigError(field, f"references ${{{name}}}, which is not set")
-        return environ[name]
-
-    return REFERENCE.sub(substitute, value)
+def is_secret_name(name: str) -> bool:
+    return any(word.lower() in SECRET_WORDS for word in _WORD.findall(name))
 
 
-def _env_value(name: str, value: object) -> str:
-    field = f"env.{name}"
-    if isinstance(value, (dict, list)):
-        return json.dumps(value)
+def _lookup(field: str, name: str, environ: Mapping[str, str]) -> str:
+    value = environ.get(name)
+    if value is None:
+        raise ConfigError(field, f"references ${{{name}}}, which is not set")
+    if not value.strip():
+        raise ConfigError(field, f"references ${{{name}}}, which is empty")
+    return value
+
+
+def _resolve_text(field: str, key: str, value: str, environ: Mapping[str, str]) -> str:
+    """Substitute references in one string. A secret-named key's value must be
+    a single reference (surrounding whitespace ignored) and resolves to the
+    referenced value alone."""
+    if is_secret_name(key):
+        match = REFERENCE.fullmatch(value.strip())
+        if not match:
+            raise ConfigError(
+                field, "holds a secret and must be a single ${NAME} reference, not a literal"
+            )
+        return _lookup(field, match.group(1), environ)
+    return REFERENCE.sub(lambda m: _lookup(field, m.group(1), environ), value)
+
+
+def _resolve_tree(field: str, key: str, value: object, environ: Mapping[str, str]) -> object:
+    """Resolve references inside a mapping or list, keeping its structure."""
+    if isinstance(value, Mapping):
+        resolved = {}
+        for child_key, child in value.items():
+            if not isinstance(child_key, str):
+                raise ConfigError(f"{field}.{child_key}", "keys must be strings")
+            resolved[child_key] = _resolve_tree(f"{field}.{child_key}", child_key, child, environ)
+        return resolved
+    if isinstance(value, list):
+        return [
+            _resolve_tree(f"{field}[{index}]", key, child, environ)
+            for index, child in enumerate(value)
+        ]
     if isinstance(value, str):
-        return value
+        return _resolve_text(field, key, value, environ)
+    if is_secret_name(key) and value is not None:
+        raise ConfigError(
+            field, "holds a secret and must be a single ${NAME} reference, not a literal"
+        )
+    return value
+
+
+def _env_value(name: str, value: object, environ: Mapping[str, str]) -> str:
+    field = f"env.{name}"
+    if isinstance(value, (Mapping, list)):
+        return json.dumps(_resolve_tree(field, name, value, environ))
+    if isinstance(value, str):
+        return _resolve_text(field, name, value, environ)
     raise ConfigError(field, "must be a string, or a mapping or list written as JSON")
 
 
@@ -111,24 +156,24 @@ def parse_config(raw: object, *, default_name: str, environ: Mapping[str, str]) 
     for name_key, value in env_raw.items():
         if not isinstance(name_key, str) or not ENV_NAME.match(name_key):
             raise ConfigError(f"env.{name_key}", "is not a valid variable name")
-        field = f"env.{name_key}"
-        text = _env_value(name_key, value)
-        if SECRET_NAME.search(name_key) and not REFERENCE.fullmatch(text.strip()):
-            raise ConfigError(
-                field, "holds a secret and must be a single ${NAME} reference, not a literal"
-            )
-        env[name_key] = _resolve(field, text, environ)
+        env[name_key] = _env_value(name_key, value, environ)
 
     for required in REQUIRED_ENV:
-        if not env.get(required):
+        if not env.get(required, "").strip():
             raise ConfigError(f"env.{required}", "is missing")
+
+    port = env.get("PORT")
+    if port is not None and not (port.isdigit() and 1 <= int(port) <= 65535):
+        raise ConfigError("env.PORT", f"must be a port number from 1 to 65535, not {port!r}")
 
     return RunConfig(name=name, image=image, model=model, dataset=dataset, env=env)
 
 
 def load_config(path: Path, environ: Mapping[str, str]) -> RunConfig:
     try:
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ConfigError(str(path), f"is not UTF-8 text: {exc}") from exc
     except OSError as exc:
         raise ConfigError(str(path), f"cannot be read: {exc}") from exc
     try:

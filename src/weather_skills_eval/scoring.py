@@ -1,21 +1,32 @@
 """Scores of one play, from the play itself and from the app's Langfuse traces.
 
-Token counts come from each generation's ``usage_details``. Both the app's
-own generations and OpenRouter Broadcast generations count cached tokens
-inside ``input``; the cache read and cache write counts are moved out of
-``input``, so ``uncached input`` holds only tokens billed at the full input
-price. A cache-miss call is a model call that wrote at least
-``CACHE_MISS_TOKENS`` tokens of context it could not read from the cache
-(uncached input plus cache write).
+Token counts come from each generation. In both shapes a generation's
+``input`` is the whole prompt, cached tokens included:
+
+- Generations the app records carry the cache counts in ``usage_details``
+  as ``cache_read_input_tokens`` and ``cache_creation_input_tokens``.
+- Generations OpenRouter Broadcast records carry only ``input``, ``output``
+  and ``total`` in ``usage_details``; their cache counts are in the
+  observation metadata, under ``attributes``, as
+  ``gen_ai.usage.input_tokens.cached`` and
+  ``gen_ai.usage.input_tokens.cache_write``.
+
+The cache read and cache write counts are moved out of ``input``, so
+``uncached input`` holds only tokens billed at the full input price. A
+cache-miss call is a model call that wrote at least ``CACHE_MISS_TOKENS``
+tokens of context it could not read from the cache (uncached input plus
+cache write).
 """
 
+import json
 from dataclasses import dataclass, field
 
 CACHE_MISS_TOKENS = 50_000
 
-# Key spellings of cache counts in generation usage_details.
-CACHE_READ_KEYS = ("cache_read_input_tokens", "input_cache_read", "input_cached_tokens")
-CACHE_WRITE_KEYS = ("cache_creation_input_tokens", "input_cache_write", "input_cache_creation")
+APP_CACHE_READ = "cache_read_input_tokens"
+APP_CACHE_WRITE = "cache_creation_input_tokens"
+BROADCAST_CACHE_READ = "gen_ai.usage.input_tokens.cached"
+BROADCAST_CACHE_WRITE = "gen_ai.usage.input_tokens.cache_write"
 
 APP_TRACE_NAME = "weather-skills-chat"
 
@@ -35,42 +46,65 @@ class TraceMetrics:
     trace_ids: list[str] = field(default_factory=list)
 
 
-def _first(usage: dict, keys: tuple[str, ...]) -> int:
-    for key in keys:
-        if usage.get(key) is not None:
-            return int(usage[key])
-    return 0
+def _count(value) -> int:
+    if value is None or value == "":
+        return 0
+    return int(float(value))
 
 
-def split_usage(usage: dict) -> tuple[int, int, int, int]:
+def _attributes(metadata) -> dict:
+    attributes = (metadata or {}).get("attributes") if isinstance(metadata, dict) else None
+    if isinstance(attributes, str):
+        try:
+            attributes = json.loads(attributes)
+        except ValueError:
+            return {}
+    return attributes if isinstance(attributes, dict) else {}
+
+
+def split_usage(usage: dict, metadata: dict | None = None) -> tuple[int, int, int, int]:
     """(uncached input, cache read, cache write, output) of one generation."""
     usage = usage or {}
-    read = _first(usage, CACHE_READ_KEYS)
-    write = _first(usage, CACHE_WRITE_KEYS)
-    uncached = max(int(usage.get("input") or 0) - read - write, 0)
-    return uncached, read, write, int(usage.get("output") or 0)
+    attributes = _attributes(metadata)
+    if usage.get(APP_CACHE_READ) is not None or usage.get(APP_CACHE_WRITE) is not None:
+        read, write = _count(usage.get(APP_CACHE_READ)), _count(usage.get(APP_CACHE_WRITE))
+    else:
+        read = _count(attributes.get(BROADCAST_CACHE_READ))
+        write = _count(attributes.get(BROADCAST_CACHE_WRITE))
+    uncached = max(_count(usage.get("input")) - read - write, 0)
+    return uncached, read, write, _count(usage.get("output"))
+
+
+def _cost(obs: dict) -> float | None:
+    cost = (obs.get("cost_details") or {}).get("total")
+    if cost is None:
+        cost = obs.get("total_cost")
+    return None if cost is None else float(cost)
 
 
 def trace_metrics(observations: list[dict]) -> TraceMetrics:
-    """Observations are dicts with type, name, level, usage_details, cost_details, total_cost."""
+    """Observations are dicts with type, name, level, usage_details, cost_details,
+    total_cost and metadata."""
     metrics = TraceMetrics()
     metrics.trace_ids = sorted({o["trace_id"] for o in observations if o.get("trace_id")})
     for obs in observations:
         kind, level = obs.get("type"), obs.get("level")
         if kind == "GENERATION":
             metrics.model_calls += 1
-            uncached, read, write, output = split_usage(obs.get("usage_details") or {})
+            uncached, read, write, output = split_usage(
+                obs.get("usage_details") or {}, obs.get("metadata")
+            )
             metrics.tokens_uncached_input += uncached
             metrics.tokens_cache_read += read
             metrics.tokens_cache_write += write
             metrics.tokens_output += output
             if uncached + write >= CACHE_MISS_TOKENS:
                 metrics.cache_miss_calls += 1
-            cost = (obs.get("cost_details") or {}).get("total", obs.get("total_cost"))
+            cost = _cost(obs)
             if cost is None:
                 metrics.calls_without_cost += 1
             else:
-                metrics.cost_usd += float(cost)
+                metrics.cost_usd += cost
         elif kind == "SPAN" and obs.get("name") == "llm" and level == "ERROR":
             # A model call the app could not send or the provider refused.
             metrics.model_calls += 1
@@ -101,18 +135,26 @@ class PlayFacts:
 
 
 def build_scores(
-    facts: PlayFacts, metrics: TraceMetrics | None, traces_complete: bool
+    facts: PlayFacts,
+    metrics: TraceMetrics | None,
+    traces_complete: bool,
+    trace_problem: str | None = None,
 ) -> list[Score]:
+    """The play's scores. Without ``metrics`` the trace-based scores are left
+    out and the goal_reached comment says why (``trace_problem``)."""
     scope = "up to the goal" if facts.goal_reached else f"over the whole play ({facts.outcome})"
+    goal_comment = facts.outcome
+    if metrics is None:
+        goal_comment = f"{facts.outcome}; trace scores missing: {trace_problem or 'no app traces'}"
     scores = [
-        Score("goal_reached", 1.0 if facts.goal_reached else 0.0, facts.outcome),
+        Score("goal_reached", 1.0 if facts.goal_reached else 0.0, goal_comment),
         Score("turns_to_goal", facts.turns, scope),
         Score("clarifying_questions", facts.clarifying_questions, scope),
         Score("hints_used", facts.hints_used, scope),
         Score(
             "time_to_answer_seconds",
             round(facts.time_to_answer_seconds, 3),
-            f"time the app spent answering, pauses excluded, {scope}",
+            f"time the app spent on answered turns, pauses and failed turns excluded, {scope}",
         ),
     ]
     if facts.answer_quality is not None:

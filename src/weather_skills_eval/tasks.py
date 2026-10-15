@@ -85,21 +85,40 @@ def parse_task(item) -> Task:
     get = item.get if isinstance(item, dict) else lambda key: getattr(item, key, None)
     item_id = str(get("id") or "<no id>")
     opening = get("input")
-    if not isinstance(opening, str):
-        raise TaskError(f"dataset item {item_id}: input must be the opening message as a string")
+    if not isinstance(opening, str) or not opening.strip():
+        raise TaskError(
+            f"dataset item {item_id}: input must be the opening message as a non-empty string"
+        )
     parts = {}
     for field, model in (("expected_output", ExpectedOutput), ("metadata", TaskMetadata)):
         try:
             parts[field] = model.model_validate(get(field) or {})
         except ValidationError as exc:
-            problems = "; ".join(
-                ".".join([field, *(str(p) for p in error["loc"])]) + f": {error['msg']}"
-                for error in exc.errors()
-            )
-            raise TaskError(f"dataset item {item_id}: {problems}") from exc
-    return Task(
-        id=item_id,
-        opening_message=opening,
-        expected=parts["expected_output"],
-        metadata=parts["metadata"],
+            raise TaskError(f"dataset item {item_id}: {_problems(field, exc)}") from exc
+    try:
+        return Task(
+            id=item_id,
+            opening_message=opening,
+            expected=parts["expected_output"],
+            metadata=parts["metadata"],
+        )
+    except ValidationError as exc:
+        raise TaskError(f"dataset item {item_id}: {_problems('input', exc)}") from exc
+
+
+def _problems(field: str, exc: ValidationError) -> str:
+    return "; ".join(
+        ".".join([field, *(str(p) for p in error["loc"])]) + f": {error['msg']}"
+        for error in exc.errors()
     )
+
+
+def parse_tasks(items) -> dict[str, Task]:
+    """All tasks of a dataset, keyed by item id. Item ids must be unique."""
+    tasks: dict[str, Task] = {}
+    for item in items:
+        task = parse_task(item)
+        if task.id in tasks:
+            raise TaskError(f"dataset item {task.id}: the id appears more than once")
+        tasks[task.id] = task
+    return tasks

@@ -22,7 +22,7 @@ _DETAILS = re.compile(r"<details\b[^>]*>.*?</details>", re.IGNORECASE | re.DOTAL
 
 
 class ChatError(Exception):
-    """The app returned an error for a turn."""
+    """The app returned an error, or a reply the harness cannot read."""
 
 
 def visible_text(content: str) -> str:
@@ -30,30 +30,45 @@ def visible_text(content: str) -> str:
     return _DETAILS.sub("", content or "").strip()
 
 
-def _version_key(version: str | None) -> tuple:
-    text = (version or "0").lstrip("vV")
-    return tuple(
-        (0, int(part), "") if part.isdigit() else (1, 0, part.lower())
-        for part in re.findall(r"\d+|[A-Za-z]+", text)
-    )
+def _identifier_key(part: str) -> tuple:
+    # Semver: numeric identifiers sort below alphanumeric ones, and numerically.
+    return (0, int(part), "") if part.isdigit() else (1, 0, part.lower())
+
+
+def version_key(version: str | None) -> tuple:
+    """Semver-style ordering key. A leading v is ignored, build metadata (+...)
+    is ignored, and a pre-release (-...) sorts below its release."""
+    text = (version or "0").strip()
+    if text[:1] in ("v", "V"):
+        text = text[1:]
+    text = text.split("+", 1)[0]
+    release, _, prerelease = text.partition("-")
+    release_key = tuple(_identifier_key(p) for p in re.split(r"[.]", release) if p)
+    if not prerelease:
+        return (release_key, 1, ())
+    return (release_key, 0, tuple(_identifier_key(p) for p in prerelease.split(".") if p))
 
 
 def highest_skill_versions(tools: list[dict]) -> list[str]:
-    """Tool ids for chat: every tool, with each skill name kept at its highest version."""
+    """Tool ids for chat: every tool, with each skill name kept at its highest version.
+
+    A skill tool with no skill name and no tool name cannot be matched to
+    another version, so each such tool is kept.
+    """
     chosen: list[dict] = []
     by_skill: dict[str, int] = {}
     for tool in tools:
         manifest = (tool.get("meta") or {}).get("manifest") or {}
-        if manifest.get("kind") != "skill":
+        key = (manifest.get("skill_name") or tool.get("name") or "").strip().lower()
+        if manifest.get("kind") != "skill" or not key:
             chosen.append(tool)
             continue
-        key = (manifest.get("skill_name") or tool.get("name") or "").strip().lower()
         if key not in by_skill:
             by_skill[key] = len(chosen)
             chosen.append(tool)
             continue
         current = (chosen[by_skill[key]].get("meta") or {}).get("manifest") or {}
-        if _version_key(manifest.get("version")) > _version_key(current.get("version")):
+        if version_key(manifest.get("version")) > version_key(current.get("version")):
             chosen[by_skill[key]] = tool
     return [tool["id"] for tool in chosen]
 
@@ -72,43 +87,58 @@ class AppClient:
     async def aclose(self) -> None:
         await self._http.aclose()
 
-    async def _json(self, method: str, path: str, **kwargs):
-        response = await self._http.request(method, path, **kwargs)
+    async def _json(self, method: str, path: str, expect: type, **kwargs):
+        try:
+            response = await self._http.request(method, path, **kwargs)
+        except httpx.HTTPError as exc:
+            raise ChatError(f"{method} {path} failed: {exc}") from exc
+        try:
+            data = response.json()
+        except ValueError:
+            data = None
         if response.status_code >= 400:
-            try:
-                detail = response.json().get("detail")
-            except ValueError:
-                detail = response.text
+            detail = data.get("detail") if isinstance(data, dict) else response.text
             raise ChatError(f"{method} {path} returned {response.status_code}: {detail}")
-        return response.json()
+        if not isinstance(data, expect):
+            raise ChatError(
+                f"{method} {path} returned {type(data).__name__}, expected {expect.__name__}"
+            )
+        return data
 
     async def tool_summary(self) -> list[dict]:
-        return await self._json("GET", "/api/v1/tool_summary")
+        return await self._json("GET", "/api/v1/tool_summary", list)
 
     async def skill_packs(self) -> list[dict]:
-        return await self._json("GET", "/api/v1/skills/")
+        return await self._json("GET", "/api/v1/skills/", list)
 
-    async def create_chat(self, chat: dict) -> dict:
-        return await self._json("POST", "/api/v1/chats/new", json={"chat": chat})
+    async def create_chat(self, chat: dict) -> str:
+        data = await self._json("POST", "/api/v1/chats/new", dict, json={"chat": chat})
+        chat_id = data.get("id")
+        if not isinstance(chat_id, str) or not chat_id:
+            raise ChatError(f"POST /api/v1/chats/new returned no chat id: {data!r}")
+        return chat_id
 
     async def complete(self, body: dict) -> dict:
-        return await self._json("POST", "/api/chat/completions", json=body)
+        return await self._json("POST", "/api/chat/completions", dict, json=body)
 
     async def get_chat(self, chat_id: str) -> dict:
-        return await self._json("GET", f"/api/v1/chats/{chat_id}")
+        return await self._json("GET", f"/api/v1/chats/{chat_id}", dict)
 
     async def artifacts(self, chat_id: str) -> list[dict]:
-        return await self._json("GET", f"/api/v1/chats/{chat_id}/artifacts")
+        return await self._json("GET", f"/api/v1/chats/{chat_id}/artifacts", list)
 
     async def zarr_meta(self, chat_id: str, path: str) -> dict:
         return await self._json(
-            "GET", f"/api/v1/chats/{chat_id}/artifacts/zarr/meta", params={"path": path}
+            "GET", f"/api/v1/chats/{chat_id}/artifacts/zarr/meta", dict, params={"path": path}
         )
 
     async def artifact_content(self, chat_id: str, path: str) -> bytes:
-        response = await self._http.get(
-            f"/api/v1/chats/{chat_id}/artifacts/content", params={"path": path}
-        )
+        try:
+            response = await self._http.get(
+                f"/api/v1/chats/{chat_id}/artifacts/content", params={"path": path}
+            )
+        except httpx.HTTPError as exc:
+            raise ChatError(f"artifact {path} could not be read: {exc}") from exc
         if response.status_code >= 400:
             raise ChatError(f"artifact {path} returned {response.status_code}")
         return response.content
@@ -137,7 +167,12 @@ def _message(role: str, content: str, model: str, parent_id: str | None) -> dict
 
 
 class Conversation:
-    """One chat with the app. Each ``send`` is one turn and waits for the reply."""
+    """One chat with the app. Each ``send`` is one turn and waits for the reply.
+
+    ``turns`` counts user messages sent; ``turns_reached`` counts those whose
+    completion request the app accepted, so each of them has an app trace.
+    ``answer_seconds`` holds the answer time of each turn that got a reply.
+    """
 
     def __init__(
         self,
@@ -161,6 +196,7 @@ class Conversation:
         self._last_assistant_id: str | None = None
         self.chat_id: str | None = None
         self.turns = 0
+        self.turns_reached = 0
         self.answer_seconds: list[float] = []
         self.error: str | None = None
 
@@ -180,7 +216,7 @@ class Conversation:
         user = _message("user", text, self._model, None)
         assistant = _message("assistant", "", self._model, user["id"])
         user["childrenIds"] = [assistant["id"]]
-        chat = await self._app.create_chat(
+        self.chat_id = await self._app.create_chat(
             {
                 "title": "weather-skills-eval",
                 "models": [self._model],
@@ -191,7 +227,6 @@ class Conversation:
                 "messages": [user, assistant],
             }
         )
-        self.chat_id = chat["id"]
         body = self._body(assistant["id"])
         body["messages"] = [{"role": "user", "content": text}]
         await self._app.complete(body)
@@ -214,8 +249,11 @@ class Conversation:
     async def _wait_done(self, assistant_id: str, started: float) -> str:
         while True:
             chat = await self._app.get_chat(self.chat_id)
-            messages = ((chat.get("chat") or {}).get("history") or {}).get("messages") or {}
-            message = messages.get(assistant_id) or {}
+            history = (chat.get("chat") or {}).get("history") or {}
+            messages = history.get("messages") if isinstance(history, dict) else None
+            message = (messages or {}).get(assistant_id) or {}
+            if not isinstance(message, dict):
+                raise ChatError(f"The chat holds an unreadable reply: {message!r}")
             if message.get("done"):
                 error = message.get("error")
                 if error:
@@ -234,13 +272,11 @@ class Conversation:
                 assistant_id = await self._start(text)
             else:
                 assistant_id = await self._continue(text)
+            self.turns_reached += 1
             content = await self._wait_done(assistant_id, started)
         except ChatError as exc:
             self.error = str(exc)
             raise
-        except httpx.HTTPError as exc:
-            self.error = f"HTTP error talking to the app: {exc}"
-            raise ChatError(self.error) from exc
         self._last_assistant_id = assistant_id
         seconds = self._clock() - started
         self.answer_seconds.append(seconds)

@@ -1,6 +1,6 @@
 import pytest
 
-from weather_skills_eval.app_client import highest_skill_versions, visible_text
+from weather_skills_eval.app_client import highest_skill_versions, version_key, visible_text
 from weather_skills_eval.config import ConfigError, parse_config
 from weather_skills_eval.scoring import split_usage, trace_metrics
 from weather_skills_eval.settings import SettingsError, load_settings
@@ -140,8 +140,33 @@ def test_split_usage_moves_cache_counts_out_of_input():
             "cache_creation_input_tokens": 6452,
         }
     ) == (2, 120583, 6452, 1711)
-    assert split_usage({"input": 900, "output": 3, "input_cache_read": 800}) == (100, 800, 0, 3)
+    # Broadcast: counts in metadata attributes, as strings.
+    broadcast_metadata = {
+        "attributes": {
+            "gen_ai.usage.input_tokens.cached": "800",
+            "gen_ai.usage.input_tokens.cache_write": "50",
+        }
+    }
+    assert split_usage({"input": 900, "output": 3}, broadcast_metadata) == (50, 800, 50, 3)
+    # Guessed key spellings are not read.
+    assert split_usage({"input": 900, "output": 3, "input_cache_read": 800}) == (900, 0, 0, 3)
     assert split_usage({"input": 10, "output": 1}) == (10, 0, 0, 1)
+
+
+def test_trace_metrics_falls_back_to_total_cost():
+    metrics = trace_metrics(
+        [
+            {
+                "trace_id": "t",
+                "type": "GENERATION",
+                "usage_details": {"input": 5, "output": 1},
+                "cost_details": {"total": None, "input": 0.1},
+                "total_cost": 0.3,
+            }
+        ]
+    )
+    assert metrics.cost_usd == pytest.approx(0.3)
+    assert metrics.calls_without_cost == 0
 
 
 def test_trace_metrics_counts_failed_model_calls_and_missing_cost():
@@ -178,6 +203,26 @@ def test_highest_skill_versions_compares_numerically():
         {"id": "c", "name": "other", "meta": {}},
     ]
     assert highest_skill_versions(tools) == ["b", "c"]
+
+
+def test_skill_versions_follow_semver_with_prereleases_below_releases():
+    assert version_key("v2.0.0") == version_key("2.0.0")
+    assert version_key("2.0.0-rc.1") < version_key("2.0.0")
+    assert version_key("2.0.0-alpha") < version_key("2.0.0-beta")
+    assert version_key("2.0.0-rc.2") < version_key("2.0.0-rc.10")
+    assert version_key("1.10.0") > version_key("1.9.5")
+
+    def skill(tool_id, version, name="s"):
+        return {
+            "id": tool_id,
+            "name": name,
+            "meta": {"manifest": {"kind": "skill", "skill_name": name, "version": version}},
+        }
+
+    assert highest_skill_versions([skill("a", "2.0.0"), skill("b", "v2.1.0-rc.1")]) == ["b"]
+    assert highest_skill_versions([skill("a", "2.1.0"), skill("b", "v2.1.0-rc.1")]) == ["a"]
+    # Skill tools without a name cannot be matched up, so each is kept.
+    assert highest_skill_versions([skill("a", "1", ""), skill("b", "2", "")]) == ["a", "b"]
 
 
 def test_visible_text_drops_tool_blocks():

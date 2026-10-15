@@ -1,0 +1,35 @@
+# A configuration for weather-skills-eval. Copy it, replace every TODO, and set the
+# referenced ${...} variables in .env. Every secret is a ${...} reference.
+name: example
+image: ghcr.io/rhiza-research/weather-skills-chat:TODO
+model: TODO
+dataset: TODO
+env:
+  WEBUI_SECRET_KEY: ${APP_WEBUI_SECRET_KEY}
+  BOOTSTRAP_ADMIN_EMAIL: TODO
+  BOOTSTRAP_ADMIN_PASSWORD: ${APP_ADMIN_PASSWORD}
+  BOOTSTRAP_ADMIN_API_KEY: ${APP_ADMIN_API_KEY}
+
+  OPENAI_API_BASE_URLS: https://openrouter.ai/api/v1
+  OPENAI_API_KEYS: ${APP_OPENROUTER_API_KEY}
+  OPENAI_API_CONFIGS:
+    "0":
+      model_call_tracing: openrouter
+
+  CATALOG_MODELS:
+    - id: TODO
+      name: TODO
+      base_model_id: TODO
+      meta: {}
+      params: {}
+  SKILL_PACKS:
+    - git_url: TODO
+      ref: main
+
+  # Without Landlock on the Docker host, skill runs cannot be confined.
+  SKILL_SANDLOCK: "false"
+
+  # The app must trace into the Langfuse project the harness reads.
+  LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL}
+  LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+  LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY}

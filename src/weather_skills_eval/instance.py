@@ -1,10 +1,14 @@
 """One throwaway app container per run.
 
-The container starts from the image with only the configuration's
+The configured image is pulled before every run, so a stale local tag never
+runs. The container starts from that image with only the configuration's
 environment and no volumes, so its storage starts empty. It is removed when
-the run ends, whether the run succeeded or not.
+the run ends, whether the run succeeded or not. Containers left by an earlier
+run that was killed before it could clean up carry the same label and are
+removed when the next run starts.
 """
 
+import logging
 import time
 import uuid
 from collections.abc import Callable
@@ -12,9 +16,15 @@ from collections.abc import Callable
 import docker.errors
 import httpx
 
+log = logging.getLogger(__name__)
+
+LABEL = "weather-skills-eval"
+LABEL_VALUE = "app"
+
 
 class AppStartError(Exception):
-    """The app container exited or never answered /health. Carries its logs."""
+    """The app image could not be pulled, or its container exited, disappeared
+    or never answered /health. Carries the container logs when there are any."""
 
 
 def _health_ok(url: str) -> bool:
@@ -25,9 +35,20 @@ def _health_ok(url: str) -> bool:
     if response.status_code != 200:
         return False
     try:
-        return response.json().get("status") is True
+        data = response.json()
     except ValueError:
         return False
+    return isinstance(data, dict) and data.get("status") is True
+
+
+def repository_of(ref: str) -> str:
+    """``ghcr.io/org/app:tag`` and ``ghcr.io/org/app@sha256:...`` -> ``ghcr.io/org/app``."""
+    if "@" in ref:
+        return ref.split("@", 1)[0]
+    head, _, last = ref.rpartition("/")
+    if ":" in last:
+        last = last.split(":", 1)[0]
+    return f"{head}/{last}" if head else last
 
 
 class AppInstance:
@@ -63,11 +84,31 @@ class AppInstance:
     def base_url(self) -> str:
         return f"http://{self.name}:{self._port}"
 
-    def _image(self):
+    def _pull(self):
         try:
-            return self._docker.images.get(self._image_ref)
-        except docker.errors.ImageNotFound:
             return self._docker.images.pull(self._image_ref)
+        except docker.errors.DockerException as exc:
+            raise AppStartError(f"Image {self._image_ref} could not be pulled: {exc}") from exc
+
+    def _digest(self, image) -> str:
+        repository = repository_of(self._image_ref)
+        for digest in image.attrs.get("RepoDigests") or []:
+            if digest.split("@", 1)[0] == repository:
+                return digest
+        raise AppStartError(
+            f"Image {self._image_ref} has no digest for {repository} "
+            f"(digests: {image.attrs.get('RepoDigests') or []})"
+        )
+
+    def _remove_leftovers(self) -> None:
+        for container in self._docker.containers.list(
+            all=True, filters={"label": f"{LABEL}={LABEL_VALUE}"}
+        ):
+            log.warning("Removing container %s left by an earlier run", container.name)
+            try:
+                container.remove(force=True, v=True)
+            except docker.errors.DockerException as exc:
+                log.warning("Could not remove %s: %s", container.name, exc)
 
     def _logs(self) -> str:
         try:
@@ -79,7 +120,10 @@ class AppInstance:
         deadline = self._clock() + self._start_timeout
         url = f"{self.base_url}/health"
         while True:
-            self.container.reload()
+            try:
+                self.container.reload()
+            except docker.errors.NotFound as exc:
+                raise AppStartError("App container disappeared before answering /health") from exc
             if self.container.status in ("exited", "dead"):
                 raise AppStartError(
                     f"App container exited before answering /health.\n"
@@ -95,30 +139,34 @@ class AppInstance:
             self._sleep(self._poll_interval)
 
     def remove(self) -> None:
-        if self.container is None:
-            return
+        """Remove this run's container by name. Never raises: a cleanup error
+        must not replace the error that ended the run."""
+        self.container = None
         try:
-            self.container.remove(force=True, v=True)
+            self._docker.containers.get(self.name).remove(force=True, v=True)
         except docker.errors.NotFound:
             pass
-        self.container = None
+        except Exception as exc:
+            log.error("Could not remove app container %s: %s", self.name, exc)
 
     def __enter__(self) -> "AppInstance":
-        image = self._image()
-        digests = image.attrs.get("RepoDigests") or []
-        self.image_digest = digests[0] if digests else image.id
-        self.container = self._docker.containers.run(
-            image.id,
-            detach=True,
-            name=self.name,
-            environment=self._env,
-            network=self._network,
-            labels={"weather-skills-eval": "app"},
-        )
+        self._remove_leftovers()
+        image = self._pull()
+        self.image_digest = self._digest(image)
         try:
+            self.container = self._docker.containers.run(
+                image.id,
+                detach=True,
+                name=self.name,
+                environment=self._env,
+                network=self._network,
+                labels={LABEL: LABEL_VALUE},
+            )
             self._wait_for_health()
-        except BaseException:
+        except BaseException as exc:
             self.remove()
+            if isinstance(exc, docker.errors.DockerException):
+                raise AppStartError(f"App container could not start: {exc}") from exc
             raise
         return self
 

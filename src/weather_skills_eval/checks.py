@@ -16,7 +16,7 @@ class CheckResult:
 
 async def _meets(app: AppClient, chat_id: str, check: ArtifactCheck, entry: dict) -> str | None:
     """None when the entry meets every condition, else why not."""
-    path = entry.get("path", "")
+    path = entry["path"]
     if check.kind and entry.get("kind") != check.kind:
         return f"{path} is {entry.get('kind')}, not {check.kind}"
     if check.variables or check.dims:
@@ -47,10 +47,16 @@ async def run_checks(
         return []
     if chat_id is None:
         return [CheckResult(check, False, "no chat yet") for check in checks]
-    entries = await app.artifacts(chat_id)
+    try:
+        listed = await app.artifacts(chat_id)
+    except ChatError as exc:
+        return [
+            CheckResult(check, False, f"chat files could not be listed: {exc}") for check in checks
+        ]
+    entries = [e for e in listed if isinstance(e, dict) and isinstance(e.get("path"), str)]
     results = []
     for check in checks:
-        matches = [e for e in entries if fnmatchcase(e.get("path", ""), check.path)]
+        matches = [e for e in entries if fnmatchcase(e["path"], check.path)]
         if not matches:
             results.append(CheckResult(check, False, f"no file matches {check.path}"))
             continue

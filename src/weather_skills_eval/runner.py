@@ -7,7 +7,7 @@ Order of a run:
 4. Read the resolved configuration from the app (tools, skill pack commits).
 5. Run the experiment: each item's task plays the task and returns its
    scores, which the evaluator records on the item.
-6. Remove the container, whatever happened.
+6. Remove the container and flush Langfuse, whatever happened.
 """
 
 import asyncio
@@ -22,7 +22,11 @@ from .instance import AppInstance
 from .langfuse_gateway import LangfuseGateway
 from .play import PlayDeps, play
 from .settings import Settings, load_settings
-from .tasks import parse_task
+from .tasks import parse_tasks
+
+
+class DatasetError(Exception):
+    """The dataset is missing, cannot be read, or has no items."""
 
 
 @dataclass
@@ -44,6 +48,7 @@ async def _resolved(app: AppClient) -> tuple[list[str], list[dict]]:
             "commit_sha": p.get("commit_sha"),
         }
         for p in await app.skill_packs()
+        if isinstance(p, dict)
     ]
     return tool_ids, packs
 
@@ -61,11 +66,43 @@ def run(
     settings = load_settings(environ)
     config: RunConfig = load_config(config_path, environ)
     gateway = (gateway_factory or _default_gateway)(settings)
+    try:
+        return _run(
+            config,
+            settings,
+            gateway,
+            docker_client_factory=docker_client_factory,
+            app_transport=app_transport,
+            instance_options=instance_options,
+            play_options=play_options,
+        )
+    finally:
+        gateway.flush()
 
-    dataset = gateway.dataset(config.dataset)
-    tasks = {item.id: parse_task(item) for item in dataset.items}
-    if not tasks:
-        raise ValueError(f"Dataset {config.dataset} has no items")
+
+def _read_dataset(gateway: LangfuseGateway, name: str):
+    try:
+        dataset = gateway.dataset(name)
+    except Exception as exc:
+        raise DatasetError(f"Dataset {name} could not be read from Langfuse: {exc}") from exc
+    if not dataset.items:
+        raise DatasetError(f"Dataset {name} has no items")
+    return dataset
+
+
+def _run(
+    config: RunConfig,
+    settings: Settings,
+    gateway: LangfuseGateway,
+    *,
+    docker_client_factory,
+    app_transport,
+    instance_options,
+    play_options,
+) -> RunSummary:
+    dataset = _read_dataset(gateway, config.dataset)
+    tasks = parse_tasks(dataset.items)
+    dataset_version = getattr(dataset, "version", None)
 
     with AppInstance(
         docker_client=docker_client_factory(),
@@ -96,8 +133,13 @@ def run(
             "model": config.model,
             "env_var_names": ",".join(config.env_names),
             "skill_packs": json.dumps(packs),
+            "tool_ids": ",".join(tool_ids),
             "simulated_user_model": settings.simulated_user_model,
             "judge_model": settings.judge_model,
+            "harness_commit": settings.harness_commit or "unrecorded",
+            "dataset": config.dataset,
+            "dataset_version": dataset_version.isoformat() if dataset_version else "latest",
+            "dataset_items": str(len(tasks)),
         }
 
         async def task_fn(*, item, **kwargs):
@@ -132,7 +174,6 @@ def run(
             concurrency=settings.concurrency,
         )
 
-    gateway.flush()
     outputs = [r.output or {} for r in result.item_results]
     return RunSummary(
         experiment_name=config.name,
@@ -150,4 +191,5 @@ def _default_gateway(settings: Settings) -> LangfuseGateway:
         trace_timeout=settings.trace_timeout,
         trace_settle=settings.trace_settle,
         poll_interval=settings.poll_interval,
+        model_retries=settings.model_retries,
     )
