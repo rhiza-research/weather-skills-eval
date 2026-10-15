@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "weather-skills-eval"
+version = "0.1.0"
+description = "Plays a task suite against a weather-skills-chat configuration and records each run as a Langfuse experiment."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "docker>=7.2.0",
+    "httpx>=0.28.1",
+    "langfuse>=5.0.1",
+    "langwatch-scenario>=1.6.0",
+    "litellm>=1.105.1",
+    "pydantic>=2.14.1",
+    "pyyaml>=6.0.3",
+]
+
+[project.scripts]
+weather-skills-eval = "weather_skills_eval.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.17.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/weather_skills_eval"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]

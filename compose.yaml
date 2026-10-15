@@ -1,0 +1,23 @@
+services:
+  test:
+    build: .
+    # Tests use fakes only; without a network they cannot reach a live service.
+    network_mode: none
+    command: ["sh", "-c", "ruff format --check . && ruff check . && pytest"]
+
+  eval:
+    build: .
+    entrypoint: ["weather-skills-eval"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      EVAL_DOCKER_NETWORK: weather-skills-eval
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - eval
+
+networks:
+  eval:
+    name: weather-skills-eval
