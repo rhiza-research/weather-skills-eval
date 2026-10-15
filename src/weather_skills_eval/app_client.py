@@ -111,6 +111,9 @@ class AppClient:
     async def skill_packs(self) -> list[dict]:
         return await self._json("GET", "/api/v1/skills/", list)
 
+    async def catalog_model(self, model_id: str) -> dict:
+        return await self._json("GET", "/api/v1/models/model", dict, params={"id": model_id})
+
     async def create_chat(self, chat: dict) -> str:
         data = await self._json("POST", "/api/v1/chats/new", dict, json={"chat": chat})
         chat_id = data.get("id")

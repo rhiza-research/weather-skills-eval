@@ -8,7 +8,8 @@ Exit codes:
   dataset or a dataset item is invalid, or the dataset is missing or empty.
 - 3: the app did not start (image pull, image not on the Docker host,
   container start, or /health), or Docker failed.
-- 4: the app failed while the harness read its tools and skill packs.
+- 4: the app failed while the harness read its catalog model, tools and
+  skill packs, or reported no base model for the catalog model.
 - 5: Langfuse returned an error.
 - 143: the harness was stopped with SIGTERM; the app container was removed.
 """

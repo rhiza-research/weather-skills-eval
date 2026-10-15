@@ -1,4 +1,5 @@
 import asyncio
+import json
 import uuid
 from types import SimpleNamespace
 
@@ -84,19 +85,64 @@ def test_experiment_records_scores_and_links_the_item_trace_to_the_chat(monkeypa
         )
     )
     result = gateway.run_experiment(
-        dataset=dataset, name="cfg", task=task, metadata={"image": "x"}, concurrency=1
+        dataset=dataset,
+        name="cfg",
+        description="provider/model",
+        task=task,
+        metadata={"image": "x"},
+        concurrency=1,
     )
     client.flush()
 
     assert [e.name for e in result.item_results[0].evaluations] == ["goal_reached"]
+    assert result.description == "provider/model"
     assert [(s["name"], s["value"]) for s in scores] == [("goal_reached", 1.0)]
     spans = exporter.get_finished_spans()
     task_span = next(s for s in spans if s.name == "experiment-item-task")
     assert task_span.attributes["session.id"] == "chat-42"
+    # The description travels on the item spans, where Langfuse reads it.
+    assert task_span.attributes["langfuse.experiment.description"] == "provider/model"
     chat_span = next(s for s in spans if s.name == "chat")
     assert chat_span.attributes["session.id"] == "chat-42"
     assert chat_span.context.trace_id == task_span.context.trace_id
     assert scores[0]["trace_id"] == format(task_span.context.trace_id, "032x")
+
+
+def test_app_cost_rollup_is_a_cost_only_generation_of_the_item(monkeypatch):
+    exporter = InMemorySpanExporter()
+    client = real_client(exporter)
+    gateway = gateway_for(client)
+    monkeypatch.setattr(client, "create_score", lambda **kwargs: None)
+
+    async def task(*, item, **kwargs):
+        gateway.record_app_cost(0.42, ["t1", "t2"])
+        return {"scores": []}
+
+    dataset = SimpleNamespace(
+        run_experiment=lambda **kwargs: client.run_experiment(
+            data=[{"input": "rain next week"}], **kwargs
+        )
+    )
+    gateway.run_experiment(
+        dataset=dataset, name="cfg", description="m", task=task, metadata={}, concurrency=1
+    )
+    client.flush()
+
+    spans = exporter.get_finished_spans()
+    task_span = next(s for s in spans if s.name == "experiment-item-task")
+    rollup = next(s for s in spans if s.name == "app-cost-rollup")
+    attributes = rollup.attributes
+    assert rollup.context.trace_id == task_span.context.trace_id
+    assert attributes["langfuse.observation.type"] == "generation"
+    assert json.loads(attributes["langfuse.observation.cost_details"]) == {"total": 0.42}
+    assert json.loads(attributes["langfuse.observation.input"]) == {"app_trace_ids": ["t1", "t2"]}
+    # No usage and no model: no tokens counted, no price inferred.
+    assert "langfuse.observation.usage_details" not in attributes
+    assert "langfuse.observation.model.name" not in attributes
+    # It belongs to the experiment item, so the item's cost includes it.
+    assert attributes["langfuse.experiment.item.root_observation_id"] == format(
+        task_span.context.span_id, "016x"
+    )
 
 
 def _obs(obs_id, trace_id, kind="GENERATION", name="llm", ended=True, metadata=None):
@@ -108,6 +154,7 @@ def _obs(obs_id, trace_id, kind="GENERATION", name="llm", ended=True, metadata=N
         level=SimpleNamespace(value="DEFAULT"),
         is_root_observation=kind == "SPAN",
         end_time="t" if ended else None,
+        model=f"model-{obs_id}" if kind == "GENERATION" else None,
         usage_details={"input": 1, "output": 1},
         cost_details={"total": 0.1},
         total_cost=0.1,
@@ -191,9 +238,10 @@ def test_chat_observations_read_only_app_traces_and_wait_until_settled():
     assert next(o for o in observations if o["id"] == "g1")["metadata"] == {
         "attributes.gen_ai.usage.input_tokens.cached": "100520"
     }
+    assert next(o for o in observations if o["id"] == "g2")["model"] == "model-g2"
     session_requests = [r for r in api.requests if "session_id" in r]
     assert all(r["name"] == "weather-skills-chat" for r in session_requests)
-    assert all("metadata" in r["fields"].split(",") for r in api.requests)
+    assert all({"metadata", "model"} <= set(r["fields"].split(",")) for r in api.requests)
     assert api.reads >= 5
 
 

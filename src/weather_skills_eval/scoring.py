@@ -28,6 +28,7 @@ BROADCAST_CACHE_READ = "attributes.gen_ai.usage.input_tokens.cached"
 BROADCAST_CACHE_WRITE = "attributes.gen_ai.usage.input_tokens.cache_write"
 
 APP_TRACE_NAME = "weather-skills-chat"
+COST_SCORE = "cost_to_goal_usd"
 
 
 @dataclass
@@ -43,6 +44,8 @@ class TraceMetrics:
     tool_failures: int = 0
     cache_miss_calls: int = 0
     trace_ids: list[str] = field(default_factory=list)
+    # The distinct ``model`` names of the generations.
+    provider_models: list[str] = field(default_factory=list)
 
 
 def _count(value) -> int:
@@ -72,10 +75,13 @@ def _cost(obs: dict) -> float | None:
 
 
 def trace_metrics(observations: list[dict]) -> TraceMetrics:
-    """Observations are dicts with type, name, level, usage_details, cost_details,
-    total_cost and metadata."""
+    """Observations are dicts with type, name, level, model, usage_details,
+    cost_details, total_cost and metadata."""
     metrics = TraceMetrics()
     metrics.trace_ids = sorted({o["trace_id"] for o in observations if o.get("trace_id")})
+    metrics.provider_models = sorted(
+        {o["model"] for o in observations if o.get("type") == "GENERATION" and o.get("model")}
+    )
     for obs in observations:
         kind, level = obs.get("type"), obs.get("level")
         if kind == "GENERATION":
@@ -156,7 +162,7 @@ def build_scores(
         cost_note = f"{note}; {metrics.calls_without_cost} model calls carried no cost"
     scores += [
         Score("model_calls_to_goal", metrics.model_calls, note),
-        Score("cost_to_goal_usd", round(metrics.cost_usd, 6), cost_note),
+        Score(COST_SCORE, round(metrics.cost_usd, 6), cost_note),
         Score("tokens_uncached_input", metrics.tokens_uncached_input, note),
         Score("tokens_cache_read", metrics.tokens_cache_read, note),
         Score("tokens_cache_write", metrics.tokens_cache_write, note),

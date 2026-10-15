@@ -29,7 +29,7 @@ docker compose run --rm -T eval run - < configs/<name>.yaml
 | 1 | The run failed for any other reason |
 | 2 | The run did not start: a harness setting, the configuration file, the dataset or a dataset item is invalid, or the dataset is missing or empty |
 | 3 | The app did not start (image pull, image not on the Docker host, container start or `/health`), or Docker failed |
-| 4 | The app failed while the harness read its tools and skill packs |
+| 4 | The app failed while the harness read its catalog model, tools and skill packs, or reported no base model for the catalog model |
 | 5 | Langfuse returned an error |
 | 143 | The harness was stopped with SIGTERM; the app container was removed |
 
@@ -40,7 +40,7 @@ docker compose run --rm -T eval run - < configs/<name>.yaml
 - `name`: the experiment name; defaults to the file name without `.yaml`, and is required when the configuration is read from stdin.
 - `image`: the app image. Unless `pull` is `false`, it is pulled before every run, and the experiment records its digest.
 - `pull`: `true` (the default) or `false`. With `false` the image is not pulled: the run uses the image already on the daemon of the current Docker context, such as one built there and never pushed, and stops when it is not there. With a remote context, the image must be built on that remote daemon. Its digest is recorded when the image has one for its repository, and is empty otherwise.
-- `model`: id of the catalog model the chats use.
+- `model`: id of the catalog model the chats use (an `id` in `CATALOG_MODELS`).
 - `dataset`: the Langfuse dataset holding the tasks.
 - `env`: the app's whole environment; nothing else is set.
 
@@ -52,6 +52,7 @@ Rules:
 - A variable, or a key inside a mapping value, whose name has the word key, secret, password or token in it (singular or plural; `tokens` alone, as in `max_tokens`, does not count) must be exactly one `${NAME}` reference. A literal value stops the run.
 - Values are strings. Mappings and lists are written to the variable as JSON, after their references are replaced.
 - The app listens on `PORT` from `env`, 8080 when unset.
+- `OPENAI_API_CONFIGS`, when set, must map each connection to an object whose `enable` is a boolean, `prefix_id` a string and `model_ids` a list of strings. The harness reads these three keys to name the base model (see [Scores](#scores)).
 - The app and the harness must use the same Langfuse project: the harness reads the app's traces with its own keys. The example passes the harness's Langfuse keys and address to the app.
 
 ## Harness settings
@@ -133,9 +134,11 @@ Each item of the experiment gets these scores. When the goal is not reached, the
 | `cache_miss_calls` | Model calls that wrote at least 50,000 tokens of context (uncached input plus cache write) |
 | `time_to_answer_seconds` | Time the app spent on turns that got a reply, from sending each message until its reply was done; pauses and failed turns are excluded |
 
-Trace-based scores (model calls, cost, tokens, tools, cache misses) are read from the app's Langfuse traces of the chat: traces named `weather-skills-chat` with session id = chat id, one per turn the app accepted, once they stop changing. The item output's `trace_scores` says whether they are `complete`, `partial` (traces were still arriving at the timeout) or `missing` (with the reason, such as a Langfuse error or no traces arriving); when they are missing, the `goal_reached` comment says so too and the other scores are still recorded. Each item's output holds the chat id and the app's trace ids, and the item's trace carries the chat id as its session id.
+Trace-based scores (model calls, cost, tokens, tools, cache misses) are read from the app's Langfuse traces of the chat: traces named `weather-skills-chat` with session id = chat id, one per turn the app accepted, once they stop changing. The item output's `trace_scores` says whether they are `complete`, `partial` (traces were still arriving at the timeout) or `missing` (with the reason, such as a Langfuse error or no traces arriving); when they are missing, the `goal_reached` comment says so too and the other scores are still recorded. Each item's output holds the chat id, the app's trace ids and `provider_models`, and the item's trace carries the chat id as its session id. `provider_models` lists the distinct `model` names of the app's generations in those traces: the model OpenRouter reports for calls it records with Broadcast, the model the app requested for calls the app records. It is empty when the trace scores are missing.
 
-The experiment's metadata holds the resolved configuration: image with its digest and image id and whether it was pulled, the app's environment variable names, installed skill packs with their commits, the tool ids the chats used, the chat model, the simulated user and judge models, the harness commit, and the dataset with its version and item count.
+The experiment's per-item cost in Langfuse is the app's cost: the item's trace holds one generation named `app-cost-rollup` whose cost is the item's `cost_to_goal_usd`, with no model and no token counts. It is recorded whenever that score is, and leaves out the simulated user and judge. The rollup repeats the app's cost: a cost total over the chat's session, or across the `sdk-experiment` environment (where Langfuse records the item traces) and the app's, counts it twice unless generations named `app-cost-rollup` are left out.
+
+The experiment's metadata holds the resolved configuration: image with its digest and image id and whether it was pulled, the app's environment variable names, installed skill packs with their commits, the tool ids the chats used, the chat model as `model` and `catalog_model`, the simulated user and judge models, the harness commit, and the dataset with its version and item count. `catalog_model` is the configured catalog id; `model` is the base model the app reports for it, without the `prefix_id` of the connection the app serves it from: like the app, the harness takes the last connection in `OPENAI_API_CONFIGS` that is enabled and whose `model_ids` allow the model (`open-router-.anthropic/claude-haiku-5.5` becomes `anthropic/claude-haiku-5.5`). `model` is also the experiment's description. A base model can be a floating alias such as `~anthropic/claude-opus-latest`; the metadata is written before the plays, so the models that served the calls are only in each item's `provider_models`.
 
 A run plays each task once: Langfuse expects each dataset item to appear once per experiment (Langfuse issue #5855).
 

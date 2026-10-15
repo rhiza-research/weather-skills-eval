@@ -69,6 +69,34 @@ class RunConfig:
     def port(self) -> str:
         return self.env.get("PORT", DEFAULT_APP_PORT)
 
+    @property
+    def connections(self) -> list[dict]:
+        """The connection configs of ``OPENAI_API_CONFIGS``, in the order written."""
+        return _connections(self.env.get("OPENAI_API_CONFIGS"))
+
+
+def _connections(text: str | None) -> list[dict]:
+    """Each connection's ``enable``, ``prefix_id`` and ``model_ids``, the keys
+    the app reads to pick a connection, checked for their types."""
+    if text is None:
+        return []
+    field = "env.OPENAI_API_CONFIGS"
+    try:
+        configs = json.loads(text)
+    except ValueError as exc:
+        raise ConfigError(field, f"is not JSON: {exc}") from exc
+    if not isinstance(configs, dict) or not all(isinstance(c, dict) for c in configs.values()):
+        raise ConfigError(field, "must map each connection to an object")
+    for key, config in configs.items():
+        if not isinstance(config.get("enable", True), bool):
+            raise ConfigError(f"{field}.{key}.enable", "must be true or false")
+        if not isinstance(config.get("prefix_id") or "", str):
+            raise ConfigError(f"{field}.{key}.prefix_id", "must be a string")
+        model_ids = config.get("model_ids") or []
+        if not isinstance(model_ids, list) or not all(isinstance(m, str) for m in model_ids):
+            raise ConfigError(f"{field}.{key}.model_ids", "must be a list of model ids")
+    return list(configs.values())
+
 
 def _text(raw: Mapping, key: str) -> str:
     value = raw.get(key)
@@ -175,6 +203,7 @@ def parse_config(raw: object, *, default_name: str | None, environ: Mapping[str,
     port = env.get("PORT")
     if port is not None and not (port.isdigit() and 1 <= int(port) <= 65535):
         raise ConfigError("env.PORT", f"must be a port number from 1 to 65535, not {port!r}")
+    _connections(env.get("OPENAI_API_CONFIGS"))
 
     return RunConfig(name=name, image=image, model=model, dataset=dataset, env=env, pull=pull)
 

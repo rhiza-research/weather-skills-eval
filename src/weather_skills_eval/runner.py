@@ -4,7 +4,8 @@ Order of a run:
 1. Read the harness settings and the configuration file; stop on any error.
 2. Read the dataset and check every item against the task format.
 3. Start the app container and wait for /health.
-4. Read the resolved configuration from the app (tools, skill pack commits).
+4. Read the resolved configuration from the app (the catalog model's base
+   model, tools, skill pack commits).
 5. Run the experiment: each item's task plays the task and returns its
    scores, which the evaluator records on the item.
 6. Remove the container and flush Langfuse, whatever happened.
@@ -16,11 +17,12 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from .app_client import AppClient, highest_skill_versions
+from .app_client import AppClient, ChatError, highest_skill_versions
 from .config import RunConfig, load_config
 from .instance import AppInstance
 from .langfuse_gateway import LangfuseGateway
 from .play import PlayDeps, play
+from .scoring import COST_SCORE
 from .settings import Settings, load_settings
 from .tasks import parse_tasks
 
@@ -39,7 +41,35 @@ class RunSummary:
     metadata: dict
 
 
-async def _resolved(app: AppClient) -> tuple[list[str], list[dict]]:
+def base_model(entry: dict, catalog_id: str, connections: list[dict]) -> str:
+    """The catalog model's base model id, without the app's connection prefix.
+
+    The app names a connection's models ``<prefix_id>.<id>``. It serves a
+    model from the last enabled connection whose ``model_ids`` allow it (an
+    empty list allows any), and removes that connection's prefix before it
+    calls the provider; this picks the connection the same way.
+    """
+    base = entry.get("base_model_id")
+    if not isinstance(base, str) or not base.strip():
+        raise ChatError(f"The app reports no base model for catalog model {catalog_id}")
+    base = base.strip()
+
+    def bare(prefix: str | None) -> str:
+        return base[len(prefix) + 1 :] if prefix and base.startswith(f"{prefix}.") else base
+
+    serving: dict = {}
+    for connection in connections:
+        allowed = connection.get("model_ids") or []
+        prefix = connection.get("prefix_id")
+        if connection.get("enable", True) and (
+            not allowed or bare(prefix) in allowed or base in allowed
+        ):
+            serving = connection
+    return bare(serving.get("prefix_id"))
+
+
+async def _resolved(app: AppClient, config: RunConfig) -> tuple[list[str], list[dict], str]:
+    model = base_model(await app.catalog_model(config.model), config.model, config.connections)
     tool_ids = highest_skill_versions(await app.tool_summary())
     packs = [
         {
@@ -50,7 +80,7 @@ async def _resolved(app: AppClient) -> tuple[list[str], list[dict]]:
         for p in await app.skill_packs()
         if isinstance(p, dict)
     ]
-    return tool_ids, packs
+    return tool_ids, packs, model
 
 
 def run(
@@ -124,18 +154,19 @@ def _run(
         async def read_resolved():
             app = new_app()
             try:
-                return await _resolved(app)
+                return await _resolved(app, config)
             finally:
                 await app.aclose()
 
-        tool_ids, packs = asyncio.run(read_resolved())
+        tool_ids, packs, model = asyncio.run(read_resolved())
         metadata = {
             "config_name": config.name,
             "image": config.image,
             "image_digest": instance.image_digest or "",
             "image_id": instance.image_id or "",
             "image_pulled": "true" if config.pull else "false",
-            "model": config.model,
+            "model": model,
+            "catalog_model": config.model,
             "env_var_names": ",".join(config.env_names),
             "skill_packs": json.dumps(packs),
             "tool_ids": ",".join(tool_ids),
@@ -169,11 +200,16 @@ def _run(
                 await app.aclose()
             if result.chat_id:
                 gateway.link_item_to_chat(result.chat_id)
+            # Absent when the trace scores are missing; then nothing is recorded.
+            app_cost = next((s.value for s in result.scores if s.name == COST_SCORE), None)
+            if app_cost is not None:
+                gateway.record_app_cost(app_cost, result.app_trace_ids)
             return result.output()
 
         result = gateway.run_experiment(
             dataset=dataset,
             name=config.name,
+            description=model,
             task=task_fn,
             metadata=metadata,
             concurrency=settings.concurrency,

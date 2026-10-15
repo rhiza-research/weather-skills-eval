@@ -127,6 +127,9 @@ class FakeApp:
         self.answer_seconds = answer_seconds
         self.chats: dict[str, dict] = {}
         self.completions: list[dict] = []
+        # What the app reports as the catalog model's base model; None for none.
+        self.base_model_id: str | None = "open-router-.anthropic/claude-haiku-5.5"
+        self.catalog_model_requests: list[str] = []
         # (endpoint, path) of each file request: listings and downloads.
         self.file_requests: list[tuple[str, str | None]] = []
         self.tools = [
@@ -164,6 +167,10 @@ class FakeApp:
                     }
                 ],
             )
+        if path == "/api/v1/models/model":
+            model_id = request.url.params["id"]
+            self.catalog_model_requests.append(model_id)
+            return httpx.Response(200, json={"id": model_id, "base_model_id": self.base_model_id})
         if path == "/api/v1/chats/new":
             chat = json.loads(request.content)["chat"]
             chat_id = f"chat-{len(self.chats) + 1}"
@@ -440,6 +447,7 @@ def app_observations(chat_id: str, turns: int) -> list[dict]:
                 "type": "GENERATION",
                 "name": "llm",
                 "level": "DEFAULT",
+                "model": "provider/model-b",
                 "usage_details": {
                     "input": 80000,
                     "output": 300,
@@ -456,6 +464,7 @@ def app_observations(chat_id: str, turns: int) -> list[dict]:
                 "type": "GENERATION",
                 "name": "llm",
                 "level": "DEFAULT",
+                "model": "provider/model-a",
                 "usage_details": {"input": 77000, "output": 100, "total": 77100},
                 "cost_details": {"total": 0.19},
                 "total_cost": 0.19,
@@ -532,6 +541,8 @@ class FakeGateway:
         self.models = models
         self.experiments: list[dict] = []
         self.linked: list[str] = []
+        # (cost_usd, app_trace_ids) of each app cost rollup.
+        self.app_costs: list[tuple[float, list[str]]] = []
         self.flushed = False
         self.observation_requests: list[tuple[str, int]] = []
         # Replace to change what the app's traces hold, or to raise.
@@ -543,14 +554,19 @@ class FakeGateway:
             raise self.dataset_error
         return SimpleNamespace(name=name, items=self.items, version=None)
 
-    def run_experiment(self, *, dataset, name, task, metadata, concurrency):
+    def run_experiment(self, *, dataset, name, description, task, metadata, concurrency):
         results = []
         for item in dataset.items:
             output = asyncio.run(task(item=item))
             results.append(
                 SimpleNamespace(item=item, output=output, evaluations=play_scores(output=output))
             )
-        experiment = {"name": name, "metadata": metadata, "items": results}
+        experiment = {
+            "name": name,
+            "description": description,
+            "metadata": metadata,
+            "items": results,
+        }
         self.experiments.append(experiment)
         return SimpleNamespace(run_name=f"{name} - run", experiment_url=None, item_results=results)
 
@@ -563,6 +579,9 @@ class FakeGateway:
 
     def link_item_to_chat(self, chat_id: str) -> None:
         self.linked.append(chat_id)
+
+    def record_app_cost(self, cost_usd: float, app_trace_ids: list[str]) -> None:
+        self.app_costs.append((cost_usd, app_trace_ids))
 
     def flush(self) -> None:
         self.flushed = True

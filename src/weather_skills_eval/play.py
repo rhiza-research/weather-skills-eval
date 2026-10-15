@@ -71,6 +71,7 @@ class PlayResult:
     scores: list[Score]
     trace_scores: str
     app_trace_ids: list[str] = field(default_factory=list)
+    provider_models: list[str] = field(default_factory=list)
     paused_seconds: float = 0.0
 
     def output(self) -> dict:
@@ -82,6 +83,7 @@ class PlayResult:
             "error": self.error,
             "trace_scores": self.trace_scores,
             "app_trace_ids": self.app_trace_ids,
+            "provider_models": self.provider_models,
             "paused_seconds": self.paused_seconds,
             "scores": [
                 {"name": s.name, "value": s.value, "comment": s.comment} for s in self.scores
@@ -240,5 +242,6 @@ async def play(task: Task, deps: PlayDeps) -> PlayResult:
         scores=build_scores(facts, metrics, traces_complete, problem),
         trace_scores=trace_scores,
         app_trace_ids=metrics.trace_ids if metrics else [],
+        provider_models=metrics.provider_models if metrics else [],
         paused_seconds=paused,
     )

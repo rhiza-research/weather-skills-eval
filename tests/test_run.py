@@ -18,6 +18,7 @@ from fakes import (
     FakeGateway,
     FakeModels,
     Reply,
+    app_observations,
     broadcast_observations,
     display_image,
     image_bytes,
@@ -27,6 +28,7 @@ from fakes import (
     zarr_entry,
 )
 
+from weather_skills_eval.app_client import ChatError
 from weather_skills_eval.config import ConfigError
 from weather_skills_eval.instance import AppStartError
 from weather_skills_eval.runner import DatasetError, run
@@ -60,6 +62,9 @@ CONFIG = textwrap.dedent(
       BOOTSTRAP_ADMIN_API_KEY: ${APP_API_KEY}
       OPENAI_API_BASE_URLS: https://openrouter.ai/api/v1
       OPENAI_API_KEYS: ${APP_OPENROUTER_KEY}
+      OPENAI_API_CONFIGS:
+        "0":
+          prefix_id: open-router-
       SKILL_SANDLOCK: "false"
       SKILL_PACKS:
         - git_url: https://example.invalid/pack.git
@@ -194,6 +199,12 @@ def test_run_plays_every_task_into_one_experiment_and_removes_the_container(tmp_
     assert "OPENAI_API_KEYS" in metadata["env_var_names"].split(",")
     assert "1234567" in metadata["skill_packs"]
     assert metadata["tool_ids"] == "plot-2,fetch"
+    # The catalog model's base model, without the connection prefix.
+    assert harness.app.catalog_model_requests == ["weather-agent"]
+    assert metadata["model"] == "anthropic/claude-haiku-5.5"
+    assert metadata["catalog_model"] == "weather-agent"
+    assert experiment["description"] == "anthropic/claude-haiku-5.5"
+    assert harness.output()["provider_models"] == ["provider/model-a", "provider/model-b"]
     assert metadata["harness_commit"] == "unrecorded"
     assert metadata["dataset"] == "weather-tasks"
     assert metadata["dataset_version"] == "latest"
@@ -201,6 +212,12 @@ def test_run_plays_every_task_into_one_experiment_and_removes_the_container(tmp_
     assert all(isinstance(v, str) for v in metadata.values())
     assert summary.items == 3 and summary.goals_reached == 3
     assert harness.gateway.linked == ["chat-1", "chat-2", "chat-3"]
+    # Each item's rollup carries its own chat's app traces.
+    assert [ids for _, ids in harness.gateway.app_costs] == [
+        ["chat-1-trace-0"],
+        ["chat-2-trace-0"],
+        ["chat-3-trace-0"],
+    ]
     assert harness.gateway.flushed
     for index in range(3):
         assert harness.output(index)["trace_scores"] == "complete"
@@ -274,6 +291,10 @@ def test_goal_met_records_turns_cost_tokens_and_time(tmp_path):
     assert output["outcome"] == "goal_reached"
     assert output["chat_id"] == "chat-1"
     assert output["app_trace_ids"] == ["chat-1-trace-0", "chat-1-trace-1"]
+    # The item trace carries the app's cost, the same number as the score.
+    assert harness.gateway.app_costs == [
+        (scores["cost_to_goal_usd"], ["chat-1-trace-0", "chat-1-trace-1"])
+    ]
     roles = {role for role, _, _ in harness.models.calls}
     assert roles == {"simulated-user", "judge"}
     assert all(session == "chat-1" for _, session, _ in harness.models.calls)
@@ -688,6 +709,48 @@ def test_langfuse_error_keeps_the_other_scores(tmp_path):
     assert output["trace_scores"].startswith("missing: Langfuse could not be read")
     comment = harness.gateway.experiments[0]["items"][0].evaluations[0].comment
     assert "trace scores missing" in comment
+    assert harness.gateway.app_costs == []
+    assert output["provider_models"] == []
+
+
+def test_catalog_model_without_base_model_stops_the_run(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.app.base_model_id = None
+
+    with pytest.raises(ChatError, match="no base model for catalog model weather-agent"):
+        harness.run()
+
+    assert harness.gateway.experiments == []
+    assert harness.container.removed
+
+
+def zero_cost_observations(chat_id, turns):
+    observations = app_observations(chat_id, turns)
+    for obs in observations:
+        if obs["type"] == "GENERATION":
+            obs.update(cost_details={"total": 0.0}, total_cost=0.0)
+    return observations, True
+
+
+@pytest.mark.parametrize(
+    "observations, trace_scores, cost",
+    [
+        # One turn of app_observations: 0.02 + 0.19.
+        (lambda chat_id, turns: (app_observations(chat_id, turns), False), "partial", 0.21),
+        (zero_cost_observations, "complete", 0.0),
+    ],
+    ids=["partial", "zero-cost"],
+)
+def test_app_cost_rollup_matches_the_cost_score(tmp_path, observations, trace_scores, cost):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.gateway.observations = observations
+    harness.run()
+
+    assert harness.output()["trace_scores"].startswith(trace_scores)
+    assert harness.scores()["cost_to_goal_usd"] == pytest.approx(cost)
+    assert harness.gateway.app_costs == [(harness.scores()["cost_to_goal_usd"], ["chat-1-trace-0"])]
 
 
 def test_traces_that_never_arrive_are_recorded_as_missing(tmp_path):

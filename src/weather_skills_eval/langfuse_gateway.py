@@ -6,7 +6,9 @@ reads the app's traces from the project its own keys belong to.
 - The task suite: a Langfuse dataset.
 - The run: one experiment on that dataset (``DatasetClient.run_experiment``),
   with one item per task and the play's scores on each item. Each item's
-  trace carries the chat id as its session id.
+  trace carries the chat id as its session id, and an ``app-cost-rollup``
+  generation whose cost is the play's ``cost_to_goal_usd``, so the
+  experiment's per-item cost shows the app's cost.
 - The simulated user's and the judge's model calls: each call is its own
   trace, with user id ``simulated-user`` or ``judge``, session id = the chat
   id, in the harness's Langfuse environment.
@@ -27,9 +29,10 @@ from opentelemetry.sdk.trace import TracerProvider
 
 from .scoring import APP_TRACE_NAME
 
-OBSERVATION_FIELDS = "core,basic,usage,metadata"
+OBSERVATION_FIELDS = "core,basic,model,usage,metadata"
 PAGE_SIZE = 1000
 SESSION_ATTRIBUTE = "session.id"
+APP_COST_ROLLUP = "app-cost-rollup"
 
 
 class TraceReadError(Exception):
@@ -65,6 +68,7 @@ def _normalize(observation) -> dict:
         "level": getattr(level, "value", level),
         "is_root": bool(observation.is_root_observation),
         "end_time": observation.end_time,
+        "model": observation.model,
         "usage_details": observation.usage_details or {},
         "cost_details": observation.cost_details or {},
         "total_cost": observation.total_cost,
@@ -107,9 +111,12 @@ class LangfuseGateway:
     def dataset(self, name: str):
         return self.client.get_dataset(name)
 
-    def run_experiment(self, *, dataset, name: str, task, metadata: dict, concurrency: int):
+    def run_experiment(
+        self, *, dataset, name: str, description: str, task, metadata: dict, concurrency: int
+    ):
         return dataset.run_experiment(
             name=name,
+            description=description,
             task=task,
             evaluators=[play_scores],
             max_concurrency=concurrency,
@@ -127,6 +134,22 @@ class LangfuseGateway:
         with propagate_attributes(session_id=chat_id):
             with self.client.start_as_current_observation(name="chat", input={"chat_id": chat_id}):
                 pass
+
+    def record_app_cost(self, cost_usd: float, app_trace_ids: list[str]) -> None:
+        """Record the app's cost on the current experiment item's trace.
+
+        Called inside the experiment task. Langfuse sets cost only on
+        generations, and the experiment's per-item cost sums the item
+        trace's generations. The rollup has no model and no usage, so Langfuse
+        infers no price and counts no tokens for it.
+        """
+        with self.client.start_as_current_observation(
+            name=APP_COST_ROLLUP,
+            as_type="generation",
+            input={"app_trace_ids": app_trace_ids},
+            cost_details={"total": cost_usd},
+        ):
+            pass
 
     def traced_completion(self, role: str, session_id: str | None, **kwargs):
         # A fresh context makes the call a trace of its own instead of a child

@@ -19,7 +19,7 @@ from weather_skills_eval.config import ConfigError, load_config, parse_config
 from weather_skills_eval.instance import AppInstance, AppStartError, repository_of
 from weather_skills_eval.judge import rate_answer
 from weather_skills_eval.play import neutral_transcript
-from weather_skills_eval.runner import DatasetError
+from weather_skills_eval.runner import DatasetError, base_model
 from weather_skills_eval.settings import SettingsError, load_settings
 from weather_skills_eval.tasks import TaskError, parse_task
 
@@ -92,6 +92,54 @@ def test_invalid_port_stops_the_run(port):
 
 def test_valid_port_is_used():
     assert parse({"PORT": "3000"}).port == "3000"
+
+
+@pytest.mark.parametrize(
+    "configs, field, message",
+    [
+        ("not json", "env.OPENAI_API_CONFIGS", "is not JSON"),
+        ('["a"]', "env.OPENAI_API_CONFIGS", "must map each connection"),
+        ('{"0": "a"}', "env.OPENAI_API_CONFIGS", "must map each connection"),
+        ({"0": {"prefix_id": 1}}, "env.OPENAI_API_CONFIGS.0.prefix_id", "string"),
+        ({"0": {"enable": "no"}}, "env.OPENAI_API_CONFIGS.0.enable", "true or false"),
+        ({"0": {"model_ids": "m"}}, "env.OPENAI_API_CONFIGS.0.model_ids", "list"),
+    ],
+)
+def test_invalid_connection_configs_stop_the_run(configs, field, message):
+    with pytest.raises(ConfigError, match=message) as error:
+        parse({"OPENAI_API_CONFIGS": configs})
+    assert error.value.field == field
+
+
+ROUTER = {"prefix_id": "open-router-"}
+
+
+@pytest.mark.parametrize(
+    "base, connections, expected",
+    [
+        ("open-router-.anthropic/claude-haiku-5.5", [ROUTER], "anthropic/claude-haiku-5.5"),
+        (" open-router-.anthropic/claude-haiku-5.5 ", [ROUTER], "anthropic/claude-haiku-5.5"),
+        ("anthropic/claude-haiku-5.5", [], "anthropic/claude-haiku-5.5"),
+        ("~anthropic/claude-opus-latest", [ROUTER], "~anthropic/claude-opus-latest"),
+        # The last connection that may serve the model wins, as in the app.
+        ("a.b.model", [{"prefix_id": "a.b"}, {"prefix_id": "a"}], "b.model"),
+        ("a.b.model", [{"prefix_id": "a"}, {"prefix_id": "a.b"}], "model"),
+        # A disabled connection, or one whose model_ids leave the model out, does not serve it.
+        ("a.model", [{"prefix_id": "a"}, {"prefix_id": "b", "enable": False}], "model"),
+        ("a.model", [{"prefix_id": "a"}, {"model_ids": ["other"]}], "model"),
+        ("a.model", [{}, {"prefix_id": "a", "model_ids": ["model"]}], "model"),
+        # A connection without a prefix serving the model leaves it as is.
+        ("a.model", [{"prefix_id": "a"}, {}], "a.model"),
+    ],
+)
+def test_base_model_drops_the_serving_connections_prefix(base, connections, expected):
+    assert base_model({"base_model_id": base}, "catalog", connections) == expected
+
+
+def test_connections_are_read_in_the_order_written():
+    configs = {"0": {"prefix_id": "a"}, "1": {"enable": False}}
+    assert parse({"OPENAI_API_CONFIGS": configs}).connections == list(configs.values())
+    assert parse().connections == []
 
 
 def test_non_utf8_config_file_is_a_config_error(tmp_path):
