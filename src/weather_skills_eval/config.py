@@ -12,9 +12,11 @@ are not.
 
 import json
 import re
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 import yaml
 
@@ -133,7 +135,9 @@ def _env_value(name: str, value: object, environ: Mapping[str, str]) -> str:
     raise ConfigError(field, "must be a string, or a mapping or list written as JSON")
 
 
-def parse_config(raw: object, *, default_name: str, environ: Mapping[str, str]) -> RunConfig:
+def parse_config(raw: object, *, default_name: str | None, environ: Mapping[str, str]) -> RunConfig:
+    """``default_name`` is used when the file has no ``name``; with ``None``
+    (a configuration read from stdin) ``name`` is required."""
     if not isinstance(raw, Mapping):
         raise ConfigError("<root>", "must be a mapping")
     for key in raw:
@@ -142,6 +146,8 @@ def parse_config(raw: object, *, default_name: str, environ: Mapping[str, str]) 
     for key in REQUIRED_KEYS:
         if key not in raw:
             raise ConfigError(key, "is missing")
+    if default_name is None and "name" not in raw:
+        raise ConfigError("name", "is missing; a configuration read from stdin needs one")
 
     name = _text(raw, "name") if "name" in raw else default_name
     image = _text(raw, "image")
@@ -169,15 +175,33 @@ def parse_config(raw: object, *, default_name: str, environ: Mapping[str, str]) 
     return RunConfig(name=name, image=image, model=model, dataset=dataset, env=env)
 
 
-def load_config(path: Path, environ: Mapping[str, str]) -> RunConfig:
+STDIN = "-"
+
+
+def _from_text(
+    text: str, *, source: str, default_name: str | None, environ: Mapping[str, str]
+) -> RunConfig:
+    try:
+        raw = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ConfigError(source, f"is not valid YAML: {exc}") from exc
+    return parse_config(raw, default_name=default_name, environ=environ)
+
+
+def load_config(path: Path, environ: Mapping[str, str], stdin: BinaryIO | None = None) -> RunConfig:
+    """Read the configuration from ``path``, or from ``stdin`` when ``path`` is ``-``."""
+    if str(path) == STDIN:
+        source = "<stdin>"
+        stream = stdin if stdin is not None else sys.stdin.buffer
+        try:
+            text = stream.read().decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ConfigError(source, f"is not UTF-8 text: {exc}") from exc
+        return _from_text(text, source=source, default_name=None, environ=environ)
     try:
         text = path.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:
         raise ConfigError(str(path), f"is not UTF-8 text: {exc}") from exc
     except OSError as exc:
         raise ConfigError(str(path), f"cannot be read: {exc}") from exc
-    try:
-        raw = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        raise ConfigError(str(path), f"is not valid YAML: {exc}") from exc
-    return parse_config(raw, default_name=path.stem, environ=environ)
+    return _from_text(text, source=str(path), default_name=path.stem, environ=environ)

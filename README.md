@@ -13,12 +13,13 @@ Everything runs in Docker.
 ```sh
 cp .env.example .env        # fill in the harness settings and the values your config references
 cp configs/example.yaml configs/<name>.yaml   # replace every TODO
-HARNESS_COMMIT=$(git rev-parse HEAD) docker compose run --rm --build eval run configs/<name>.yaml
+HARNESS_COMMIT=$(git rev-parse HEAD) docker compose build eval
+docker compose run --rm -T eval run - < configs/<name>.yaml
 ```
 
-- The eval service mounts `./configs` read-only at `/app/configs`, so configuration files live in `configs/` and editing one does not rebuild the image. A bind mount needs the files on the Docker host, so with a remote Docker context the `configs/` folder must exist at the same path on that host.
+- `run -` reads the configuration from stdin, so it works with a remote Docker context, where a bind mount from this machine would not reach the daemon. A configuration read from stdin must set `name`. `run <path>` reads a file inside the container instead.
 - `HARNESS_COMMIT` is baked into the image and recorded in each experiment's metadata; without it the metadata says `unrecorded`.
-- The eval service reaches the Docker daemon of the current Docker context through its socket. It pulls the configured image, starts the app container on the `weather-skills-eval` network, and removes it when the run ends, also when the run fails or the harness receives SIGTERM. When a run starts it also removes containers left by an earlier run (label `weather-skills-eval=app`), so two runs must not share one Docker daemon at the same time.
+- The eval service reaches the Docker daemon of the current Docker context through its socket. It pulls the configured image, starts the app container on the `weather-skills-eval` network, and removes it when the run ends, also when the run fails or the harness receives SIGTERM. Each app container is labeled with its run id (`weather-skills-eval.run`), and a run only touches its own container, so several runs can share one Docker daemon. A harness killed with SIGKILL cannot clean up: remove its container by that label by hand.
 
 Tests and lint, in a container without network access:
 
@@ -42,7 +43,7 @@ docker compose run --rm --build test
 
 `configs/example.yaml` is a complete example. Its keys:
 
-- `name`: the experiment name; defaults to the file name without `.yaml`.
+- `name`: the experiment name; defaults to the file name without `.yaml`, and is required when the configuration is read from stdin.
 - `image`: the app image. It is pulled before every run, and the experiment records its digest.
 - `model`: id of the catalog model the chats use.
 - `dataset`: the Langfuse dataset holding the tasks.

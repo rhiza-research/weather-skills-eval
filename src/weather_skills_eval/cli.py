@@ -1,4 +1,4 @@
-"""``weather-skills-eval run <config>``.
+"""``weather-skills-eval run <config>``; ``run -`` reads the configuration from stdin.
 
 Exit codes:
 
@@ -55,7 +55,9 @@ def main(argv: list[str] | None = None, *, docker_client_factory=_docker_client)
     run_parser = commands.add_parser(
         "run", help="Play every task in the dataset against one configuration"
     )
-    run_parser.add_argument("config", type=Path, help="Configuration file (YAML)")
+    run_parser.add_argument(
+        "config", type=Path, help="Configuration file (YAML), or - to read it from stdin"
+    )
     args = parser.parse_args(argv)
 
     signal.signal(signal.SIGTERM, _terminate)

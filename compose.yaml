@@ -21,7 +21,6 @@ services:
       EVAL_DOCKER_NETWORK: weather-skills-eval
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./configs:/app/configs:ro
     networks:
       - eval
 

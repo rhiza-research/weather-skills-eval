@@ -62,9 +62,11 @@ def run(
     app_transport=None,
     instance_options: dict | None = None,
     play_options: dict | None = None,
+    stdin=None,
 ) -> RunSummary:
+    """``config_path`` is a file, or ``-`` to read the configuration from stdin."""
     settings = load_settings(environ)
-    config: RunConfig = load_config(config_path, environ)
+    config: RunConfig = load_config(config_path, environ, stdin=stdin)
     gateway = (gateway_factory or _default_gateway)(settings)
     try:
         return _run(

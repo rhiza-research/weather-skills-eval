@@ -1,11 +1,14 @@
 import asyncio
+import io
 import json
+import types
 from pathlib import Path
 
 import docker.errors
 import httpx
 import litellm
 import pytest
+from fakes import FakeContainer
 from langfuse.api.core.api_error import ApiError as LangfuseApiError
 
 from weather_skills_eval import cli
@@ -13,7 +16,7 @@ from weather_skills_eval import instance as instance_module
 from weather_skills_eval.app_client import AppClient, ChatError
 from weather_skills_eval.checks import run_checks
 from weather_skills_eval.config import ConfigError, load_config, parse_config
-from weather_skills_eval.instance import AppStartError, repository_of
+from weather_skills_eval.instance import AppInstance, AppStartError, repository_of
 from weather_skills_eval.judge import rate_answer
 from weather_skills_eval.play import neutral_transcript
 from weather_skills_eval.runner import DatasetError
@@ -327,3 +330,102 @@ def test_sigterm_handler_unwinds_with_exit_code_143():
     with pytest.raises(SystemExit) as exit_info:
         cli._terminate(15, None)
     assert exit_info.value.code == 143
+
+
+def test_cli_passes_dash_through_to_read_stdin(monkeypatch):
+    seen = []
+
+    def recording_run(path, environ, **kwargs):
+        seen.append(path)
+        raise SettingsError("stop here")
+
+    monkeypatch.setattr(cli, "run", recording_run)
+    cli.main(["run", "-"])
+    assert str(seen[0]) == "-"
+
+
+def test_load_config_from_stdin_and_from_a_path(tmp_path):
+    text = (
+        "name: from-stdin\nimage: img:tag\nmodel: m\ndataset: d\nenv:\n"
+        "  WEBUI_SECRET_KEY: ${S}\n  BOOTSTRAP_ADMIN_EMAIL: admin\n"
+        "  BOOTSTRAP_ADMIN_PASSWORD: ${P}\n  BOOTSTRAP_ADMIN_API_KEY: ${K}\n"
+    )
+    assert load_config(Path("-"), ENVIRON, stdin=io.BytesIO(text.encode())).name == "from-stdin"
+    path = tmp_path / "file.yaml"
+    path.write_text(text.replace("name: from-stdin\n", ""))
+    assert load_config(path, ENVIRON).name == "file"
+    with pytest.raises(ConfigError, match="not UTF-8"):
+        load_config(Path("-"), ENVIRON, stdin=io.BytesIO(b"\xff\xfe"))
+
+
+class SharedDaemon:
+    """One Docker daemon shared by several runs. Listing containers is not
+    allowed: a run must only touch the container it started."""
+
+    def __init__(self):
+        self.containers_by_name: dict[str, FakeContainer] = {}
+        self.labels: dict[str, dict] = {}
+        image = types.SimpleNamespace(
+            id="sha256:image", attrs={"RepoDigests": ["ghcr.io/org/app@sha256:abc"]}
+        )
+        daemon = self
+
+        class Images:
+            def pull(self, ref):
+                return image
+
+        class Containers:
+            def run(self, image_id, *, name, labels, **kwargs):
+                container = FakeContainer(["running"], name=name)
+                daemon.containers_by_name[name] = container
+                daemon.labels[name] = labels
+                return container
+
+            def get(self, name):
+                if name not in daemon.containers_by_name:
+                    raise docker.errors.NotFound(name)
+                return daemon.containers_by_name[name]
+
+            def list(self, **kwargs):
+                raise AssertionError("a run must not list other runs' containers")
+
+        self.images = Images()
+        self.containers = Containers()
+
+
+def instance_on(daemon) -> AppInstance:
+    return AppInstance(
+        docker_client=daemon,
+        image="ghcr.io/org/app:1",
+        env={},
+        network="n",
+        port="8080",
+        start_timeout=10,
+        poll_interval=1,
+        health_check=lambda url: True,
+    )
+
+
+def test_concurrent_runs_on_one_daemon_do_not_interfere():
+    daemon = SharedDaemon()
+    first, second = instance_on(daemon), instance_on(daemon)
+
+    with first:
+        with second:
+            run_ids = {labels["weather-skills-eval.run"] for labels in daemon.labels.values()}
+            assert run_ids == {first.run_id, second.run_id}
+            assert len(run_ids) == 2
+        assert daemon.containers_by_name[second.name].removed
+        assert not daemon.containers_by_name[first.name].removed
+    assert daemon.containers_by_name[first.name].removed
+
+
+def test_sigterm_during_a_run_removes_its_container():
+    daemon = SharedDaemon()
+    instance = instance_on(daemon)
+
+    with pytest.raises(SystemExit):
+        with instance:
+            cli._terminate(15, None)
+
+    assert daemon.containers_by_name[instance.name].removed

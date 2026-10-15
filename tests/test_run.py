@@ -1,7 +1,9 @@
 """The I/O and edge-case matrix, end to end through ``runner.run`` with a fake app,
 fake Docker, fake Langfuse and fake harness models."""
 
+import io
 import textwrap
+from pathlib import Path
 
 import docker.errors
 import pytest
@@ -104,10 +106,11 @@ class Harness:
         self.health_checks += 1
         return True
 
-    def run(self, health=None):
+    def run(self, health=None, config_path=None, stdin=None):
         return run(
-            self.config_path,
+            config_path or self.config_path,
             ENVIRON,
+            stdin=stdin,
             docker_client_factory=lambda: self.docker,
             gateway_factory=lambda settings: self.gateway,
             app_transport=self.app.transport,
@@ -180,7 +183,31 @@ def test_run_plays_every_task_into_one_experiment_and_removes_the_container(tmp_
         assert harness.output(index)["trace_scores"] == "complete"
     # Highest version per skill name, other tools kept.
     assert harness.app.completions[0]["tool_ids"] == ["plot-2", "fetch"]
-    assert harness.docker.list_filters == [{"label": "weather-skills-eval=app"}]
+    # The container carries its run id, and no other container is listed or touched.
+    assert call["labels"]["weather-skills-eval.run"] in call["name"]
+    assert harness.docker.list_filters == []
+
+
+def test_config_read_from_stdin(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+
+    harness.run(config_path=Path("-"), stdin=io.BytesIO(CONFIG.encode()))
+
+    assert harness.gateway.experiments[0]["name"] == "production-agent"
+    assert harness.scores()["goal_reached"] == 1.0
+
+
+def test_config_from_stdin_must_name_the_experiment(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    unnamed = CONFIG.replace("name: production-agent\n", "")
+
+    with pytest.raises(ConfigError) as error:
+        harness.run(config_path=Path("-"), stdin=io.BytesIO(unnamed.encode()))
+
+    assert error.value.field == "name"
+    assert harness.docker.run_calls == []
 
 
 def test_goal_met_records_turns_cost_tokens_and_time(tmp_path):
@@ -475,13 +502,14 @@ def test_container_that_disappears_stops_the_run(tmp_path):
         harness.run()
 
 
-def test_leftover_containers_are_removed_at_start(tmp_path):
+def test_another_runs_container_is_left_alone(tmp_path):
     items = [task("t1", "rain forecast kenya")]
-    leftover = FakeContainer(["exited"], name="weather-skills-eval-app-old")
-    harness = Harness(tmp_path, items, reply_done_on(1), leftovers=[leftover])
+    other = FakeContainer(["running"], name="weather-skills-eval-app-other")
+    harness = Harness(tmp_path, items, reply_done_on(1), leftovers=[other])
     harness.run()
 
-    assert leftover.removed
+    assert harness.container.removed
+    assert not other.removed
 
 
 def test_missing_dataset_does_not_start_the_run(tmp_path):

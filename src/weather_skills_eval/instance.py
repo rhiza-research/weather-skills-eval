@@ -3,9 +3,13 @@
 The configured image is pulled before every run, so a stale local tag never
 runs. The container starts from that image with only the configuration's
 environment and no volumes, so its storage starts empty. It is removed when
-the run ends, whether the run succeeded or not. Containers left by an earlier
-run that was killed before it could clean up carry the same label and are
-removed when the next run starts.
+the run ends, whether the run succeeded or not, and when the harness gets
+SIGTERM (the CLI turns it into an exit that unwinds through this cleanup).
+
+Each container is labeled with its run's id. A run only ever touches the
+container it started, by name, so runs sharing one Docker daemon do not
+interfere. A harness killed with SIGKILL cannot clean up; its container
+keeps the ``weather-skills-eval.run`` label and is removed by hand.
 """
 
 import logging
@@ -20,6 +24,7 @@ log = logging.getLogger(__name__)
 
 LABEL = "weather-skills-eval"
 LABEL_VALUE = "app"
+RUN_LABEL = "weather-skills-eval.run"
 
 
 class AppStartError(Exception):
@@ -76,7 +81,8 @@ class AppInstance:
         self._health_check = health_check
         self._clock = clock
         self._sleep = sleep
-        self.name = f"weather-skills-eval-app-{uuid.uuid4().hex[:12]}"
+        self.run_id = uuid.uuid4().hex[:12]
+        self.name = f"weather-skills-eval-app-{self.run_id}"
         self.container = None
         self.image_digest: str | None = None
 
@@ -99,16 +105,6 @@ class AppInstance:
             f"Image {self._image_ref} has no digest for {repository} "
             f"(digests: {image.attrs.get('RepoDigests') or []})"
         )
-
-    def _remove_leftovers(self) -> None:
-        for container in self._docker.containers.list(
-            all=True, filters={"label": f"{LABEL}={LABEL_VALUE}"}
-        ):
-            log.warning("Removing container %s left by an earlier run", container.name)
-            try:
-                container.remove(force=True, v=True)
-            except docker.errors.DockerException as exc:
-                log.warning("Could not remove %s: %s", container.name, exc)
 
     def _logs(self) -> str:
         try:
@@ -150,7 +146,6 @@ class AppInstance:
             log.error("Could not remove app container %s: %s", self.name, exc)
 
     def __enter__(self) -> "AppInstance":
-        self._remove_leftovers()
         image = self._pull()
         self.image_digest = self._digest(image)
         try:
@@ -160,7 +155,7 @@ class AppInstance:
                 name=self.name,
                 environment=self._env,
                 network=self._network,
-                labels={LABEL: LABEL_VALUE},
+                labels={LABEL: LABEL_VALUE, RUN_LABEL: self.run_id},
             )
             self._wait_for_health()
         except BaseException as exc:
