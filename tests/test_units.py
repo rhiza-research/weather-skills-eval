@@ -153,17 +153,43 @@ def test_split_usage_moves_cache_counts_out_of_input():
             "cache_creation_input_tokens": 6452,
         }
     ) == (2, 120583, 6452, 1711)
-    # Broadcast: counts in metadata attributes, as strings.
+    # Broadcast: counts in flat dotted metadata keys, as strings.
     broadcast_metadata = {
-        "attributes": {
-            "gen_ai.usage.input_tokens.cached": "800",
-            "gen_ai.usage.input_tokens.cache_write": "50",
-        }
+        "attributes.gen_ai.usage.input_tokens.cached": "800",
+        "attributes.gen_ai.usage.input_tokens.cache_write": "50",
     }
     assert split_usage({"input": 900, "output": 3}, broadcast_metadata) == (50, 800, 50, 3)
+    # App-recorded counts take precedence over metadata.
+    assert split_usage(
+        {"input": 900, "output": 3, "cache_read_input_tokens": 100}, broadcast_metadata
+    ) == (800, 100, 0, 3)
     # Guessed key spellings are not read.
     assert split_usage({"input": 900, "output": 3, "input_cache_read": 800}) == (900, 0, 0, 3)
     assert split_usage({"input": 10, "output": 1}) == (10, 0, 0, 1)
+    assert split_usage({"input": 10, "output": 1}, {}) == (10, 0, 0, 1)
+    assert split_usage({"input": 10, "output": 1}, None) == (10, 0, 0, 1)
+
+
+def test_trace_metrics_reads_broadcast_cache_counts_of_a_real_generation():
+    # Langfuse generation c7346b686bb6f406: 100853 input = 4 uncached + 329 write + 100520 read.
+    metrics = trace_metrics(
+        [
+            {
+                "trace_id": "t",
+                "type": "GENERATION",
+                "usage_details": {"input": 100853, "output": 240, "total": 101093},
+                "metadata": {
+                    "attributes.gen_ai.usage.input_tokens.cached": 100520,
+                    "attributes.gen_ai.usage.input_tokens.cache_write": 329,
+                },
+            }
+        ]
+    )
+    assert metrics.tokens_uncached_input == 4
+    assert metrics.tokens_cache_read == 100520
+    assert metrics.tokens_cache_write == 329
+    assert metrics.tokens_output == 240
+    assert metrics.cache_miss_calls == 0
 
 
 def test_trace_metrics_falls_back_to_total_cost():

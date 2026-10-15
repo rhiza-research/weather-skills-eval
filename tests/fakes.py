@@ -375,7 +375,8 @@ def app_observations(chat_id: str, turns: int) -> list[dict]:
 def broadcast_observations(chat_id: str) -> list[dict]:
     """One app trace with two OpenRouter Broadcast generations, shaped like the
     real ones: usage_details holds only input, output and total (input being
-    the whole prompt), and the cache counts are in metadata attributes."""
+    the whole prompt), and the cache counts are top-level metadata keys with
+    dotted names."""
     trace = f"{chat_id}-trace-0"
 
     def generation(obs_id, cached, cache_write, cost_details, total_cost):
@@ -393,10 +394,8 @@ def broadcast_observations(chat_id: str) -> list[dict]:
             "cost_details": cost_details,
             "total_cost": total_cost,
             "metadata": {
-                "attributes": {
-                    "gen_ai.usage.input_tokens.cached": str(cached),
-                    "gen_ai.usage.input_tokens.cache_write": str(cache_write),
-                }
+                "attributes.gen_ai.usage.input_tokens.cached": str(cached),
+                "attributes.gen_ai.usage.input_tokens.cache_write": str(cache_write),
             },
         }
 

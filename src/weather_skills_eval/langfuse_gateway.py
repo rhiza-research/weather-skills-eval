@@ -28,9 +28,6 @@ from opentelemetry.sdk.trace import TracerProvider
 from .scoring import APP_TRACE_NAME
 
 OBSERVATION_FIELDS = "core,basic,usage,metadata"
-# Broadcast generations keep their cache counts in metadata["attributes"],
-# which the API truncates unless it is expanded.
-EXPANDED_METADATA = "attributes"
 PAGE_SIZE = 1000
 SESSION_ATTRIBUTE = "session.id"
 
@@ -165,7 +162,6 @@ class LangfuseGateway:
         while True:
             page = self.client.api.observations.get_many(
                 fields=OBSERVATION_FIELDS,
-                expand_metadata=EXPANDED_METADATA,
                 limit=PAGE_SIZE,
                 cursor=cursor,
                 **filters,

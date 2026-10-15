@@ -117,7 +117,7 @@ Each item of the experiment gets these scores. When the goal is not reached, the
 | `hints_used` | Hidden steps the simulated user revealed, at most the number of hidden steps |
 | `answer_quality` | 1 to 5, rated by the judge model; not rated when no turn got a reply |
 | `cost_to_goal_usd` | Sum of each generation's `cost_details` total, or its total cost when that is missing |
-| `tokens_uncached_input`, `tokens_cache_read`, `tokens_cache_write`, `tokens_output` | Per generation, `input` is the whole prompt; the cache counts are moved out of it. App-recorded generations carry them in `usage_details` (`cache_read_input_tokens`, `cache_creation_input_tokens`); OpenRouter Broadcast generations carry them in metadata `attributes` (`gen_ai.usage.input_tokens.cached`, `gen_ai.usage.input_tokens.cache_write`) |
+| `tokens_uncached_input`, `tokens_cache_read`, `tokens_cache_write`, `tokens_output` | Per generation, `input` is the whole prompt; the cache counts are moved out of it. App-recorded generations carry them in `usage_details` (`cache_read_input_tokens`, `cache_creation_input_tokens`); OpenRouter Broadcast generations carry them as top-level metadata keys whose names contain the dots (`attributes.gen_ai.usage.input_tokens.cached`, `attributes.gen_ai.usage.input_tokens.cache_write`) |
 | `tool_calls`, `tool_failures` | Tool observations in the app's traces, and those at level ERROR |
 | `cache_miss_calls` | Model calls that wrote at least 50,000 tokens of context (uncached input plus cache write) |
 | `time_to_answer_seconds` | Time the app spent on turns that got a reply, from sending each message until its reply was done; pauses and failed turns are excluded |

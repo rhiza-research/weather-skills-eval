@@ -134,8 +134,8 @@ class FakeObservationsApi:
             observations.append(_obs("r2", "t2", "SPAN", "weather-skills-chat"))
         return observations
 
-    def get_many(self, *, fields, expand_metadata, limit, cursor, **filters):
-        self.requests.append({"fields": fields, "expand_metadata": expand_metadata, **filters})
+    def get_many(self, *, fields, limit, cursor, **filters):
+        self.requests.append({"fields": fields, **filters})
         if "session_id" in filters:
             self.reads += 1
             matches = [o for o in self._session() if o.name == filters.get("name", o.name)]
@@ -151,7 +151,13 @@ class FakeObservationsApi:
             )
         if trace == "t1":
             return SimpleNamespace(
-                data=[_obs("g1", "t1", metadata={"attributes": {"x": "1"}})],
+                data=[
+                    _obs(
+                        "g1",
+                        "t1",
+                        metadata={"attributes.gen_ai.usage.input_tokens.cached": "100520"},
+                    )
+                ],
                 meta=SimpleNamespace(cursor=None),
             )
         return SimpleNamespace(
@@ -181,13 +187,13 @@ def test_chat_observations_read_only_app_traces_and_wait_until_settled():
     assert complete
     assert sorted(o["id"] for o in observations) == ["g1", "g2", "r1", "r2"]
     assert {o["level"] for o in observations} == {"DEFAULT"}
+    # Flat dotted metadata keys pass through intact.
     assert next(o for o in observations if o["id"] == "g1")["metadata"] == {
-        "attributes": {"x": "1"}
+        "attributes.gen_ai.usage.input_tokens.cached": "100520"
     }
     session_requests = [r for r in api.requests if "session_id" in r]
     assert all(r["name"] == "weather-skills-chat" for r in session_requests)
     assert all("metadata" in r["fields"].split(",") for r in api.requests)
-    assert all(r["expand_metadata"] == "attributes" for r in api.requests)
     assert api.reads >= 5
 
 

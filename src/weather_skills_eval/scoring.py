@@ -6,10 +6,10 @@ Token counts come from each generation. In both shapes a generation's
 - Generations the app records carry the cache counts in ``usage_details``
   as ``cache_read_input_tokens`` and ``cache_creation_input_tokens``.
 - Generations OpenRouter Broadcast records carry only ``input``, ``output``
-  and ``total`` in ``usage_details``; their cache counts are in the
-  observation metadata, under ``attributes``, as
-  ``gen_ai.usage.input_tokens.cached`` and
-  ``gen_ai.usage.input_tokens.cache_write``.
+  and ``total`` in ``usage_details``; their cache counts are top-level
+  observation metadata keys whose names contain dots:
+  ``attributes.gen_ai.usage.input_tokens.cached`` and
+  ``attributes.gen_ai.usage.input_tokens.cache_write``.
 
 The cache read and cache write counts are moved out of ``input``, so
 ``uncached input`` holds only tokens billed at the full input price. A
@@ -18,15 +18,14 @@ tokens of context it could not read from the cache (uncached input plus
 cache write).
 """
 
-import json
 from dataclasses import dataclass, field
 
 CACHE_MISS_TOKENS = 50_000
 
 APP_CACHE_READ = "cache_read_input_tokens"
 APP_CACHE_WRITE = "cache_creation_input_tokens"
-BROADCAST_CACHE_READ = "gen_ai.usage.input_tokens.cached"
-BROADCAST_CACHE_WRITE = "gen_ai.usage.input_tokens.cache_write"
+BROADCAST_CACHE_READ = "attributes.gen_ai.usage.input_tokens.cached"
+BROADCAST_CACHE_WRITE = "attributes.gen_ai.usage.input_tokens.cache_write"
 
 APP_TRACE_NAME = "weather-skills-chat"
 
@@ -52,25 +51,15 @@ def _count(value) -> int:
     return int(float(value))
 
 
-def _attributes(metadata) -> dict:
-    attributes = (metadata or {}).get("attributes") if isinstance(metadata, dict) else None
-    if isinstance(attributes, str):
-        try:
-            attributes = json.loads(attributes)
-        except ValueError:
-            return {}
-    return attributes if isinstance(attributes, dict) else {}
-
-
 def split_usage(usage: dict, metadata: dict | None = None) -> tuple[int, int, int, int]:
     """(uncached input, cache read, cache write, output) of one generation."""
     usage = usage or {}
-    attributes = _attributes(metadata)
+    metadata = metadata or {}
     if usage.get(APP_CACHE_READ) is not None or usage.get(APP_CACHE_WRITE) is not None:
         read, write = _count(usage.get(APP_CACHE_READ)), _count(usage.get(APP_CACHE_WRITE))
     else:
-        read = _count(attributes.get(BROADCAST_CACHE_READ))
-        write = _count(attributes.get(BROADCAST_CACHE_WRITE))
+        read = _count(metadata.get(BROADCAST_CACHE_READ))
+        write = _count(metadata.get(BROADCAST_CACHE_WRITE))
     uncached = max(_count(usage.get("input")) - read - write, 0)
     return uncached, read, write, _count(usage.get("output"))
 
