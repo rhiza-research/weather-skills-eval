@@ -23,6 +23,7 @@ weather-skills-eval = "weather_skills_eval.cli:main"
 
 [dependency-groups]
 dev = [
+    "pre-commit>=4.7.0",
     "pytest>=9.1.1",
     "ruff>=0.17.0",
 ]

@@ -21,12 +21,6 @@ docker compose run --rm -T eval run - < configs/<name>.yaml
 - `HARNESS_COMMIT` is baked into the image and recorded in each experiment's metadata; without it the metadata says `unrecorded`.
 - The eval service reaches the Docker daemon of the current Docker context through its socket. It pulls the configured image, starts the app container on the `weather-skills-eval` network, and removes it when the run ends, also when the run fails or the harness receives SIGTERM. Each app container is labeled with its run id (`weather-skills-eval.run`), and a run only touches its own container, so several runs can share one Docker daemon. A harness killed with SIGKILL cannot clean up: remove its container by that label by hand.
 
-Tests and lint, in a container without network access:
-
-```sh
-docker compose run --rm --build test
-```
-
 ### Exit codes
 
 | Code | Meaning |
@@ -132,3 +126,17 @@ Trace-based scores (model calls, cost, tokens, tools, cache misses) are read fro
 The experiment's metadata holds the resolved configuration: image and its digest, the app's environment variable names, installed skill packs with their commits, the tool ids the chats used, the chat model, the simulated user and judge models, the harness commit, and the dataset with its version and item count.
 
 A run plays each task once: Langfuse expects each dataset item to appear once per experiment (Langfuse issue #5855).
+
+## Development
+
+Tests and lint, in a container without network access:
+
+```sh
+docker compose run --rm --build test
+```
+
+Install the pre-commit hooks:
+
+```sh
+uv run pre-commit install
+```
