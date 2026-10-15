@@ -17,6 +17,7 @@ from fakes import (
     FakeModels,
     Reply,
     broadcast_observations,
+    local_image,
 )
 
 from weather_skills_eval.config import ConfigError
@@ -167,7 +168,11 @@ def test_run_plays_every_task_into_one_experiment_and_removes_the_container(tmp_
     metadata = experiment["metadata"]
     # The configured image is pulled, and the digest of its repository recorded.
     assert harness.docker.pulled == ["ghcr.io/rhiza-research/weather-skills-chat:test"]
+    assert harness.docker.looked_up == []
+    assert call["image"] == "sha256:image"
     assert metadata["image_digest"] == f"{APP_REPOSITORY}@sha256:abc"
+    assert metadata["image_id"] == "sha256:image"
+    assert metadata["image_pulled"] == "true"
     assert "OPENAI_API_KEYS" in metadata["env_var_names"].split(",")
     assert "1234567" in metadata["skill_packs"]
     assert metadata["tool_ids"] == "plot-2,fetch"
@@ -468,6 +473,73 @@ def test_image_pull_failure_stops_the_run(tmp_path):
     assert harness.gateway.flushed
 
 
+def test_pull_false_runs_a_local_image_without_a_digest(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1), local=local_image())
+    harness.config_path.write_text(CONFIG + "pull: false\n")
+
+    summary = harness.run()
+
+    assert harness.docker.pulled == []
+    assert harness.docker.looked_up == ["ghcr.io/rhiza-research/weather-skills-chat:test"]
+    assert harness.docker.run_calls[0]["image"] == "sha256:local"
+    metadata = harness.gateway.experiments[0]["metadata"]
+    assert metadata["image_pulled"] == "false"
+    assert metadata["image_id"] == "sha256:local"
+    assert metadata["image_digest"] == ""
+    assert summary.goals_reached == 1
+    assert harness.container.removed
+
+
+def test_pull_false_records_the_local_image_repo_digest(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    local = local_image(["ghcr.io/other/mirror@sha256:111", f"{APP_REPOSITORY}@sha256:def"])
+    harness = Harness(tmp_path, items, reply_done_on(1), local=local)
+    harness.config_path.write_text(CONFIG + "pull: false\n")
+
+    harness.run()
+
+    assert harness.docker.pulled == []
+    metadata = harness.gateway.experiments[0]["metadata"]
+    assert metadata["image_digest"] == f"{APP_REPOSITORY}@sha256:def"
+    assert metadata["image_id"] == "sha256:local"
+
+
+def test_pull_false_with_missing_image_stops_the_run(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1), local=None)
+    harness.config_path.write_text(CONFIG + "pull: false\n")
+
+    with pytest.raises(AppStartError) as error:
+        harness.run()
+
+    message = str(error.value)
+    assert "ghcr.io/rhiza-research/weather-skills-chat:test" in message
+    assert "is not on the Docker host" in message
+    assert harness.docker.pulled == []
+    assert harness.docker.run_calls == []
+    assert harness.gateway.experiments == []
+    assert harness.gateway.flushed
+
+
+def test_pull_false_with_failing_image_lookup_stops_the_run(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(
+        tmp_path,
+        items,
+        reply_done_on(1),
+        get_error=docker.errors.APIError("daemon unavailable"),
+    )
+    harness.config_path.write_text(CONFIG + "pull: false\n")
+
+    with pytest.raises(AppStartError, match="could not be read from the Docker host"):
+        harness.run()
+
+    assert harness.docker.pulled == []
+    assert harness.docker.run_calls == []
+    assert harness.gateway.experiments == []
+
+
 def test_container_start_failure_removes_the_container_by_name(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(
@@ -576,6 +648,8 @@ def test_app_never_healthy_stops_the_run_with_logs(tmp_path):
             "env.OPENAI_API_KEYS",
         ),
         (lambda text: text + "replicas: 2\n", "replicas"),
+        (lambda text: text + 'pull: "no"\n', "pull"),
+        (lambda text: text + "pull: 1\n", "pull"),
     ],
 )
 def test_bad_config_does_not_start_the_run(tmp_path, edit, field):

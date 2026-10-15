@@ -29,6 +29,19 @@ def test_config_resolves_references_and_defaults_name():
     assert result.port == "8080"
 
 
+def test_config_pull_defaults_to_true_and_accepts_booleans():
+    assert parse_config(config(), default_name="x", environ=ENVIRON).pull is True
+    assert parse_config(config(pull=True), default_name="x", environ=ENVIRON).pull is True
+    assert parse_config(config(pull=False), default_name="x", environ=ENVIRON).pull is False
+
+
+@pytest.mark.parametrize("value", ["no", "false", 0, 1, None])
+def test_config_pull_must_be_a_boolean(value):
+    with pytest.raises(ConfigError) as error:
+        parse_config(config(pull=value), default_name="x", environ=ENVIRON)
+    assert error.value.field == "pull"
+
+
 def test_config_reference_to_unset_variable_names_the_field():
     raw = config(env={**BASE_ENV, "LANGFUSE_SECRET_KEY": "${MISSING}"})
     with pytest.raises(ConfigError) as error:

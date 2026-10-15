@@ -171,22 +171,37 @@ class FakeContainer:
 APP_REPOSITORY = "ghcr.io/rhiza-research/weather-skills-chat"
 
 
+def local_image(repo_digests: list[str] | None = None) -> SimpleNamespace:
+    """An image built on the Docker host; it has no repo digest unless given one."""
+    return SimpleNamespace(id="sha256:local", attrs={"RepoDigests": repo_digests or []})
+
+
+NO_LOOKUP = object()
+
+
 class FakeDocker:
-    """Docker with one image. ``pull_error`` fails the pull; ``run_error`` fails
-    ``containers.run`` after the container was created; ``leftovers`` are
-    labeled containers from an earlier run."""
+    """Docker with one image to pull. ``pull_error`` fails the pull; ``local``
+    is the image already on the host that ``images.get`` returns, ``None``
+    when the host does not have it (``get`` raises ImageNotFound), and by
+    default no lookup is expected (``get`` fails the test); ``get_error``
+    fails ``images.get``; ``run_error`` fails ``containers.run`` after the
+    container was created; ``leftovers`` are labeled containers from an
+    earlier run."""
 
     def __init__(
         self,
         container: FakeContainer,
         *,
         pull_error: Exception | None = None,
+        local: SimpleNamespace | None | object = NO_LOOKUP,
+        get_error: Exception | None = None,
         run_error: Exception | None = None,
         leftovers: list[FakeContainer] | None = None,
     ):
         self.container = container
         self.run_calls: list[dict] = []
         self.pulled: list[str] = []
+        self.looked_up: list[str] = []
         self.list_filters: list[dict] = []
         self.created: dict[str, FakeContainer] = {}
         self.leftovers = leftovers or []
@@ -203,7 +218,14 @@ class FakeDocker:
 
         class Images:
             def get(self, ref):
-                raise AssertionError("the harness must pull, not use a local tag")
+                outer.looked_up.append(ref)
+                if get_error:
+                    raise get_error
+                if local is NO_LOOKUP:
+                    raise AssertionError("the harness must pull, not use a local tag")
+                if local is None:
+                    raise docker.errors.ImageNotFound(f"No such image: {ref}")
+                return local
 
             def pull(self, ref):
                 outer.pulled.append(ref)

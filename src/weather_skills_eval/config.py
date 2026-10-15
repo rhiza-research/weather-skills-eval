@@ -20,7 +20,7 @@ from typing import BinaryIO
 
 import yaml
 
-ALLOWED_KEYS = ("name", "image", "model", "dataset", "env")
+ALLOWED_KEYS = ("name", "image", "pull", "model", "dataset", "env")
 REQUIRED_KEYS = ("image", "model", "dataset", "env")
 
 # The harness signs in with BOOTSTRAP_ADMIN_API_KEY; the app does not start
@@ -55,6 +55,7 @@ class RunConfig:
     model: str
     dataset: str
     env: dict[str, str]
+    pull: bool = True
 
     @property
     def env_names(self) -> list[str]:
@@ -153,6 +154,9 @@ def parse_config(raw: object, *, default_name: str | None, environ: Mapping[str,
     image = _text(raw, "image")
     model = _text(raw, "model")
     dataset = _text(raw, "dataset")
+    pull = raw.get("pull", True)
+    if not isinstance(pull, bool):
+        raise ConfigError("pull", "must be true or false")
 
     env_raw = raw["env"]
     if not isinstance(env_raw, Mapping):
@@ -172,7 +176,7 @@ def parse_config(raw: object, *, default_name: str | None, environ: Mapping[str,
     if port is not None and not (port.isdigit() and 1 <= int(port) <= 65535):
         raise ConfigError("env.PORT", f"must be a port number from 1 to 65535, not {port!r}")
 
-    return RunConfig(name=name, image=image, model=model, dataset=dataset, env=env)
+    return RunConfig(name=name, image=image, model=model, dataset=dataset, env=env, pull=pull)
 
 
 STDIN = "-"

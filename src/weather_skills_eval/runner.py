@@ -109,6 +109,7 @@ def _run(
     with AppInstance(
         docker_client=docker_client_factory(),
         image=config.image,
+        pull=config.pull,
         env=config.env,
         network=settings.docker_network,
         port=config.port,
@@ -132,6 +133,8 @@ def _run(
             "config_name": config.name,
             "image": config.image,
             "image_digest": instance.image_digest or "",
+            "image_id": instance.image_id or "",
+            "image_pulled": "true" if config.pull else "false",
             "model": config.model,
             "env_var_names": ",".join(config.env_names),
             "skill_packs": json.dumps(packs),

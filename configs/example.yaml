@@ -2,6 +2,8 @@
 # referenced ${...} variables in .env. Every secret is a ${...} reference.
 name: example
 image: ghcr.io/rhiza-research/weather-skills-chat:TODO
+# false runs the image already on the Docker host instead of pulling it.
+pull: true
 model: TODO
 dataset: TODO
 env:

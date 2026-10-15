@@ -1,10 +1,13 @@
 """One throwaway app container per run.
 
-The configured image is pulled before every run, so a stale local tag never
-runs. The container starts from that image with only the configuration's
-environment and no volumes, so its storage starts empty. It is removed when
-the run ends, whether the run succeeded or not, and when the harness gets
-SIGTERM (the CLI turns it into an exit that unwinds through this cleanup).
+By default the configured image is pulled before every run, so a stale local
+tag never runs. With ``pull`` off, the image already on the Docker host is
+used, which is how an image built there and never pushed is run; it is never
+pulled, and a missing image stops the run. The container starts from the
+image's id with only the configuration's environment and no volumes, so its
+storage starts empty. It is removed when the run ends, whether the run
+succeeded or not, and when the harness gets SIGTERM (the CLI turns it into an
+exit that unwinds through this cleanup).
 
 Each container is labeled with its run's id. A run only ever touches the
 container it started, by name, so runs sharing one Docker daemon do not
@@ -28,8 +31,9 @@ RUN_LABEL = "weather-skills-eval.run"
 
 
 class AppStartError(Exception):
-    """The app image could not be pulled, or its container exited, disappeared
-    or never answered /health. Carries the container logs when there are any."""
+    """The app image could not be pulled or is not on the Docker host, or its
+    container exited, disappeared or never answered /health. Carries the
+    container logs when there are any."""
 
 
 def _health_ok(url: str) -> bool:
@@ -67,6 +71,7 @@ class AppInstance:
         port: str,
         start_timeout: float,
         poll_interval: float,
+        pull: bool = True,
         health_check: Callable[[str], bool] = _health_ok,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
@@ -78,6 +83,7 @@ class AppInstance:
         self._port = port
         self._start_timeout = start_timeout
         self._poll_interval = poll_interval
+        self._pull_first = pull
         self._health_check = health_check
         self._clock = clock
         self._sleep = sleep
@@ -85,6 +91,7 @@ class AppInstance:
         self.name = f"weather-skills-eval-app-{self.run_id}"
         self.container = None
         self.image_digest: str | None = None
+        self.image_id: str | None = None
 
     @property
     def base_url(self) -> str:
@@ -96,11 +103,28 @@ class AppInstance:
         except docker.errors.DockerException as exc:
             raise AppStartError(f"Image {self._image_ref} could not be pulled: {exc}") from exc
 
-    def _digest(self, image) -> str:
+    def _local(self):
+        try:
+            return self._docker.images.get(self._image_ref)
+        except docker.errors.ImageNotFound as exc:
+            raise AppStartError(f"Image {self._image_ref} is not on the Docker host") from exc
+        except docker.errors.DockerException as exc:
+            raise AppStartError(
+                f"Image {self._image_ref} could not be read from the Docker host: {exc}"
+            ) from exc
+
+    def _repo_digest(self, image) -> str | None:
         repository = repository_of(self._image_ref)
         for digest in image.attrs.get("RepoDigests") or []:
             if digest.split("@", 1)[0] == repository:
                 return digest
+        return None
+
+    def _digest(self, image) -> str:
+        digest = self._repo_digest(image)
+        if digest is not None:
+            return digest
+        repository = repository_of(self._image_ref)
         raise AppStartError(
             f"Image {self._image_ref} has no digest for {repository} "
             f"(digests: {image.attrs.get('RepoDigests') or []})"
@@ -146,8 +170,14 @@ class AppInstance:
             log.error("Could not remove app container %s: %s", self.name, exc)
 
     def __enter__(self) -> "AppInstance":
-        image = self._pull()
-        self.image_digest = self._digest(image)
+        if self._pull_first:
+            image = self._pull()
+            self.image_digest = self._digest(image)
+        else:
+            # An image built on the host has no repo digest until it is pushed.
+            image = self._local()
+            self.image_digest = self._repo_digest(image)
+        self.image_id = image.id
         try:
             self.container = self._docker.containers.run(
                 image.id,
