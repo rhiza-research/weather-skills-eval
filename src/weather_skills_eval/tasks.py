@@ -1,9 +1,11 @@
 """The dataset item format: one task per Langfuse dataset item.
 
 - ``input``: the opening message the simulated user sends, as a string.
-- ``expected_output``: how the goal is checked. ``artifact_checks`` are
-  automatic checks on the chat's files; ``judge_criteria`` are read by the
-  judge. The goal is reached when every check and every criterion passes.
+- ``expected_output``: how the goal is checked. ``deliverables`` are the
+  kinds of file the result must include (``image``, ``zarr``); when it is
+  not empty, the files the assistant presents are the result, and each must
+  carry provenance. ``judge_criteria`` are read by the judge. The goal is
+  reached when the judge passes every criterion.
 - ``metadata``: what the simulated user knows and how the play runs:
   ``facts`` (the facts sheet the user answers from), ``hidden_steps`` (hints
   the user reveals only when the assistant is stuck), ``pauses`` (waits
@@ -23,24 +25,19 @@ class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
-class ArtifactCheck(_Strict):
-    """Passes when at least one chat file matching ``path`` meets every condition."""
-
-    path: str = Field(min_length=1, description="Glob matched against the file's chat path")
-    kind: Literal["file", "image", "zarr", "zarr_view", "directory"] | None = None
-    variables: list[str] = Field(default_factory=list, description="Zarr data variables")
-    dims: list[str] = Field(default_factory=list, description="Zarr dimensions")
-    contains: str | None = Field(default=None, description="Text the file content contains")
+Deliverable = Literal["image", "zarr"]
 
 
 class ExpectedOutput(_Strict):
-    artifact_checks: list[ArtifactCheck] = Field(default_factory=list)
+    deliverables: list[Deliverable] = Field(
+        default_factory=list, description="Kinds of file the presented result must include"
+    )
     judge_criteria: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _has_a_goal(self):
-        if not self.artifact_checks and not self.judge_criteria:
-            raise ValueError("needs at least one artifact check or judge criterion")
+        if not self.deliverables and not self.judge_criteria:
+            raise ValueError("needs at least one deliverable or judge criterion")
         return self
 
 

@@ -64,11 +64,7 @@ Rules:
 {
   "input": "I need next week's rain totals for western Kenya as a map",
   "expected_output": {
-    "artifact_checks": [
-      {"path": "*.png", "kind": "image"},
-      {"path": "*.zarr", "kind": "zarr", "variables": ["precip"], "dims": ["time"]},
-      {"path": "notes.txt", "contains": "mm"}
-    ],
+    "deliverables": ["image"],
     "judge_criteria": ["The assistant presents weekly rain totals for western Kenya"]
   },
   "metadata": {
@@ -82,12 +78,27 @@ Rules:
 ```
 
 - `input` is the opening message, sent as the first turn. It must not be empty. Item ids must be unique.
-- `artifact_checks` run against the chat's files after every reply. A check passes when one file whose chat path matches `path` meets all of its conditions (`kind`, zarr `variables` and `dims`, text `contains`). `path` is an `fnmatch` pattern on the whole path, so `*` also matches `/`: `*.png` matches `maps/rain.png`.
-- `judge_criteria` are judged by Scenario's judge once every artifact check passes. The goal is reached when all checks and all criteria pass, and the play ends there.
+- `deliverables` are the kinds of file the result must include, each `image` or `zarr`. Empty or absent means the task expects no file. An item needs at least one deliverable or judge criterion. Any other key in `expected_output` stops the run.
+- `judge_criteria` are judged by Scenario's judge after every reply, as described under [Judging](#judging). The goal is reached when the judge passes every criterion, and the play ends there.
 - `facts` is what the simulated user answers from. `hidden_steps` are revealed one at a time, only when the assistant is stuck. The simulated user may give up.
 - `pauses` wait before the given turn (turn 1 is the opening message, so the first possible pause is before turn 2).
 - `turn_limit` is the most user messages a play sends.
 - `tags` are labels for grouping tasks in Langfuse. The harness does not read them; Langfuse shows them with the item's metadata.
+
+## Judging
+
+The judge sees the transcript as the user sees it: each reply's text, without tool calls.
+
+A task with no `deliverables` is judged on the transcript and its `judge_criteria`.
+
+When a task has `deliverables`, the result is the set of files the assistant presents, never the other files of the chat, which hold intermediate results. After every reply:
+
+1. The presented files are those of the latest reply that presents any: the `path` of a successful `display_image` call, the `attachments` of a successful `send_email` call, and the relative markdown image and link targets in the reply text (`![map](maps/rain.png)`, `[data](out.zarr)`).
+2. Each file's kind and provenance come from its entry in the chat's file listing. Every kind in `deliverables` must be among the presented files. Each presented file must have provenance: the app reads the `weather_skills_history` chain of PNG images and zarr stores into the entry's `provenance_detail`.
+3. Each presented image is downloaded. Nothing else is downloaded.
+4. The judge rules on the `judge_criteria` plus a fixed criterion: each presented file's provenance (data source, region, period, aggregation, units) matches the user's request and what was agreed in the chat. Besides the transcript, its call holds one message of harness evidence: each file's path and kind, its `provenance_detail` as JSON, and each image.
+
+When any of steps 1 to 3 fails (no reply presented a file, a file is not in the listing, a kind is missing, a file has no provenance, or an image cannot be downloaded), the judge model is not called, the play continues, and the reason is the judge's last check.
 
 ## Outcomes
 
@@ -95,14 +106,14 @@ Each play ends with one outcome, given in the item output and in the `goal_reach
 
 | Outcome | Meaning |
 |-|-|
-| `goal_reached` | Every artifact check and every judge criterion passed |
+| `goal_reached` | The judge passed every criterion, including the provenance criterion when the task has `deliverables` |
 | `turn_limit` | The turn limit passed without the goal |
 | `user_gave_up` | The simulated user gave up |
 | `chat_error` | The app returned an error for a turn, or a reply the harness cannot read |
 | `error` | Something else stopped the play, such as a harness model reply that cannot be used |
 | `not_reached` | The play ended without the goal for none of the reasons above |
 
-For `turn_limit`, `user_gave_up` and `not_reached`, the reasoning ends with the judge's last check.
+For `turn_limit`, `user_gave_up` and `not_reached`, the reasoning ends with the judge's last check: the judge model's reasoning, or why no result could be judged (it names the file, and the download error when there is one).
 
 ## Scores
 

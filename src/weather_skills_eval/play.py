@@ -22,7 +22,7 @@ import scenario
 from scenario import AgentAdapter, AgentInput, AgentRole
 
 from .app_client import AppClient, Conversation, visible_text
-from .checks import run_checks
+from .checks import collect_evidence, presented_paths
 from .judge import GoalJudge, rate_answer
 from .llm import Complete
 from .scoring import PlayFacts, Score, TraceMetrics, build_scores, trace_metrics
@@ -34,7 +34,8 @@ ChatObservations = Callable[[str, int], Awaitable[tuple[list[dict], bool]]]
 
 class AppAgent(AgentAdapter):
     """The agent under test: the app, reached over HTTP. Keeps the exchanges
-    that got a reply, so the conversation survives a play that errors."""
+    that got a reply, so the conversation survives a play that errors, and
+    the files presented by the latest reply that presents any."""
 
     role = AgentRole.AGENT
     name = "weather-skills-chat"
@@ -42,10 +43,14 @@ class AppAgent(AgentAdapter):
     def __init__(self, conversation: Conversation):
         self._conversation = conversation
         self.exchanges: list[tuple[str, str]] = []
+        self.presented: list[str] = []
 
     async def call(self, input: AgentInput):
         text = input.last_new_user_message_str()
         answer = await self._conversation.send(text)
+        presented = presented_paths(answer.content)
+        if presented:
+            self.presented = presented
         reply = visible_text(answer.content) or "(the reply has no text)"
         self.exchanges.append((text, reply))
         return reply
@@ -122,11 +127,12 @@ async def play(task: Task, deps: PlayDeps) -> PlayResult:
     )
     judge = GoalJudge(
         criteria=list(task.expected.judge_criteria),
+        deliverables=list(task.expected.deliverables),
         model=deps.judge_model,
         complete=deps.complete,
         session_id=session_id,
-        run_checks=lambda: run_checks(
-            deps.app, conversation.chat_id, task.expected.artifact_checks
+        collect_evidence=lambda: collect_evidence(
+            deps.app, conversation.chat_id, agent.presented, list(task.expected.deliverables)
         ),
     )
     paused = 0.0

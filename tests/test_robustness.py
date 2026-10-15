@@ -14,14 +14,14 @@ from langfuse.api.core.api_error import ApiError as LangfuseApiError
 from weather_skills_eval import cli
 from weather_skills_eval import instance as instance_module
 from weather_skills_eval.app_client import AppClient, ChatError
-from weather_skills_eval.checks import run_checks
+from weather_skills_eval.checks import collect_evidence
 from weather_skills_eval.config import ConfigError, load_config, parse_config
 from weather_skills_eval.instance import AppInstance, AppStartError, repository_of
 from weather_skills_eval.judge import rate_answer
 from weather_skills_eval.play import neutral_transcript
 from weather_skills_eval.runner import DatasetError
 from weather_skills_eval.settings import SettingsError, load_settings
-from weather_skills_eval.tasks import ArtifactCheck, TaskError, parse_task
+from weather_skills_eval.tasks import TaskError, parse_task
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -203,25 +203,28 @@ def test_create_chat_without_id_is_a_chat_error():
         asyncio.run(app.create_chat({}))
 
 
-def test_artifact_listing_error_fails_the_checks():
+def test_artifact_listing_error_is_reported():
     app = client(lambda request: httpx.Response(500, json={"detail": "disk"}))
-    results = asyncio.run(run_checks(app, "c1", [ArtifactCheck(path="*.png")]))
-    assert [r.passed for r in results] == [False]
-    assert "could not be listed" in results[0].detail
+    evidence = asyncio.run(collect_evidence(app, "c1", ["maps/rain.png"], ["image"]))
+    assert "could not be listed" in evidence.problem
+    assert evidence.files == []
 
 
-def test_artifacts_with_null_paths_are_ignored():
+def test_presented_file_missing_from_the_listing_is_named():
     entries = [{"path": None, "kind": "image"}, {"kind": "image"}, "junk"]
     app = client(lambda request: httpx.Response(200, json=entries))
-    results = asyncio.run(run_checks(app, "c1", [ArtifactCheck(path="*")]))
-    assert [r.passed for r in results] == [False]
+    evidence = asyncio.run(collect_evidence(app, "c1", ["maps/rain.png"], ["image"]))
+    assert evidence.problem == "Presented files are not in the chat's files: ['maps/rain.png']"
 
 
-def test_fnmatch_star_matches_across_folders():
-    entries = [{"path": "maps/rain.png", "kind": "image"}]
-    app = client(lambda request: httpx.Response(200, json=entries))
-    results = asyncio.run(run_checks(app, "c1", [ArtifactCheck(path="*.png", kind="image")]))
-    assert [r.passed for r in results] == [True]
+@pytest.mark.parametrize("detail", [None, ["arco-era5-fetch"], "{}", {}, {"branches": []}])
+def test_provenance_detail_must_be_an_object(detail):
+    entry = {"path": "out.zarr", "kind": "zarr"}
+    if detail is not None:
+        entry["provenance_detail"] = detail
+    app = client(lambda request: httpx.Response(200, json=[entry]))
+    evidence = asyncio.run(collect_evidence(app, "c1", ["out.zarr"], ["zarr"]))
+    assert evidence.problem == "Presented files have no provenance: ['out.zarr']"
 
 
 @pytest.mark.parametrize(

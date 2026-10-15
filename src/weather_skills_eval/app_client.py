@@ -127,11 +127,6 @@ class AppClient:
     async def artifacts(self, chat_id: str) -> list[dict]:
         return await self._json("GET", f"/api/v1/chats/{chat_id}/artifacts", list)
 
-    async def zarr_meta(self, chat_id: str, path: str) -> dict:
-        return await self._json(
-            "GET", f"/api/v1/chats/{chat_id}/artifacts/zarr/meta", dict, params={"path": path}
-        )
-
     async def artifact_content(self, chat_id: str, path: str) -> bytes:
         try:
             response = await self._http.get(

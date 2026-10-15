@@ -1,7 +1,9 @@
 """The I/O and edge-case matrix, end to end through ``runner.run`` with a fake app,
 fake Docker, fake Langfuse and fake harness models."""
 
+import base64
 import io
+import json
 import textwrap
 from pathlib import Path
 
@@ -17,7 +19,12 @@ from fakes import (
     FakeModels,
     Reply,
     broadcast_observations,
+    display_image,
+    image_bytes,
+    image_entry,
     local_image,
+    tool_call,
+    zarr_entry,
 )
 
 from weather_skills_eval.config import ConfigError
@@ -61,7 +68,9 @@ CONFIG = textwrap.dedent(
 )
 
 
-def task(item_id, opening, *, turn_limit=4, criteria=None, checks=None, hidden=None, pauses=None):
+def task(
+    item_id, opening, *, turn_limit=4, criteria=None, deliverables=None, hidden=None, pauses=None
+):
     return {
         "id": item_id,
         "input": opening,
@@ -69,7 +78,7 @@ def task(item_id, opening, *, turn_limit=4, criteria=None, checks=None, hidden=N
             "judge_criteria": criteria
             if criteria is not None
             else ["The assistant gives the rain forecast"],
-            "artifact_checks": checks or [],
+            "deliverables": deliverables or [],
         },
         "metadata": {
             "facts": "Region: Kenya. Period: next week.",
@@ -92,10 +101,19 @@ def progress(message="go on", classification="progress", hint=False):
 
 
 class Harness:
-    def __init__(self, tmp_path, items, reply, user_replies=None, container=None, **docker_options):
+    def __init__(
+        self,
+        tmp_path,
+        items,
+        reply,
+        user_replies=None,
+        container=None,
+        judge_fails_on=None,
+        **docker_options,
+    ):
         self.clock = FakeClock()
         self.app = FakeApp(reply, self.clock)
-        self.models = FakeModels(user_replies)
+        self.models = FakeModels(user_replies, judge_fails_on=judge_fails_on)
         self.gateway = FakeGateway(items, self.models)
         self.container = container or FakeContainer(["running"])
         self.docker = FakeDocker(self.container, **docker_options)
@@ -216,20 +234,15 @@ def test_config_from_stdin_must_name_the_experiment(tmp_path):
 
 
 def test_goal_met_records_turns_cost_tokens_and_time(tmp_path):
-    items = [
-        task(
-            "t1",
-            "rain forecast kenya",
-            checks=[{"path": "*.png", "kind": "image"}],
-        )
-    ]
+    items = [task("t1", "rain forecast kenya", deliverables=["image"])]
 
     def reply(opening, number, text):
         if number == 1:
             return Reply("Which region do you need?")
         return Reply(
-            "DONE: here is the map.",
-            artifacts=[{"path": "rain.png", "name": "rain.png", "kind": "image", "is_dir": False}],
+            "DONE: here is the map.\n" + display_image("rain.png"),
+            artifacts=[image_entry("rain.png")],
+            files={"rain.png": image_bytes("rain.png")},
         )
 
     harness = Harness(
@@ -278,17 +291,265 @@ def test_every_turn_requests_a_streaming_completion(tmp_path):
     assert "turn" in completions[1]
 
 
-def test_automatic_check_failing_keeps_the_play_going(tmp_path):
-    items = [
-        task("t1", "rain map kenya", turn_limit=2, checks=[{"path": "*.zarr", "kind": "zarr"}])
+# The presented result and its provenance
+
+
+def judge_parts(harness) -> list[dict]:
+    """The harness-evidence parts of the last verdict call, which hold image parts."""
+    messages = harness.models.verdict_calls()[-1]["messages"]
+    evidence = [m for m in messages if isinstance(m.get("content"), list)]
+    assert len(evidence) == 1
+    return evidence[0]["content"]
+
+
+def map_reply(*, presenting: str, files=None, artifacts=None):
+    """Turn 1 asks; later turns present. The chat also holds an intermediate
+    zarr and a plot, never presented."""
+
+    def reply(opening, number, text):
+        if number == 1:
+            return Reply("Which data source should I use?")
+        return Reply(
+            f"DONE: weekly rain for western Kenya from ERA5.\n{presenting}",
+            artifacts=[
+                zarr_entry("intermediate_results/era5.zarr"),
+                image_entry("intermediate_results/daily.png"),
+                *(artifacts or [image_entry("maps/rain.png")]),
+            ],
+            files={
+                "intermediate_results/daily.png": image_bytes("intermediate_results/daily.png"),
+                **(files if files is not None else {"maps/rain.png": image_bytes("maps/rain.png")}),
+            },
+        )
+
+    return reply
+
+
+def test_presented_image_reaches_the_judge_with_its_provenance(tmp_path):
+    items = [task("t1", "rain map kenya", deliverables=["image"])]
+    harness = Harness(tmp_path, items, map_reply(presenting=display_image("maps/rain.png")))
+    harness.run()
+
+    assert harness.output()["outcome"] == "goal_reached"
+    verdict = harness.models.verdict_calls()[-1]
+    # The fixed criterion is judged with the task's.
+    assert "The assistant gives the rain forecast" in json.dumps(verdict["tools"])
+    assert "provenance (data source, region" in json.dumps(verdict["tools"])
+    transcript = verdict["messages"][1]["content"]
+    assert "DONE: weekly rain for western Kenya from ERA5." in transcript
+    assert "<details" not in transcript
+    parts = judge_parts(harness)
+    texts = "\n".join(p["text"] for p in parts if p["type"] == "text")
+    assert "maps/rain.png (image)" in texts
+    assert '"skill": "arco-era5-fetch"' in texts
+    assert '"branches"' in texts
+    images = [p["image_url"]["url"] for p in parts if p["type"] == "image_url"]
+    encoded = base64.b64encode(image_bytes("maps/rain.png")).decode()
+    assert images == [f"data:image/png;base64,{encoded}"]
+    # Files no reply presents are never fetched.
+    downloads = [r for r in harness.app.file_requests if r[0] != "/artifacts"]
+    assert downloads == [("/artifacts/content", "maps/rain.png")]
+
+
+def test_linked_zarr_is_judged_from_the_listing_alone(tmp_path):
+    items = [task("t1", "rain data kenya", deliverables=["zarr"])]
+    harness = Harness(
+        tmp_path,
+        items,
+        map_reply(
+            presenting="Download it: [data](out.zarr)",
+            files={},
+            artifacts=[zarr_entry("out.zarr")],
+        ),
+    )
+    harness.run()
+
+    assert harness.output()["outcome"] == "goal_reached"
+    parts = judge_parts(harness)
+    assert [p["type"] for p in parts] == ["text", "text"]
+    assert "out.zarr (zarr)" in parts[1]["text"]
+    assert '"skill": "aggregate-temporal"' in parts[1]["text"]
+    # A zarr deliverable is never downloaded.
+    assert {r[0] for r in harness.app.file_requests} == {"/artifacts"}
+
+
+def test_emailed_attachment_is_presented(tmp_path):
+    items = [task("t1", "rain map kenya", deliverables=["image"])]
+    email = tool_call(
+        "send_email",
+        {
+            "to": ["user@example.invalid"],
+            "subject": "Rain",
+            "body": "Map attached",
+            "attachments": ["maps/rain.png"],
+        },
+        "Email sent to user@example.invalid with reply-to `user@example.invalid`.",
+    )
+    harness = Harness(tmp_path, items, map_reply(presenting=email))
+    harness.run()
+
+    assert harness.output()["outcome"] == "goal_reached"
+    assert "maps/rain.png (image)" in json.dumps(judge_parts(harness))
+
+
+def test_result_is_the_latest_reply_that_presents_a_file(tmp_path):
+    items = [task("t1", "rain map kenya", turn_limit=4, deliverables=["image"])]
+    presenting = {
+        2: display_image("maps/rain.png"),
+        3: "",
+        4: display_image("maps/rain2.png"),
+    }
+
+    def reply(opening, number, text):
+        if number == 1:
+            return Reply("Which data source should I use?")
+        return Reply(
+            f"DONE: weekly rain for western Kenya.\n{presenting[number]}",
+            artifacts=[
+                image_entry("maps/rain.png", fetcher="chirps-fetch"),
+                image_entry("maps/rain2.png"),
+            ],
+            files={
+                "maps/rain.png": image_bytes("maps/rain.png"),
+                "maps/rain2.png": image_bytes("maps/rain2.png"),
+            },
+        )
+
+    # The judge fails the CHIRPS provenance of rain.png and passes rain2.png.
+    harness = Harness(tmp_path, items, reply, judge_fails_on="chirps-fetch")
+    harness.run()
+
+    assert harness.output()["outcome"] == "goal_reached"
+    assert harness.scores()["turns_to_goal"] == 4
+    presented = []
+    for call in harness.models.verdict_calls():
+        evidence = [m for m in call["messages"] if isinstance(m.get("content"), list)]
+        texts = [p["text"] for p in evidence[0]["content"] if p["type"] == "text"]
+        presented.append([t.split("\n")[0] for t in texts[1:]])
+    assert presented == [
+        ["File: maps/rain.png (image)"],
+        ["File: maps/rain.png (image)"],
+        ["File: maps/rain2.png (image)"],
     ]
+    assert harness.app.file_requests == [
+        ("/artifacts", None),
+        ("/artifacts/content", "maps/rain.png"),
+        ("/artifacts", None),
+        ("/artifacts/content", "maps/rain.png"),
+        ("/artifacts", None),
+        ("/artifacts/content", "maps/rain2.png"),
+    ]
+
+
+def test_provenance_that_contradicts_the_chat_fails_and_the_play_continues(tmp_path):
+    items = [task("t1", "rain map kenya", turn_limit=3, deliverables=["image"])]
+    harness = Harness(
+        tmp_path,
+        items,
+        map_reply(
+            presenting=display_image("maps/rain.png"),
+            artifacts=[image_entry("maps/rain.png", fetcher="chirps-fetch")],
+        ),
+        judge_fails_on="chirps-fetch",
+    )
+    harness.run()
+
+    output = harness.output()
+    assert output["outcome"] == "turn_limit"
+    assert harness.scores()["turns_to_goal"] == 3
+    # The judge saw the provenance on every turn that presented the map.
+    assert len(harness.models.verdict_calls()) == 2
+    assert "(last check: verdict failed)" in output["reasoning"]
+
+
+def test_nothing_presented_skips_the_judge(tmp_path):
+    items = [task("t1", "rain map kenya", turn_limit=2, deliverables=["zarr"])]
     harness = Harness(tmp_path, items, reply_done_on(1))
     harness.run()
 
+    output = harness.output()
     assert harness.scores()["goal_reached"] == 0.0
-    assert harness.output()["outcome"] == "turn_limit"
-    # The judge model is never asked while an automatic check fails.
-    assert not [c for c in harness.models.calls if c[0] == "judge" and c[2].get("tools")]
+    assert output["outcome"] == "turn_limit"
+    assert "No result presented" in output["reasoning"]
+    assert harness.models.verdict_calls() == []
+
+
+def test_file_without_provenance_skips_the_judge(tmp_path):
+    items = [task("t1", "rain map kenya", turn_limit=2, deliverables=["image"])]
+    harness = Harness(
+        tmp_path,
+        items,
+        map_reply(
+            presenting=display_image("maps/rain.png"),
+            artifacts=[image_entry("maps/rain.png", provenance=False)],
+        ),
+    )
+    harness.run()
+
+    reasoning = harness.output()["reasoning"]
+    assert "Presented files have no provenance: ['maps/rain.png']" in reasoning
+    assert harness.models.verdict_calls() == []
+    assert {r[0] for r in harness.app.file_requests} == {"/artifacts"}
+
+
+def test_unreadable_image_skips_the_judge(tmp_path):
+    items = [task("t1", "rain map kenya", turn_limit=2, deliverables=["image"])]
+    harness = Harness(
+        tmp_path, items, map_reply(presenting=display_image("maps/rain.png"), files={})
+    )
+    harness.run()
+
+    reasoning = harness.output()["reasoning"]
+    assert "maps/rain.png could not be read" in reasoning
+    assert "404" in reasoning
+    assert harness.models.verdict_calls() == []
+
+
+def test_missing_kind_skips_the_judge(tmp_path):
+    items = [task("t1", "rain map kenya", turn_limit=2, deliverables=["image"])]
+    harness = Harness(
+        tmp_path,
+        items,
+        map_reply(presenting="[data](out.zarr)", artifacts=[zarr_entry("out.zarr")]),
+    )
+    harness.run()
+
+    reasoning = harness.output()["reasoning"]
+    assert "No presented file is an image" in reasoning
+    assert "out.zarr (zarr)" in reasoning
+    assert harness.models.verdict_calls() == []
+    assert not [r for r in harness.app.file_requests if r[0] != "/artifacts"]
+
+
+def test_every_deliverable_kind_must_be_presented(tmp_path):
+    items = [task("t1", "rain map kenya", turn_limit=2, deliverables=["image", "zarr"])]
+    harness = Harness(tmp_path, items, map_reply(presenting=display_image("maps/rain.png")))
+    harness.run()
+
+    assert "No presented file is a zarr" in harness.output()["reasoning"]
+    assert harness.models.verdict_calls() == []
+
+
+def test_task_without_deliverables_is_judged_on_the_chat_alone(tmp_path):
+    items = [task("t1", "rain map kenya")]
+    harness = Harness(tmp_path, items, map_reply(presenting=display_image("maps/rain.png")))
+    harness.run()
+
+    assert harness.output()["outcome"] == "goal_reached"
+    assert harness.app.file_requests == []
+    messages = harness.models.verdict_calls()[-1]["messages"]
+    assert all(isinstance(m["content"], str) for m in messages)
+    assert "provenance" not in json.dumps(harness.models.verdict_calls()[-1]["tools"])
+
+
+def test_item_with_artifact_checks_does_not_start_the_run(tmp_path):
+    item = task("t1", "rain map kenya")
+    item["expected_output"]["artifact_checks"] = [{"path": "*.png"}]
+    harness = Harness(tmp_path, [item], reply_done_on(1))
+
+    with pytest.raises(TaskError, match="expected_output.artifact_checks"):
+        harness.run()
+    assert harness.docker.run_calls == []
 
 
 def test_turn_limit_ends_as_failure_with_its_scores(tmp_path):

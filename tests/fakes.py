@@ -1,6 +1,9 @@
-"""Fakes for the app, Docker, Langfuse and the harness models. No test reaches a live service."""
+"""Fakes for the app, Docker, Langfuse and the harness models, and the files and
+replies the app stores. No test reaches a live service."""
 
 import asyncio
+import hashlib
+import html
 import json
 import re
 from collections.abc import Callable
@@ -33,10 +36,82 @@ class FakeClock:
 
 @dataclass
 class Reply:
+    """``artifacts`` are added to the chat's file listing; ``files`` maps a chat
+    path to the bytes the app serves for it."""
+
     content: str = ""
     error: str | None = None
     artifacts: list[dict] = field(default_factory=list)
+    files: dict[str, bytes] = field(default_factory=dict)
     http_status: int | None = None
+
+
+def chain(fetcher: str = "arco-era5-fetch") -> list[dict]:
+    """A provenance chain: a fetch for western Kenya, then a weekly sum."""
+    return [
+        {
+            "skill": fetcher,
+            "version": "0.0.2",
+            "args": {"bbox": "33.9,-4.7,35.9,1.2", "start_time": "2026-10-05"},
+            "input": None,
+        },
+        {
+            "skill": "aggregate-temporal",
+            "version": "0.0.2",
+            "args": {"period": "weekly", "reducer": "sum"},
+            "input": {
+                "basename": "rain.zarr",
+                "hash": hashlib.sha256(b"rain.zarr").hexdigest(),
+            },
+        },
+    ]
+
+
+def provenance_detail(history: list) -> dict:
+    """The listing's ``provenance_detail`` for one unlabeled chain."""
+    crumbs = [step["skill"] for step in history]
+    return {"crumbs": crumbs, "branches": [{"label": None, "steps": history, "crumbs": crumbs}]}
+
+
+def image_bytes(path: str) -> bytes:
+    """What the app serves for an image; the harness only passes it on."""
+    return f"image {path}".encode()
+
+
+def _entry(path: str, kind: str, history: list | None) -> dict:
+    entry = {"path": path, "name": path.rsplit("/", 1)[-1], "kind": kind, "is_dir": kind == "zarr"}
+    if history is not None:
+        detail = provenance_detail(history)
+        entry.update(provenance=detail["crumbs"], provenance_detail=detail)
+    return entry
+
+
+def tool_call(name: str, arguments: dict, result) -> str:
+    """A tool call as the app stores it in the assistant message: arguments and
+    a list or object result are JSON text, each attribute HTML-escaped JSON."""
+    if isinstance(result, (list, dict)):
+        result = json.dumps(result, indent=2)
+    return (
+        f'<details type="tool_calls" done="true" id="call-{name}" name="{name}" '
+        f'arguments="{html.escape(json.dumps(json.dumps(arguments)))}" '
+        f'result="{html.escape(json.dumps(result))}" files="">\n'
+        "<summary>Tool Executed</summary>\n</details>\n"
+    )
+
+
+def display_image(path: str) -> str:
+    """A successful display_image call; the app keeps only the note."""
+    return tool_call("display_image", {"path": path}, [f"Showing `{path}`."])
+
+
+def image_entry(path: str, fetcher: str = "arco-era5-fetch", provenance: bool = True) -> dict:
+    """A PNG listing entry, with the provenance of ``chain(fetcher)`` unless told not."""
+    return _entry(path, "image", chain(fetcher) if provenance else None)
+
+
+def zarr_entry(path: str, fetcher: str = "arco-era5-fetch", provenance: bool = True) -> dict:
+    """A zarr store listing entry, with the provenance of ``chain(fetcher)`` unless told not."""
+    return _entry(path, "zarr", chain(fetcher) if provenance else None)
 
 
 # reply(opening_message, turn_number, user_text) -> Reply
@@ -52,6 +127,8 @@ class FakeApp:
         self.answer_seconds = answer_seconds
         self.chats: dict[str, dict] = {}
         self.completions: list[dict] = []
+        # (endpoint, path) of each file request: listings and downloads.
+        self.file_requests: list[tuple[str, str | None]] = []
         self.tools = [
             {
                 "id": "plot-1",
@@ -90,7 +167,13 @@ class FakeApp:
         if path == "/api/v1/chats/new":
             chat = json.loads(request.content)["chat"]
             chat_id = f"chat-{len(self.chats) + 1}"
-            self.chats[chat_id] = {"chat": chat, "opening": None, "turns": 0, "artifacts": []}
+            self.chats[chat_id] = {
+                "chat": chat,
+                "opening": None,
+                "turns": 0,
+                "artifacts": [],
+                "files": {},
+            }
             return httpx.Response(200, json={"id": chat_id, "chat": chat})
         if path == "/api/chat/completions":
             return self._complete(json.loads(request.content))
@@ -100,13 +183,19 @@ class FakeApp:
             rest = match.group(2) or ""
             if rest == "":
                 return httpx.Response(200, json={"id": match.group(1), "chat": state["chat"]})
-            if rest == "/artifacts":
-                return httpx.Response(200, json=state["artifacts"])
-            if rest == "/artifacts/zarr/meta":
-                return httpx.Response(200, json={"variables": {"precip": {}}, "dims": {"time": 7}})
-            if rest == "/artifacts/content":
-                return httpx.Response(200, content=b"rain total")
+            if rest.startswith("/artifacts"):
+                return self._files(state, rest, request.url.params)
         return httpx.Response(404, json={"detail": f"no route {path}"})
+
+    def _files(self, state: dict, rest: str, params) -> httpx.Response:
+        wanted = params.get("path")
+        self.file_requests.append((rest, wanted))
+        files = state["files"]
+        if rest == "/artifacts":
+            return httpx.Response(200, json=state["artifacts"])
+        if rest == "/artifacts/content" and wanted in files:
+            return httpx.Response(200, content=files[wanted])
+        return httpx.Response(404, json={"detail": "Not found"})
 
     def _complete(self, body: dict) -> httpx.Response:
         self.completions.append(body)
@@ -132,6 +221,7 @@ class FakeApp:
         if reply.error:
             message["error"] = {"content": reply.error}
         state["artifacts"].extend(reply.artifacts)
+        state["files"].update(reply.files)
         return httpx.Response(200, json={"status": True, "task_id": body["chat_id"]})
 
 
@@ -269,12 +359,21 @@ class FakeModels:
 
     ``user_replies`` maps a word in the opening message to the replies the
     simulated user gives in order; the judge passes every criterion when the
-    conversation contains ``DONE``.
+    messages it gets contain ``DONE`` and not ``judge_fails_on``.
     """
 
-    def __init__(self, user_replies: dict[str, list[dict]] | None = None):
+    def __init__(
+        self,
+        user_replies: dict[str, list[dict]] | None = None,
+        judge_fails_on: str | None = None,
+    ):
         self.user_replies = {k: list(v) for k, v in (user_replies or {}).items()}
+        self.judge_fails_on = judge_fails_on
         self.calls: list[tuple[str, str | None, dict]] = []
+
+    def verdict_calls(self) -> list[dict]:
+        """The kwargs of each judge call that delivered a verdict."""
+        return [c[2] for c in self.calls if c[0] == "judge" and c[2].get("tools")]
 
     def __call__(self, role: str, session_id: str | None, **kwargs):
         self.calls.append((role, session_id, kwargs))
@@ -301,7 +400,10 @@ class FakeModels:
             finish = next(t for t in tools if t["function"]["name"] == "finish_test")
             keys = finish["function"]["parameters"]["properties"]["criteria"]["properties"]
             conversation = json.dumps(messages)
-            status = "passed" if "DONE" in conversation else "failed"
+            passed = "DONE" in conversation and not (
+                self.judge_fails_on and self.judge_fails_on in conversation
+            )
+            status = "passed" if passed else "failed"
             answers = {
                 key: {"requirement": key, "reasoning": "checked", "status": status} for key in keys
             }

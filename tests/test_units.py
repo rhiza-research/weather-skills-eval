@@ -1,6 +1,8 @@
 import pytest
+from fakes import display_image, tool_call
 
 from weather_skills_eval.app_client import highest_skill_versions, version_key, visible_text
+from weather_skills_eval.checks import presented_paths
 from weather_skills_eval.config import ConfigError, parse_config
 from weather_skills_eval.scoring import split_usage, trace_metrics
 from weather_skills_eval.settings import SettingsError, load_settings
@@ -139,9 +141,78 @@ def test_task_rejects_pause_past_turn_limit():
         )
 
 
+def test_task_deliverables_are_image_or_zarr():
+    task = parse_task(item(expected_output={"deliverables": ["image", "zarr"]}))
+    assert task.expected.deliverables == ["image", "zarr"]
+    assert parse_task(item()).expected.deliverables == []
+    with pytest.raises(TaskError, match="expected_output.deliverables"):
+        parse_task(item(expected_output={"deliverables": ["png"]}))
+
+
 def test_task_needs_a_goal():
-    with pytest.raises(TaskError, match="expected_output"):
+    with pytest.raises(TaskError, match="expected_output") as error:
         parse_task(item(expected_output={}))
+    assert "needs at least one deliverable or judge criterion" in str(error.value)
+
+
+def test_task_rejects_artifact_checks():
+    with pytest.raises(TaskError, match="expected_output.artifact_checks"):
+        parse_task(item(expected_output={"artifact_checks": [{"path": "*.png"}]}))
+
+
+def test_presented_paths_come_from_successful_tool_calls_and_relative_links():
+    content = "".join(
+        [
+            "Here is the map ![map](./maps/rain.png) and [notes](notes.txt 'n').\n",
+            display_image("/maps/rain.png"),
+            tool_call("display_image", {"path": "missing.png"}, "Image not found: `missing.png`"),
+            tool_call(
+                "send_email",
+                {"to": ["a@example.invalid"], "attachments": "out.zarr"},
+                "Email sent to a@example.invalid with reply-to `a@example.invalid`.",
+            ),
+            tool_call(
+                "send_email",
+                {"to": ["a@example.invalid"], "attachments": ["x.png"]},
+                "Email send failed: refused",
+            ),
+            '<details type="reasoning" done="true">\n[draft](draft.png)\n</details>\n',
+            "[site](https://example.invalid/a.png) [top](#top) [cached](/cache/images/1.png)",
+            " ![inline](data:image/png;base64,AAAA) [folder](plots/) ![m](my%20map.png)",
+        ]
+    )
+    assert presented_paths(content) == [
+        "maps/rain.png",
+        "notes.txt",
+        "out.zarr",
+        "plots",
+        "my map.png",
+    ]
+    assert presented_paths("No files here.") == []
+
+
+def test_link_query_and_fragment_are_dropped():
+    assert presented_paths("[d](out.zarr?x=1)") == ["out.zarr"]
+    assert presented_paths("[m](rain.png#top)") == ["rain.png"]
+
+
+@pytest.mark.parametrize(
+    "attachments, paths",
+    [
+        (123, []),
+        (True, []),
+        ({"path": "x.png"}, []),
+        (None, []),
+        ([1, None, "x.png", {"p": "y.png"}], ["x.png"]),
+    ],
+)
+def test_emailed_attachments_that_are_not_paths_are_ignored(attachments, paths):
+    content = tool_call(
+        "send_email",
+        {"to": ["a@example.invalid"], "attachments": attachments},
+        "Email sent to a@example.invalid with reply-to `a@example.invalid`.",
+    )
+    assert presented_paths(content) == paths
 
 
 def test_split_usage_moves_cache_counts_out_of_input():
