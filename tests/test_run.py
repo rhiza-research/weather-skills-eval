@@ -266,6 +266,18 @@ def test_goal_met_records_turns_cost_tokens_and_time(tmp_path):
     assert all(session == "chat-1" for _, session, _ in harness.models.calls)
 
 
+def test_every_turn_requests_a_streaming_completion(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(2))
+    harness.run()
+
+    completions = harness.app.completions
+    assert len(completions) == 2
+    assert all(body["stream"] is True for body in completions)
+    assert "turn" not in completions[0]
+    assert "turn" in completions[1]
+
+
 def test_automatic_check_failing_keeps_the_play_going(tmp_path):
     items = [
         task("t1", "rain map kenya", turn_limit=2, checks=[{"path": "*.zarr", "kind": "zarr"}])

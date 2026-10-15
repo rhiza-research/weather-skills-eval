@@ -1,11 +1,11 @@
-"""The app's chat API, used the way the app's own automation runner uses it.
+"""The app's chat API, called over HTTP with an API key.
 
 The first turn pre-creates the chat with a user and an empty assistant
 message, then posts the completion with that chat id, the assistant id and a
-session id, so the app runs the tool loop as a background task and returns at
-once. Later turns send the new messages in the ``turn`` field and the app
-rebuilds the transcript from storage. An API-key client cannot join the
-app's socket events, so completion is detected by polling the chat until
+session id, so the app runs the turn as a background task and answers at once
+with its task id. Later turns send the new messages in the ``turn`` field and
+the app rebuilds the transcript from storage. An API-key client cannot join
+the app's socket events, so completion is detected by polling the chat until
 the assistant message is ``done``.
 """
 
@@ -206,6 +206,8 @@ class Conversation:
             "chat_id": self.chat_id,
             "id": assistant_id,
             "session_id": self._session_id,
+            # Only the app's streaming path runs the native tool loop.
+            "stream": True,
             "tool_ids": self._tool_ids,
             "features": {},
             "params": {"function_calling": "native"},
