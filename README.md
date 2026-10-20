@@ -27,7 +27,7 @@ docker compose run --rm -T eval run - < configs/<name>.yaml
 |-|-|
 | 0 | The run finished and the experiment was recorded |
 | 1 | The run failed for any other reason |
-| 2 | The run did not start: a harness setting, the configuration file, the dataset or a dataset item is invalid, or the dataset is missing or empty |
+| 2 | The run did not start: a harness setting, the configuration file, the dataset or a dataset item is invalid, the dataset is missing or empty, or the dataset needs a skill pack the configuration does not turn on |
 | 3 | The app did not start (image pull, image not on the Docker host, container start or `/health`), or Docker failed |
 | 4 | The app failed while the harness read its catalog model, tools and skill packs, or reported no base model for the catalog model |
 | 5 | Langfuse returned an error |
@@ -41,7 +41,7 @@ docker compose run --rm -T eval run - < configs/<name>.yaml
 - `image`: the app image. Unless `pull` is `false`, it is pulled before every run, and the experiment records its digest.
 - `pull`: `true` (the default) or `false`. With `false` the image is not pulled: the run uses the image already on the daemon of the current Docker context, such as one built there and never pushed, and stops when it is not there. With a remote context, the image must be built on that remote daemon. Its digest is recorded when the image has one for its repository, and is empty otherwise.
 - `model`: id of the catalog model the chats use (an `id` in `CATALOG_MODELS`).
-- `dataset`: the Langfuse dataset holding the tasks.
+- `dataset`: the Langfuse dataset holding the tasks. The dataset's metadata may name the skill packs its tasks need as `skill_packs`, a list of pack names, such as `{"skill_packs": ["chc-skills"]}`. Without metadata, without `skill_packs`, or with an empty list, the dataset needs no pack. Metadata that is not an object, or a `skill_packs` that is not a list of non-empty names, stops the run. After reading the dataset and before starting the app, the harness checks that `SKILL_PACKS` in `env` turns on every pack the dataset names, and otherwise stops the run, naming each pack the configuration does not turn on. Every run of a dataset plays every item, so tasks that need a pack belong in a dataset of their own.
 - `env`: the app's whole environment; nothing else is set.
 
 Rules:
@@ -53,6 +53,7 @@ Rules:
 - Values are strings. Mappings and lists are written to the variable as JSON, after their references are replaced.
 - The app listens on `PORT` from `env`, 8080 when unset.
 - `OPENAI_API_CONFIGS`, when set, must map each connection to an object whose `enable` is a boolean, `prefix_id` a string and `model_ids` a list of strings. The harness reads these three keys to name the base model (see [Scores](#scores)).
+- `SKILL_PACKS`, when set, must be a list of objects, each with a non-empty string `git_url` and, when present, a boolean `enabled_by_default`. A pack is named by the last path segment of its `git_url`, ignoring surrounding whitespace and trailing slashes, without a trailing `.git` (`https://github.com/rhiza-research/chc-skills.git` is `chc-skills`), and is on when its `enabled_by_default` is `true` or absent. The harness reads these to check the dataset's `skill_packs`.
 - The app and the harness must use the same Langfuse project: the harness reads the app's traces with its own keys. The example passes the harness's Langfuse keys and address to the app.
 
 ## Harness settings
@@ -138,7 +139,7 @@ Trace-based scores (model calls, cost, tokens, tools, cache misses) are read fro
 
 The experiment's per-item cost in Langfuse is the app's cost: the item's trace holds one generation named `app-cost-rollup` whose cost is the item's `cost_to_goal_usd`, with no model and no token counts. It is recorded whenever that score is, and leaves out the simulated user and judge. The rollup repeats the app's cost: a cost total over the chat's session, or across the `sdk-experiment` environment (where Langfuse records the item traces) and the app's, counts it twice unless generations named `app-cost-rollup` are left out.
 
-The experiment's metadata holds the resolved configuration: image with its digest and image id and whether it was pulled, the app's environment variable names, installed skill packs with their commits, the tool ids the chats used, the chat model as `model` and `catalog_model`, the simulated user and judge models, the harness commit, and the dataset with its version and item count. `catalog_model` is the configured catalog id; `model` is the base model the app reports for it, without the `prefix_id` of the connection the app serves it from: like the app, the harness takes the last connection in `OPENAI_API_CONFIGS` that is enabled and whose `model_ids` allow the model (`open-router-.anthropic/claude-haiku-5.5` becomes `anthropic/claude-haiku-5.5`). `model` is also the experiment's description. A base model can be a floating alias such as `~anthropic/claude-opus-latest`; the metadata is written before the plays, so the models that served the calls are only in each item's `provider_models`.
+The experiment's metadata holds the resolved configuration: image with its digest and image id and whether it was pulled, the app's environment variable names, installed skill packs with their commits, the tool ids the chats used, the chat model as `model` and `catalog_model`, the simulated user and judge models, the harness commit, and the dataset with its version, item count and the skill packs it needs (`dataset_skill_packs`, comma-separated, empty when none). `catalog_model` is the configured catalog id; `model` is the base model the app reports for it, without the `prefix_id` of the connection the app serves it from: like the app, the harness takes the last connection in `OPENAI_API_CONFIGS` that is enabled and whose `model_ids` allow the model (`open-router-.anthropic/claude-haiku-5.5` becomes `anthropic/claude-haiku-5.5`). `model` is also the experiment's description. A base model can be a floating alias such as `~anthropic/claude-opus-latest`; the metadata is written before the plays, so the models that served the calls are only in each item's `provider_models`.
 
 A run plays each task once: Langfuse expects each dataset item to appear once per experiment (Langfuse issue #5855).
 

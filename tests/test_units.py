@@ -3,7 +3,7 @@ from fakes import display_image, tool_call
 
 from weather_skills_eval.app_client import highest_skill_versions, version_key, visible_text
 from weather_skills_eval.checks import presented_paths
-from weather_skills_eval.config import ConfigError, parse_config
+from weather_skills_eval.config import ConfigError, pack_name, parse_config
 from weather_skills_eval.scoring import split_usage, trace_metrics
 from weather_skills_eval.settings import SettingsError, load_settings
 from weather_skills_eval.tasks import TaskError, parse_task
@@ -78,6 +78,54 @@ def test_config_rejects_non_string_scalars():
     with pytest.raises(ConfigError) as error:
         parse_config(raw, default_name="x", environ=ENVIRON)
     assert error.value.field == "env.SKILL_SANDLOCK"
+
+
+def with_skill_packs(packs):
+    raw = config(env={**BASE_ENV, "SKILL_PACKS": packs})
+    return parse_config(raw, default_name="x", environ=ENVIRON)
+
+
+def test_skill_packs_on_are_named_by_repository():
+    packs = [
+        {"git_url": "https://github.com/rhiza-research/chc-skills.git"},
+        {"git_url": "https://example.invalid/forecasting-skills", "enabled_by_default": True},
+        {"git_url": "https://example.invalid/off-skills.git", "enabled_by_default": False},
+    ]
+    assert with_skill_packs(packs).skill_packs_on == ["chc-skills", "forecasting-skills"]
+
+
+@pytest.mark.parametrize(
+    "git_url",
+    [
+        "https://github.com/rhiza-research/chc-skills.git",
+        "https://github.com/rhiza-research/chc-skills",
+        "https://github.com/rhiza-research/chc-skills/",
+        "https://github.com/rhiza-research/chc-skills//",
+        "  https://github.com/rhiza-research/chc-skills.git  ",
+        "git@github.com:rhiza-research/chc-skills.git",
+    ],
+)
+def test_pack_name_is_the_repository_name(git_url):
+    assert pack_name(git_url) == "chc-skills"
+    assert with_skill_packs([{"git_url": git_url}]).skill_packs_on == ["chc-skills"]
+    assert parse_config(config(), default_name="x", environ=ENVIRON).skill_packs_on == []
+
+
+@pytest.mark.parametrize(
+    "packs",
+    [
+        "not json",
+        {"git_url": "https://example.invalid/pack.git"},
+        ["https://example.invalid/pack.git"],
+        [{"ref": "main"}],
+        [{"git_url": ""}],
+        [{"git_url": "https://example.invalid/pack.git", "enabled_by_default": "no"}],
+    ],
+)
+def test_config_rejects_invalid_skill_packs(packs):
+    with pytest.raises(ConfigError) as error:
+        with_skill_packs(packs)
+    assert error.value.field == "env.SKILL_PACKS"
 
 
 def settings_env(**overrides):

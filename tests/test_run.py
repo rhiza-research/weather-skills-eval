@@ -209,6 +209,7 @@ def test_run_plays_every_task_into_one_experiment_and_removes_the_container(tmp_
     assert metadata["dataset"] == "weather-tasks"
     assert metadata["dataset_version"] == "latest"
     assert metadata["dataset_items"] == "3"
+    assert metadata["dataset_skill_packs"] == ""
     assert all(isinstance(v, str) for v in metadata.values())
     assert summary.items == 3 and summary.goals_reached == 3
     assert harness.gateway.linked == ["chat-1", "chat-2", "chat-3"]
@@ -934,6 +935,147 @@ def test_empty_dataset_does_not_start_the_run(tmp_path):
 
     with pytest.raises(DatasetError, match="has no items"):
         harness.run()
+    assert harness.docker.run_calls == []
+
+
+# Skill packs a dataset needs
+
+PACKS_BLOCK = "  SKILL_PACKS:\n    - git_url: https://example.invalid/pack.git\n      ref: main\n"
+CHC_PACK = "    - git_url: https://github.com/rhiza-research/chc-skills.git\n"
+
+
+def with_skill_packs(block: str) -> str:
+    """CONFIG with its SKILL_PACKS replaced by ``block``."""
+    assert CONFIG.endswith(PACKS_BLOCK)
+    return CONFIG.removesuffix(PACKS_BLOCK) + block
+
+
+@pytest.mark.parametrize("metadata", [None, {}, {"owner": "eval"}, {"skill_packs": []}])
+def test_dataset_needing_no_pack_plays_every_item(tmp_path, metadata):
+    items = [task("t1", "rain forecast kenya"), task("t2", "weekly rain")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.gateway.dataset_metadata = metadata
+
+    summary = harness.run()
+
+    assert summary.items == 2
+    assert harness.gateway.experiments[0]["metadata"]["dataset_skill_packs"] == ""
+
+
+FORECASTING_PACK = (
+    "    - git_url: https://github.com/rhiza-research/forecasting-skills/\n"
+    "      enabled_by_default: true\n"
+)
+
+
+@pytest.mark.parametrize(
+    "packs, config, recorded",
+    [
+        (["chc-skills"], CONFIG + CHC_PACK, "chc-skills"),
+        ([" chc-skills "], CONFIG + CHC_PACK, "chc-skills"),
+        (
+            ["chc-skills", "forecasting-skills"],
+            CONFIG + FORECASTING_PACK + CHC_PACK,
+            "chc-skills,forecasting-skills",
+        ),
+    ],
+    ids=["one-pack", "padded-name", "two-packs-in-dataset-order"],
+)
+def test_dataset_packs_that_the_config_turns_on_play_every_item(tmp_path, packs, config, recorded):
+    items = [task("t1", "rain forecast kenya"), task("t2", "weekly rain")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.gateway.dataset_metadata = {"skill_packs": packs}
+    harness.config_path.write_text(config)
+
+    summary = harness.run()
+
+    assert summary.items == 2
+    assert len(harness.docker.run_calls) == 1
+    assert harness.gateway.experiments[0]["metadata"]["dataset_skill_packs"] == recorded
+
+
+def test_only_the_packs_the_config_does_not_turn_on_are_named(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.gateway.dataset_metadata = {"skill_packs": ["chc-skills", "a-skills", "b-skills"]}
+    harness.config_path.write_text(CONFIG + CHC_PACK)
+
+    with pytest.raises(DatasetError) as error:
+        harness.run()
+
+    message = str(error.value)
+    assert "a-skills, b-skills" in message
+    assert "chc-skills" not in message
+    assert harness.docker.run_calls == []
+
+
+@pytest.mark.parametrize("metadata", ["chc-skills", ["chc-skills"]])
+def test_dataset_metadata_that_is_not_an_object_does_not_start_the_run(tmp_path, metadata):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.gateway.dataset_metadata = metadata
+
+    with pytest.raises(DatasetError, match="Dataset weather-tasks metadata must be an object"):
+        harness.run()
+    assert harness.docker.run_calls == []
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        CONFIG + CHC_PACK + "      enabled_by_default: false\n",
+        CONFIG,
+        with_skill_packs(""),
+    ],
+    ids=["pack-off", "pack-not-listed", "skill-packs-unset"],
+)
+def test_dataset_pack_the_config_does_not_turn_on_does_not_start_the_run(tmp_path, config):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.gateway.dataset_metadata = {"skill_packs": ["chc-skills"]}
+    harness.config_path.write_text(config)
+
+    with pytest.raises(DatasetError) as error:
+        harness.run()
+
+    message = str(error.value)
+    assert "weather-tasks" in message
+    assert "chc-skills" in message
+    assert "does not turn on" in message
+    assert harness.docker.run_calls == []
+    assert harness.gateway.experiments == []
+
+
+@pytest.mark.parametrize("packs", ["chc-skills", [""], ["  "], [1], {"chc-skills": True}])
+def test_bad_dataset_skill_packs_does_not_start_the_run(tmp_path, packs):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.gateway.dataset_metadata = {"skill_packs": packs}
+
+    with pytest.raises(DatasetError, match="Dataset weather-tasks metadata skill_packs"):
+        harness.run()
+    assert harness.docker.run_calls == []
+
+
+@pytest.mark.parametrize(
+    "packs",
+    [
+        '  SKILL_PACKS: "{}"\n',
+        "  SKILL_PACKS:\n    - ref: main\n",
+        "  SKILL_PACKS:\n    - git_url: https://example.invalid/pack.git\n"
+        '      enabled_by_default: "no"\n',
+    ],
+    ids=["not-a-list", "no-git-url", "enabled-not-boolean"],
+)
+def test_bad_skill_packs_config_does_not_start_the_run(tmp_path, packs):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.config_path.write_text(with_skill_packs(packs))
+
+    with pytest.raises(ConfigError) as error:
+        harness.run()
+
+    assert error.value.field == "env.SKILL_PACKS"
     assert harness.docker.run_calls == []
 
 

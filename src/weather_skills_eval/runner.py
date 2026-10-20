@@ -2,7 +2,9 @@
 
 Order of a run:
 1. Read the harness settings and the configuration file; stop on any error.
-2. Read the dataset and check every item against the task format.
+2. Read the dataset, check that the configuration turns on every skill pack
+   the dataset's metadata names in ``skill_packs``, and check every item
+   against the task format.
 3. Start the app container and wait for /health.
 4. Read the resolved configuration from the app (the catalog model's base
    model, tools, skill pack commits).
@@ -28,7 +30,9 @@ from .tasks import parse_tasks
 
 
 class DatasetError(Exception):
-    """The dataset is missing, cannot be read, or has no items."""
+    """The dataset is missing, cannot be read, has no items, has invalid
+    ``skill_packs`` metadata, or needs a skill pack the configuration does not
+    turn on."""
 
 
 @dataclass
@@ -122,6 +126,36 @@ def _read_dataset(gateway: LangfuseGateway, name: str):
     return dataset
 
 
+def _required_packs(dataset, name: str) -> list[str]:
+    """The pack names in the dataset metadata's ``skill_packs``; none when the
+    metadata or the key is absent."""
+    metadata = getattr(dataset, "metadata", None)
+    if metadata is None:
+        return []
+    if not isinstance(metadata, Mapping):
+        raise DatasetError(f"Dataset {name} metadata must be an object")
+    packs = metadata.get("skill_packs")
+    if packs is None:
+        return []
+    if not isinstance(packs, list) or not all(isinstance(p, str) and p.strip() for p in packs):
+        raise DatasetError(
+            f"Dataset {name} metadata skill_packs must be a list of non-empty pack names"
+        )
+    return [p.strip() for p in packs]
+
+
+def _check_packs(required: list[str], config: RunConfig, name: str) -> None:
+    """Stop the run before the app starts when the configuration does not turn
+    on a pack the dataset needs, so every run of a dataset plays every item."""
+    on = config.skill_packs_on
+    missing = [pack for pack in required if pack not in on]
+    if missing:
+        raise DatasetError(
+            f"Dataset {name} needs skill packs {', '.join(missing)}, "
+            "which the configuration does not turn on in SKILL_PACKS"
+        )
+
+
 def _run(
     config: RunConfig,
     settings: Settings,
@@ -133,6 +167,8 @@ def _run(
     play_options,
 ) -> RunSummary:
     dataset = _read_dataset(gateway, config.dataset)
+    required_packs = _required_packs(dataset, config.dataset)
+    _check_packs(required_packs, config, config.dataset)
     tasks = parse_tasks(dataset.items)
     dataset_version = getattr(dataset, "version", None)
 
@@ -176,6 +212,7 @@ def _run(
             "dataset": config.dataset,
             "dataset_version": dataset_version.isoformat() if dataset_version else "latest",
             "dataset_items": str(len(tasks)),
+            "dataset_skill_packs": ",".join(required_packs),
         }
 
         async def task_fn(*, item, **kwargs):

@@ -548,11 +548,14 @@ class FakeGateway:
         # Replace to change what the app's traces hold, or to raise.
         self.observations = lambda chat_id, turns: (app_observations(chat_id, turns), True)
         self.dataset_error: Exception | None = None
+        self.dataset_metadata: object = None
 
     def dataset(self, name: str):
         if self.dataset_error:
             raise self.dataset_error
-        return SimpleNamespace(name=name, items=self.items, version=None)
+        return SimpleNamespace(
+            name=name, items=self.items, version=None, metadata=self.dataset_metadata
+        )
 
     def run_experiment(self, *, dataset, name, description, task, metadata, concurrency):
         results = []

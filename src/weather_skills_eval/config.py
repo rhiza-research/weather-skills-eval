@@ -74,6 +74,42 @@ class RunConfig:
         """The connection configs of ``OPENAI_API_CONFIGS``, in the order written."""
         return _connections(self.env.get("OPENAI_API_CONFIGS"))
 
+    @property
+    def skill_packs_on(self) -> list[str]:
+        """The names of the packs in ``SKILL_PACKS`` that the app turns on."""
+        return [
+            pack_name(pack["git_url"])
+            for pack in _skill_packs(self.env.get("SKILL_PACKS"))
+            if pack.get("enabled_by_default", True)
+        ]
+
+
+def pack_name(git_url: str) -> str:
+    """A pack's repository name: the last path segment of its URL, ignoring
+    surrounding whitespace and trailing slashes, without ``.git``."""
+    return git_url.strip().rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+
+
+def _skill_packs(text: str | None) -> list[dict]:
+    """The pack entries of ``SKILL_PACKS``, with ``git_url`` and
+    ``enabled_by_default`` checked for their types."""
+    if text is None:
+        return []
+    field = "env.SKILL_PACKS"
+    try:
+        packs = json.loads(text)
+    except ValueError as exc:
+        raise ConfigError(field, f"is not JSON: {exc}") from exc
+    if not isinstance(packs, list) or not all(isinstance(p, dict) for p in packs):
+        raise ConfigError(field, "must be a list of pack objects")
+    for index, pack in enumerate(packs):
+        git_url = pack.get("git_url")
+        if not isinstance(git_url, str) or not git_url.strip():
+            raise ConfigError(field, f"entry {index} needs a non-empty string git_url")
+        if not isinstance(pack.get("enabled_by_default", True), bool):
+            raise ConfigError(field, f"entry {index} enabled_by_default must be true or false")
+    return packs
+
 
 def _connections(text: str | None) -> list[dict]:
     """Each connection's ``enable``, ``prefix_id`` and ``model_ids``, the keys
@@ -204,6 +240,7 @@ def parse_config(raw: object, *, default_name: str | None, environ: Mapping[str,
     if port is not None and not (port.isdigit() and 1 <= int(port) <= 65535):
         raise ConfigError("env.PORT", f"must be a port number from 1 to 65535, not {port!r}")
     _connections(env.get("OPENAI_API_CONFIGS"))
+    _skill_packs(env.get("SKILL_PACKS"))
 
     return RunConfig(name=name, image=image, model=model, dataset=dataset, env=env, pull=pull)
 

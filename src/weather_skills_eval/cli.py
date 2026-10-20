@@ -5,7 +5,8 @@ Exit codes:
 - 0: the run finished and the experiment was recorded.
 - 1: the run failed for any other reason.
 - 2: the run did not start: a harness setting, the configuration file, the
-  dataset or a dataset item is invalid, or the dataset is missing or empty.
+  dataset or a dataset item is invalid, the dataset is missing or empty, or
+  the dataset needs a skill pack the configuration does not turn on.
 - 3: the app did not start (image pull, image not on the Docker host,
   container start, or /health), or Docker failed.
 - 4: the app failed while the harness read its catalog model, tools and
