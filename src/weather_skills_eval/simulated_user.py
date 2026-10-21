@@ -4,9 +4,9 @@ It opens with the task's opening message. On every later turn it reads the
 assistant's last reply and what a real user sees of the latest reply that
 presents files (each file's path and kind, and each image), classifies the
 reply, checks the result against what it asked for, and answers from the
-facts sheet. It reveals a
-hidden step only when the assistant is stuck. It ends the play when it is
-done or gives up.
+facts sheet. It reveals the next hidden step not yet revealed or done when
+the assistant is stuck, or has presented a result or moved on past where that
+step belongs without doing it. It ends the play when it is done or gives up.
 """
 
 import asyncio
@@ -32,9 +32,15 @@ Facts you know. Answer the assistant's questions from these facts only. If a que
 not covered by them, say you do not know or have no preference:
 {facts}
 
-Hidden steps. You know these, but you only mention one when the assistant is stuck: it \
-repeats itself, says it cannot go on, or asks you how to proceed. Reveal at most one per \
-reply, in order, and only those not yet revealed:
+Hidden steps. You know these. The next hidden step is the first one below that you have \
+not revealed and that is not done. A step the conversation or the files you were shown \
+already show as done counts as used: skip it and consider the next one. Mention the next \
+hidden step in either case:
+- The assistant is stuck: it repeats itself, says it cannot go on, or asks you how to proceed.
+- The assistant has presented a result, or moved on past where that step belongs, without \
+doing that step.
+Do not mention it while the assistant is still working toward it: a progress reply that has \
+not reached that step yet is not a reason. Reveal at most one per reply:
 {hidden_steps}
 
 When the assistant has presented files, you also get them after the conversation: each \

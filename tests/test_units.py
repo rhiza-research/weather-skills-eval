@@ -251,6 +251,24 @@ def test_simulated_user_prompt_holds_the_done_give_up_and_correction_rules():
     assert "rovenance" not in SYSTEM_PROMPT
 
 
+def test_simulated_user_prompt_reveals_the_next_step_when_stuck_or_past_it_and_skips_done_steps():
+    prompt = SYSTEM_PROMPT.replace("\n", " ")
+    for rule in (
+        "The next hidden step is the first one below that you have not revealed and that is "
+        "not done.",
+        "A step the conversation or the files you were shown already show as done counts as "
+        "used: skip it and consider the next one.",
+        "The assistant is stuck: it repeats itself, says it cannot go on, or asks you how to "
+        "proceed.",
+        "The assistant has presented a result, or moved on past where that step belongs, "
+        "without doing that step.",
+        "a progress reply that has not reached that step yet is not a reason",
+        "Reveal at most one per reply",
+    ):
+        assert rule in prompt
+    assert "only mention one when the assistant is stuck" not in prompt
+
+
 def test_max_turns_defaults_to_20():
     assert load_settings(settings_env()).max_turns == 20
     assert load_settings(settings_env(EVAL_MAX_TURNS="50")).max_turns == 50
