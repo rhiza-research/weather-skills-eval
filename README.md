@@ -38,7 +38,7 @@ docker compose run --rm -T eval run - < configs/<name>.yaml
 `configs/example.yaml` is a complete example. Its keys:
 
 - `name`: the experiment name; defaults to the file name without `.yaml`, and is required when the configuration is read from stdin.
-- `image`: the app image. Unless `pull` is `false`, it is pulled before every run, and the experiment records its digest.
+- `image`: the app image. It may hold `${NAME}` references, such as `${APP_IMAGE}` or `ghcr.io/rhiza-research/weather-skills-chat:${APP_TAG}`, so the image under test can change per run without editing the file. A variable `image` references reaches the harness from the eval service's `.env` or from `docker compose run -e NAME=value`; a variable exported in the host shell is not passed into the container. The experiment metadata records the resolved image, not the `${...}` text. Unless `pull` is `false`, it is pulled before every run, and the experiment records its digest.
 - `pull`: `true` (the default) or `false`. With `false` the image is not pulled: the run uses the image already on the daemon of the current Docker context, such as one built there and never pushed, and stops when it is not there. With a remote context, the image must be built on that remote daemon. Its digest is recorded when the image has one for its repository, and is empty otherwise.
 - `model`: id of the catalog model the chats use (an `id` in `CATALOG_MODELS`).
 - `dataset`: the Langfuse dataset holding the tasks. The dataset's metadata may name the skill packs its tasks need as `skill_packs`, a list of pack names, such as `{"skill_packs": ["chc-skills"]}`. Without metadata, without `skill_packs`, or with an empty list, the dataset needs no pack. Metadata that is not an object, or a `skill_packs` that is not a list of non-empty names, stops the run. After reading the dataset and before starting the app, the harness checks that `SKILL_PACKS` in `env` turns on every pack the dataset names, and otherwise stops the run, naming each pack the configuration does not turn on. Every run of a dataset plays every item, so tasks that need a pack belong in a dataset of their own.
@@ -48,7 +48,7 @@ Rules:
 
 - Any other top-level key stops the run.
 - `env` uses the app's variable names (see the app wiki pages Deployment, Skill Packs and Tracing). `WEBUI_SECRET_KEY` and the three `BOOTSTRAP_ADMIN_*` variables are required: the harness signs in with `BOOTSTRAP_ADMIN_API_KEY`. `SKILL_SANDLOCK` must be `false` where the Docker host has no Landlock.
-- `${NAME}` is replaced with the harness's environment variable `NAME`; a reference to an unset or empty variable stops the run.
+- `${NAME}` in `image` or in `env` is replaced with the harness's environment variable `NAME`; a reference to an unset or empty variable stops the run.
 - A variable, or a key inside a mapping value, whose name has the word key, secret, password or token in it (singular or plural; `tokens` alone, as in `max_tokens`, does not count) must be exactly one `${NAME}` reference. A literal value stops the run.
 - Values are strings. Mappings and lists are written to the variable as JSON, after their references are replaced.
 - The app listens on `PORT` from `env`, 8080 when unset.

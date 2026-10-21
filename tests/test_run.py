@@ -264,6 +264,23 @@ def test_config_read_from_stdin(tmp_path):
     assert harness.scores()["goal_reached"] == 1.0
 
 
+def test_image_reference_is_pulled_and_recorded_resolved(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    literal = "image: ghcr.io/rhiza-research/weather-skills-chat:test"
+    assert literal in CONFIG
+    harness.config_path.write_text(CONFIG.replace(literal, "image: ${APP_IMAGE}"))
+    image = f"{APP_REPOSITORY}:40be9ee"
+
+    harness.run(APP_IMAGE=image)
+
+    assert harness.docker.pulled == [image]
+    assert harness.docker.run_calls[0]["image"] == "sha256:image"
+    metadata = harness.gateway.experiments[0]["metadata"]
+    assert metadata["image"] == image
+    assert metadata["image_digest"] == f"{APP_REPOSITORY}@sha256:abc"
+
+
 def test_config_from_stdin_must_name_the_experiment(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))

@@ -161,6 +161,7 @@ def test_example_config_is_valid():
     environ = {
         name: "value"
         for name in (
+            "APP_IMAGE",
             "APP_WEBUI_SECRET_KEY",
             "APP_ADMIN_PASSWORD",
             "APP_ADMIN_API_KEY",
@@ -605,6 +606,23 @@ def test_cli_without_settings_exits_2(monkeypatch, capsys):
     monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
     assert cli.main(["run", str(REPO / "configs" / "example.yaml")]) == 2
     assert "LANGFUSE_PUBLIC_KEY is not set" in capsys.readouterr().err
+
+
+def test_cli_with_an_unset_image_reference_exits_2(monkeypatch, capsys):
+    for key, setting in settings_env().items():
+        monkeypatch.setenv(key, setting)
+    for name in (
+        "APP_WEBUI_SECRET_KEY",
+        "APP_ADMIN_PASSWORD",
+        "APP_ADMIN_API_KEY",
+        "APP_OPENROUTER_API_KEY",
+        "LANGFUSE_BASE_URL",
+    ):
+        monkeypatch.setenv(name, "value")
+    monkeypatch.delenv("APP_IMAGE", raising=False)
+    # configs/example.yaml sets image: ${APP_IMAGE}.
+    assert cli.main(["run", str(REPO / "configs" / "example.yaml")]) == 2
+    assert "image: references ${APP_IMAGE}, which is not set" in capsys.readouterr().err
 
 
 def test_sigterm_handler_unwinds_with_exit_code_143():

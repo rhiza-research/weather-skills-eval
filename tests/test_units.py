@@ -52,6 +52,40 @@ def test_config_reference_to_unset_variable_names_the_field():
     assert error.value.field == "env.LANGFUSE_SECRET_KEY"
 
 
+APP_IMAGE = "weather-skills-chat:40be9ee"
+
+
+@pytest.mark.parametrize(
+    "image, environ",
+    [
+        ("${APP_IMAGE}", {"APP_IMAGE": APP_IMAGE}),
+        ("weather-skills-chat:${APP_TAG}", {"APP_TAG": "40be9ee"}),
+        (APP_IMAGE, {}),
+    ],
+    ids=["whole-reference", "partial-reference", "literal"],
+)
+def test_config_image_resolves_references(image, environ):
+    result = parse_config(config(image=image), default_name="x", environ={**ENVIRON, **environ})
+    assert result.image == APP_IMAGE
+
+
+@pytest.mark.parametrize(
+    "image, name, environ",
+    [
+        ("${APP_IMAGE}", "APP_IMAGE", {}),
+        ("${APP_IMAGE}", "APP_IMAGE", {"APP_IMAGE": ""}),
+        ("weather-skills-chat:${APP_TAG}", "APP_TAG", {}),
+        ("weather-skills-chat:${APP_TAG}", "APP_TAG", {"APP_TAG": ""}),
+    ],
+    ids=["whole-unset", "whole-empty", "partial-unset", "partial-empty"],
+)
+def test_config_image_reference_to_unset_or_empty_variable_names_the_image(image, name, environ):
+    with pytest.raises(ConfigError) as error:
+        parse_config(config(image=image), default_name="x", environ={**ENVIRON, **environ})
+    assert error.value.field == "image"
+    assert f"${{{name}}}" in str(error.value)
+
+
 def test_config_requires_the_admin_api_key():
     env = {k: v for k, v in BASE_ENV.items() if k != "BOOTSTRAP_ADMIN_API_KEY"}
     with pytest.raises(ConfigError) as error:

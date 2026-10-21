@@ -1,13 +1,13 @@
 """The configuration file: which app image to run and the environment it runs with.
 
-A value may reference one of the harness's own environment variables as
-``${NAME}``. A variable, or a key inside a mapping value, whose name looks
-like a secret (one of its words is key, secret, password or token, singular
-or plural, except "tokens") must be exactly one such reference, so no secret
-is ever written into a configuration file. Words are separated by
-underscores, hyphens, dots and case changes, so ``OPENAI_API_KEYS`` and
-``apiKey`` are secret names and ``max_tokens`` and ``TIKTOKEN_ENCODING_NAME``
-are not.
+``image`` and the values in ``env`` may reference the harness's own
+environment variables as ``${NAME}``. A variable, or a key inside a mapping
+value, whose name looks like a secret (one of its words is key, secret,
+password or token, singular or plural, except "tokens") must be exactly one
+such reference, so no secret is ever written into a configuration file.
+Words are separated by underscores, hyphens, dots and case changes, so
+``OPENAI_API_KEYS`` and ``apiKey`` are secret names and ``max_tokens`` and
+``TIKTOKEN_ENCODING_NAME`` are not.
 """
 
 import json
@@ -215,7 +215,9 @@ def parse_config(raw: object, *, default_name: str | None, environ: Mapping[str,
         raise ConfigError("name", "is missing; a configuration read from stdin needs one")
 
     name = _text(raw, "name") if "name" in raw else default_name
-    image = _text(raw, "image")
+    image = _resolve_text("image", "image", _text(raw, "image"), environ).strip()
+    if not image:
+        raise ConfigError("image", "must be a non-empty string")
     model = _text(raw, "model")
     dataset = _text(raw, "dataset")
     pull = raw.get("pull", True)
