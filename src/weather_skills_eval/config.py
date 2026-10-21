@@ -1,6 +1,6 @@
 """The configuration file: which app image to run and the environment it runs with.
 
-``image`` and the values in ``env`` may reference the harness's own
+``image``, ``runner_image`` and the values in ``env`` may reference the harness's own
 environment variables as ``${NAME}``. A variable, or a key inside a mapping
 value, whose name looks like a secret (one of its words is key, secret,
 password or token, singular or plural, except "tokens") must be exactly one
@@ -20,8 +20,18 @@ from typing import BinaryIO
 
 import yaml
 
-ALLOWED_KEYS = ("name", "image", "pull", "model", "dataset", "env")
-REQUIRED_KEYS = ("image", "model", "dataset", "env")
+ALLOWED_KEYS = ("name", "image", "runner_image", "pull", "model", "dataset", "env")
+REQUIRED_KEYS = ("image", "runner_image", "model", "dataset", "env")
+
+# The harness sets these on the app to run skills on the sandbox runner.
+RUNNER_ENV = (
+    "SKILL_SANDLOCK",
+    "SKILL_SANDBOX_BACKEND",
+    "SKILL_K8S_SANDBOX_ENABLED",
+    "SKILL_K8S_EMULATOR",
+    "SKILL_K8S_APISERVER",
+    "SKILL_K8S_BIND_TOKEN",
+)
 
 # The harness signs in with BOOTSTRAP_ADMIN_API_KEY; the app does not start
 # without WEBUI_SECRET_KEY, and creates the admin from the other two.
@@ -52,6 +62,7 @@ class ConfigError(Exception):
 class RunConfig:
     name: str
     image: str
+    runner_image: str
     model: str
     dataset: str
     env: dict[str, str]
@@ -218,6 +229,11 @@ def parse_config(raw: object, *, default_name: str | None, environ: Mapping[str,
     image = _resolve_text("image", "image", _text(raw, "image"), environ).strip()
     if not image:
         raise ConfigError("image", "must be a non-empty string")
+    runner_image = _resolve_text(
+        "runner_image", "runner_image", _text(raw, "runner_image"), environ
+    ).strip()
+    if not runner_image:
+        raise ConfigError("runner_image", "must be a non-empty string")
     model = _text(raw, "model")
     dataset = _text(raw, "dataset")
     pull = raw.get("pull", True)
@@ -232,6 +248,10 @@ def parse_config(raw: object, *, default_name: str | None, environ: Mapping[str,
     for name_key, value in env_raw.items():
         if not isinstance(name_key, str) or not ENV_NAME.match(name_key):
             raise ConfigError(f"env.{name_key}", "is not a valid variable name")
+        if name_key in RUNNER_ENV:
+            raise ConfigError(
+                f"env.{name_key}", "is set by the harness to run skills on the sandbox runner"
+            )
         env[name_key] = _env_value(name_key, value, environ)
 
     for required in REQUIRED_ENV:
@@ -244,7 +264,15 @@ def parse_config(raw: object, *, default_name: str | None, environ: Mapping[str,
     _connections(env.get("OPENAI_API_CONFIGS"))
     _skill_packs(env.get("SKILL_PACKS"))
 
-    return RunConfig(name=name, image=image, model=model, dataset=dataset, env=env, pull=pull)
+    return RunConfig(
+        name=name,
+        image=image,
+        runner_image=runner_image,
+        model=model,
+        dataset=dataset,
+        env=env,
+        pull=pull,
+    )
 
 
 STDIN = "-"

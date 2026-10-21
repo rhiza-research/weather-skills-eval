@@ -19,7 +19,13 @@ ENVIRON = {"S": "secret", "P": "password", "K": "sk-key"}
 
 
 def config(**overrides):
-    raw = {"image": "img:tag", "model": "m", "dataset": "d", "env": dict(BASE_ENV)}
+    raw = {
+        "image": "img:tag",
+        "runner_image": "runner:tag",
+        "model": "m",
+        "dataset": "d",
+        "env": dict(BASE_ENV),
+    }
     raw.update(overrides)
     return raw
 
@@ -109,10 +115,10 @@ def test_config_serializes_structured_values_as_json():
 
 
 def test_config_rejects_non_string_scalars():
-    raw = config(env={**BASE_ENV, "SKILL_SANDLOCK": False})
+    raw = config(env={**BASE_ENV, "ENABLE_SIGNUP": False})
     with pytest.raises(ConfigError) as error:
         parse_config(raw, default_name="x", environ=ENVIRON)
-    assert error.value.field == "env.SKILL_SANDLOCK"
+    assert error.value.field == "env.ENABLE_SIGNUP"
 
 
 def with_skill_packs(packs):

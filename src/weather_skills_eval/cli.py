@@ -7,12 +7,15 @@ Exit codes:
 - 2: the run did not start: a harness setting, the configuration file, the
   dataset or a dataset item is invalid, the dataset is missing or empty, or
   the dataset needs a skill pack the configuration does not turn on.
-- 3: the app did not start (image pull, image not on the Docker host,
-  container start, or /health), or Docker failed.
+- 3: the app or the sandbox runner did not start (an app image without the
+  sandbox emulator, image pull, image not on the Docker host, container
+  start, or /health), the runner was gone or not running again by the start
+  timeout before a task, or Docker failed.
 - 4: the app failed while the harness read its catalog model, tools and
   skill packs, or reported no base model for the catalog model.
 - 5: Langfuse returned an error.
-- 143: the harness was stopped with SIGTERM; the app container was removed.
+- 143: the harness was stopped with SIGTERM; the app and runner containers
+  and the volume were removed.
 
 ``weather-skills-eval delete [--yes] <experiment-id>`` deletes every trace of
 one run, after ``yes`` on stdin unless ``--yes`` is given. Exit codes:
@@ -38,7 +41,7 @@ from langfuse.api.core.api_error import ApiError as LangfuseApiError
 
 from .app_client import ChatError
 from .config import ConfigError
-from .instance import AppStartError
+from .instance import AppStartError, RunnerStartError
 from .langfuse_gateway import ExperimentNotFound, LangfuseRuns
 from .runner import DatasetError, run
 from .settings import SettingsError
@@ -164,6 +167,8 @@ def main(
         summary = run(args.config, os.environ, docker_client_factory=docker_client_factory)
     except (SettingsError, ConfigError, TaskError, DatasetError) as exc:
         return _fail(EXIT_NOT_STARTED, f"Run not started: {exc}")
+    except RunnerStartError as exc:
+        return _fail(EXIT_APP_NOT_STARTED, f"Run stopped, the sandbox runner did not start: {exc}")
     except AppStartError as exc:
         return _fail(EXIT_APP_NOT_STARTED, f"Run stopped, the app did not start: {exc}")
     except docker.errors.DockerException as exc:

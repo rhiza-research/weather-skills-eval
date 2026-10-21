@@ -1,5 +1,6 @@
 name: gemma-agent
 image: ${APP_IMAGE}
+runner_image: ${RUNNER_IMAGE}
 # false runs the image already on the Docker host instead of pulling it.
 pull: false
 model: weather-agent-gemma

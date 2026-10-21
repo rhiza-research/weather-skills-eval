@@ -4,8 +4,10 @@ replies the app stores. No test reaches a live service."""
 import asyncio
 import hashlib
 import html
+import io
 import json
 import re
+import tarfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -250,7 +252,11 @@ class FakeApp:
 
 class FakeContainer:
     """``statuses`` are returned by successive reloads; the status ``gone``
-    makes reload raise NotFound, as for a container removed from outside."""
+    makes reload raise NotFound, as for a container removed from outside,
+    and ``api-error`` makes it raise APIError. An entry may also be a
+    (status, restart count, exit code) tuple, which sets ``attrs``.
+    ``archives`` holds each (path, tar bytes) given to ``put_archive``;
+    ``put_archive_error`` and ``start_error`` fail those calls."""
 
     def __init__(
         self,
@@ -258,19 +264,48 @@ class FakeContainer:
         logs: bytes = b"",
         name: str = "app",
         remove_error: Exception | None = None,
+        put_archive_error: Exception | None = None,
+        start_error: Exception | None = None,
     ):
         self._statuses = statuses
         self.status = "created"
         self._logs = logs
         self.name = name
         self.remove_error = remove_error
+        self.put_archive_error = put_archive_error
+        self.start_error = start_error
         self.removed = False
+        self.started = False
+        self.reloads = 0
+        # A crashed container that Docker has not restarted, unless a status entry says otherwise.
+        self.attrs: dict = {"RestartCount": 0, "State": {"ExitCode": 1}}
+        self.archives: list[tuple[str, bytes]] = []
+
+    def put_archive(self, path: str, data: bytes) -> bool:
+        if self.put_archive_error:
+            raise self.put_archive_error
+        self.archives.append((path, data))
+        return True
+
+    def start(self) -> None:
+        if self.start_error:
+            raise self.start_error
+        self.started = True
 
     def reload(self) -> None:
+        self.reloads += 1
         if self._statuses:
-            self.status = self._statuses.pop(0)
+            entry = self._statuses.pop(0)
+            if isinstance(entry, tuple):
+                # (status, restart count, exit code), as ``docker inspect`` reports them.
+                self.status, restarts, exit_code = entry
+                self.attrs = {"RestartCount": restarts, "State": {"ExitCode": exit_code}}
+            else:
+                self.status = entry
         if self.status == "gone":
             raise docker.errors.NotFound("container gone")
+        if self.status == "api-error":
+            raise docker.errors.APIError("daemon unavailable")
 
     def logs(self, tail: int = 200) -> bytes:
         return self._logs
@@ -282,41 +317,135 @@ class FakeContainer:
 
 
 APP_REPOSITORY = "ghcr.io/rhiza-research/weather-skills-chat"
+RUNNER_REPOSITORY = "ghcr.io/rhiza-research/weather-skills-sandbox-runner"
+RUNNER_IMAGE = f"{RUNNER_REPOSITORY}:src-171514bbb4e1"
+APP_EMULATOR_PATHS = ("/app/sandbox/emulator/emulator.py", "/app/sandbox/emulator/local_runtime.py")
 
 
-def local_image(repo_digests: list[str] | None = None) -> SimpleNamespace:
+def local_image(
+    repo_digests: list[str] | None = None, image_id: str = "sha256:local"
+) -> SimpleNamespace:
     """An image built on the Docker host; it has no repo digest unless given one."""
-    return SimpleNamespace(id="sha256:local", attrs={"RepoDigests": repo_digests or []})
+    return SimpleNamespace(id=image_id, attrs={"RepoDigests": repo_digests or []})
+
+
+def emulator_file(path: str) -> bytes:
+    """What the app image holds at ``path``."""
+    return f"# {path}\n".encode()
+
+
+def app_image_files() -> dict[str, bytes]:
+    """The files of an app image that ships the emulator."""
+    return {path: emulator_file(path) for path in APP_EMULATOR_PATHS}
+
+
+class FakeSourceContainer:
+    """A container created from the app image and never started; ``files``
+    maps an absolute path to the bytes ``get_archive`` serves for it."""
+
+    def __init__(
+        self,
+        image_id: str,
+        files: dict[str, bytes],
+        archive_error: Exception | None,
+        archive_stream: Callable | None = None,
+    ):
+        self.image_id = image_id
+        self.files = files
+        self.archive_error = archive_error
+        self.archive_stream = archive_stream
+        self.read: list[str] = []
+        self.started = False
+        self.removed = False
+
+    def get_archive(self, path: str):
+        self.read.append(path)
+        if self.archive_error:
+            raise self.archive_error
+        if self.archive_stream:
+            return self.archive_stream(), {"name": path.rsplit("/", 1)[-1]}
+        if path not in self.files:
+            raise docker.errors.NotFound(f"Could not find the file {path} in container")
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as tar:
+            data = self.files[path]
+            info = tarfile.TarInfo(path.rsplit("/", 1)[-1])
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+        raw = buffer.getvalue()
+        # The SDK streams the archive in chunks.
+        return iter([raw[:100], raw[100:]]), {"name": path.rsplit("/", 1)[-1]}
+
+    def start(self) -> None:
+        self.started = True
+
+    def remove(self, force: bool = False, v: bool = False) -> None:
+        self.removed = True
+
+
+class FakeVolume:
+    def __init__(self, name: str, labels: dict, remove_error: Exception | None = None):
+        self.name = name
+        self.labels = labels
+        self.remove_error = remove_error
+        self.removed = False
+
+    def remove(self, force: bool = False) -> None:
+        if self.remove_error:
+            raise self.remove_error
+        self.removed = True
 
 
 NO_LOOKUP = object()
 
 
 class FakeDocker:
-    """Docker with one image to pull. ``pull_error`` fails the pull; ``local``
-    is the image already on the host that ``images.get`` returns, ``None``
-    when the host does not have it (``get`` raises ImageNotFound), and by
-    default no lookup is expected (``get`` fails the test); ``get_error``
-    fails ``images.get``; ``run_error`` fails ``containers.run`` after the
-    container was created; ``leftovers`` are labeled containers from an
-    earlier run."""
+    """Docker with an app image and a runner image to pull. ``pull_error``
+    fails the pull of every image, ``runner_pull_error`` only the runner's;
+    ``local`` is the app image already on the host that ``images.get``
+    returns, ``None`` when the host does not have it (``get`` raises
+    ImageNotFound), and by default no lookup is expected (``get`` fails the
+    test); the runner image is never looked up; ``get_error`` fails
+    ``images.get``; ``run_error`` fails ``containers.run`` after the
+    container was created; ``create_error`` fails ``containers.create`` of
+    the runner; ``app_files`` are the files of the app image the emulator
+    is read from (by default both emulator files), ``archive_error``
+    fails ``get_archive`` on it and ``archive_stream`` makes the stream it
+    returns; ``volume_error`` fails ``volumes.create``;
+    ``leftovers`` are labeled containers from an earlier run. ``events``
+    records each container and volume created or removed, in order;
+    ``source`` is the container created from the app image to read the
+    emulator."""
 
     def __init__(
         self,
         container: FakeContainer,
         *,
+        runner: FakeContainer | None = None,
         pull_error: Exception | None = None,
+        runner_pull_error: Exception | None = None,
         local: SimpleNamespace | None | object = NO_LOOKUP,
         get_error: Exception | None = None,
         run_error: Exception | None = None,
+        create_error: Exception | None = None,
+        app_files: dict[str, bytes] | None = None,
+        archive_error: Exception | None = None,
+        archive_stream: Callable | None = None,
+        volume_error: Exception | None = None,
+        volume_remove_error: Exception | None = None,
         leftovers: list[FakeContainer] | None = None,
     ):
         self.container = container
+        self.runner = runner or FakeContainer(["running"], name="runner")
+        self.source: FakeSourceContainer | None = None
         self.run_calls: list[dict] = []
+        self.create_calls: list[dict] = []
         self.pulled: list[str] = []
         self.looked_up: list[str] = []
         self.list_filters: list[dict] = []
         self.created: dict[str, FakeContainer] = {}
+        self.volumes_created: dict[str, FakeVolume] = {}
+        self.events: list[str] = []
         self.leftovers = leftovers or []
         image = SimpleNamespace(
             id="sha256:image",
@@ -327,11 +456,19 @@ class FakeDocker:
                 ]
             },
         )
+        runner_image = SimpleNamespace(
+            id="sha256:runner", attrs={"RepoDigests": [f"{RUNNER_REPOSITORY}@sha256:run"]}
+        )
         outer = self
+
+        def is_runner(ref: str) -> bool:
+            return ref.startswith(RUNNER_REPOSITORY)
 
         class Images:
             def get(self, ref):
                 outer.looked_up.append(ref)
+                if is_runner(ref):
+                    raise AssertionError("the runner image must be pulled, whatever pull says")
                 if get_error:
                     raise get_error
                 if local is NO_LOOKUP:
@@ -344,27 +481,74 @@ class FakeDocker:
                 outer.pulled.append(ref)
                 if pull_error:
                     raise pull_error
+                if is_runner(ref):
+                    if runner_pull_error:
+                        raise runner_pull_error
+                    return runner_image
                 return image
 
         class Containers:
             def run(self, image_id, **kwargs):
                 outer.run_calls.append({"image": image_id, **kwargs})
                 outer.created[kwargs["name"]] = outer.container
+                outer.events.append(f"run {kwargs['name']}")
                 if run_error:
                     raise run_error
                 return outer.container
 
+            def create(self, image_id, **kwargs):
+                if "-emulator-" in kwargs["name"]:
+                    outer.source = FakeSourceContainer(
+                        image_id,
+                        app_image_files() if app_files is None else app_files,
+                        archive_error,
+                        archive_stream,
+                    )
+                    outer.source.labels = kwargs["labels"]
+                    outer.created[kwargs["name"]] = outer.source
+                    outer.events.append(f"create {kwargs['name']}")
+                    return outer.source
+                outer.create_calls.append({"image": image_id, **kwargs})
+                if create_error:
+                    raise create_error
+                outer.created[kwargs["name"]] = outer.runner
+                outer.events.append(f"create {kwargs['name']}")
+                return outer.runner
+
             def get(self, name):
-                if name not in outer.created:
+                # A removed container is gone, as on a real daemon.
+                if name not in outer.created or outer.created[name].removed:
                     raise docker.errors.NotFound(name)
+                outer.events.append(f"remove {name}")
                 return outer.created[name]
 
             def list(self, all=False, filters=None):
                 outer.list_filters.append(filters)
                 return outer.leftovers
 
+        class Volumes:
+            def create(self, name, labels):
+                if volume_error:
+                    raise volume_error
+                volume = FakeVolume(name, labels, remove_error=volume_remove_error)
+                outer.volumes_created[name] = volume
+                outer.events.append(f"volume {name}")
+                return volume
+
+            def get(self, name):
+                if name not in outer.volumes_created:
+                    raise docker.errors.NotFound(name)
+                outer.events.append(f"remove {name}")
+                return outer.volumes_created[name]
+
         self.images = Images()
         self.containers = Containers()
+        self.volumes = Volumes()
+
+    def volume(self) -> FakeVolume:
+        """The one volume the run created."""
+        assert len(self.volumes_created) == 1
+        return next(iter(self.volumes_created.values()))
 
 
 def _response(content: str | None = None, tool_call: dict | None = None):

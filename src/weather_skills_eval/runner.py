@@ -5,12 +5,16 @@ Order of a run:
 2. Read the dataset, check that the configuration turns on every skill pack
    the dataset's metadata names in ``skill_packs``, and check every item
    against the task format.
-3. Start the app container and wait for /health.
+3. Pull the app image, read the sandbox emulator from it, pull the runner
+   image, start the runner container and its volume, then the app
+   container, and wait for /health.
 4. Read the resolved configuration from the app (the catalog model's base
    model, tools, skill pack commits).
-5. Run the experiment: each item's task plays the task and returns its
-   scores, which the evaluator records on the item.
-6. Remove the container and flush Langfuse, whatever happened.
+5. Run the experiment: each item's task waits for the runner to be running
+   (Docker restarts one that died), plays the task and returns its scores,
+   which the evaluator records on the item. A runner that is gone, or not
+   running by the start timeout, stops the run.
+6. Remove the containers and the volume and flush Langfuse, whatever happened.
 """
 
 import asyncio
@@ -21,7 +25,7 @@ from pathlib import Path
 
 from .app_client import AppClient, ChatError, highest_skill_versions
 from .config import RunConfig, load_config
-from .instance import AppInstance
+from .instance import AppInstance, RunnerStartError
 from .langfuse_gateway import LangfuseGateway
 from .play import PlayDeps, play
 from .scoring import COST_SCORE
@@ -175,6 +179,7 @@ def _run(
     with AppInstance(
         docker_client=docker_client_factory(),
         image=config.image,
+        runner_image=config.runner_image,
         pull=config.pull,
         env=config.env,
         network=settings.docker_network,
@@ -201,6 +206,9 @@ def _run(
             "image_digest": instance.image_digest or "",
             "image_id": instance.image_id or "",
             "image_pulled": "true" if config.pull else "false",
+            "runner_image": config.runner_image,
+            "runner_image_digest": instance.runner_image_digest or "",
+            "runner_image_id": instance.runner_image_id or "",
             "model": model,
             "catalog_model": config.model,
             "env_var_names": ",".join(config.env_names),
@@ -216,7 +224,21 @@ def _run(
             "dataset_skill_packs": ",".join(required_packs),
         }
 
+        # The first runner failure; once set, no further task is played, and
+        # it is raised after the experiment whether or not run_experiment
+        # raised it from the task.
+        runner_failure: list[RunnerStartError] = []
+
         async def task_fn(*, item, **kwargs):
+            if runner_failure:
+                raise runner_failure[0]
+            try:
+                restarts = await asyncio.to_thread(
+                    instance.wait_for_runner, f"before task {item.id}"
+                )
+            except RunnerStartError as exc:
+                runner_failure.append(exc)
+                raise
             app = new_app()
             try:
                 result = await play(
@@ -237,6 +259,15 @@ def _run(
                 )
             finally:
                 await app.aclose()
+            # A runner that stopped or restarted during the play would score the
+            # task as an agent failure; it stops the run instead.
+            try:
+                await asyncio.to_thread(
+                    instance.check_runner_unchanged, f"during task {item.id}", restarts
+                )
+            except RunnerStartError as exc:
+                runner_failure.append(exc)
+                raise
             if result.chat_id:
                 gateway.link_item_to_chat(result.chat_id)
             # Absent when the trace scores are missing; then nothing is recorded.
@@ -245,14 +276,22 @@ def _run(
                 gateway.record_app_cost(app_cost, result.app_trace_ids)
             return result.output()
 
-        result = gateway.run_experiment(
-            dataset=dataset,
-            name=config.name,
-            description=model,
-            task=task_fn,
-            metadata=metadata,
-            concurrency=settings.concurrency,
-        )
+        try:
+            result = gateway.run_experiment(
+                dataset=dataset,
+                name=config.name,
+                description=model,
+                task=task_fn,
+                metadata=metadata,
+                concurrency=settings.concurrency,
+            )
+        except Exception:
+            # The runner failure is the cause; it is not hidden behind a later error.
+            if runner_failure:
+                raise runner_failure[0]  # noqa: B904 - the other error stays as its context
+            raise
+        if runner_failure:
+            raise runner_failure[0]
 
     outputs = [r.output or {} for r in result.item_results]
     return RunSummary(

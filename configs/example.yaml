@@ -2,7 +2,10 @@
 # referenced ${...} variables in .env. Every secret is a ${...} reference.
 name: example
 image: ${APP_IMAGE}
-# false runs the image already on the Docker host instead of pulling it.
+# The image skills run on: the sandbox runner image the cluster runs. It is
+# pulled on every run, whatever pull says.
+runner_image: ${RUNNER_IMAGE}
+# false runs the app image already on the Docker host instead of pulling it.
 pull: true
 model: TODO
 dataset: TODO
@@ -27,9 +30,6 @@ env:
   SKILL_PACKS:
     - git_url: TODO
       ref: main
-
-  # Without Landlock on the Docker host, skill runs cannot be confined.
-  SKILL_SANDLOCK: "false"
 
   # The app must trace into the Langfuse project the harness reads.
   LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL}

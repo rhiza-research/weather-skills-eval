@@ -4,6 +4,7 @@ fake Docker, fake Langfuse and fake harness models."""
 import base64
 import io
 import json
+import tarfile
 import textwrap
 from collections import Counter
 from pathlib import Path
@@ -11,8 +12,12 @@ from pathlib import Path
 import docker.errors
 import httpx
 import pytest
+import requests
 from fakes import (
+    APP_EMULATOR_PATHS,
     APP_REPOSITORY,
+    RUNNER_IMAGE,
+    RUNNER_REPOSITORY,
     FakeApp,
     FakeClock,
     FakeContainer,
@@ -23,6 +28,7 @@ from fakes import (
     app_observations,
     broadcast_observations,
     display_image,
+    emulator_file,
     image_bytes,
     image_entry,
     local_image,
@@ -32,8 +38,8 @@ from fakes import (
 
 from weather_skills_eval import play as play_module
 from weather_skills_eval.app_client import ChatError
-from weather_skills_eval.config import ConfigError
-from weather_skills_eval.instance import AppStartError
+from weather_skills_eval.config import RUNNER_ENV, ConfigError
+from weather_skills_eval.instance import AppStartError, RunnerStartError
 from weather_skills_eval.langfuse_gateway import TraceReadError
 from weather_skills_eval.llm import ModelReplyError
 from weather_skills_eval.runner import DatasetError, run
@@ -60,6 +66,7 @@ CONFIG = textwrap.dedent(
     """\
     name: production-agent
     image: ghcr.io/rhiza-research/weather-skills-chat:test
+    runner_image: ghcr.io/rhiza-research/weather-skills-sandbox-runner:src-171514bbb4e1
     model: weather-agent
     dataset: weather-tasks
     env:
@@ -72,7 +79,6 @@ CONFIG = textwrap.dedent(
       OPENAI_API_CONFIGS:
         "0":
           prefix_id: open-router-
-      SKILL_SANDLOCK: "false"
       SKILL_PACKS:
         - git_url: https://example.invalid/pack.git
           ref: main
@@ -205,8 +211,9 @@ def test_run_plays_every_task_into_one_experiment_and_removes_the_container(tmp_
     assert call["environment"]["SKILL_PACKS"] == (
         '[{"git_url": "https://example.invalid/pack.git", "ref": "main"}]'
     )
-    assert "volumes" not in call
     assert harness.container.removed
+    assert harness.docker.runner.removed
+    assert harness.docker.volume().removed
     assert len(harness.gateway.experiments) == 1
     experiment = harness.gateway.experiments[0]
     assert experiment["name"] == "production-agent"
@@ -214,13 +221,19 @@ def test_run_plays_every_task_into_one_experiment_and_removes_the_container(tmp_
     for index in range(3):
         assert harness.scores(index)["goal_reached"] == 1.0
     metadata = experiment["metadata"]
-    # The configured image is pulled, and the digest of its repository recorded.
-    assert harness.docker.pulled == ["ghcr.io/rhiza-research/weather-skills-chat:test"]
+    # The configured images are pulled, and the digest of each one's repository recorded.
+    assert harness.docker.pulled == [
+        "ghcr.io/rhiza-research/weather-skills-chat:test",
+        RUNNER_IMAGE,
+    ]
     assert harness.docker.looked_up == []
     assert call["image"] == "sha256:image"
     assert metadata["image_digest"] == f"{APP_REPOSITORY}@sha256:abc"
     assert metadata["image_id"] == "sha256:image"
     assert metadata["image_pulled"] == "true"
+    assert metadata["runner_image"] == RUNNER_IMAGE
+    assert metadata["runner_image_digest"] == f"{RUNNER_REPOSITORY}@sha256:run"
+    assert metadata["runner_image_id"] == "sha256:runner"
     assert "OPENAI_API_KEYS" in metadata["env_var_names"].split(",")
     assert "1234567" in metadata["skill_packs"]
     assert metadata["tool_ids"] == "plot-2,fetch"
@@ -274,7 +287,7 @@ def test_image_reference_is_pulled_and_recorded_resolved(tmp_path):
 
     harness.run(APP_IMAGE=image)
 
-    assert harness.docker.pulled == [image]
+    assert harness.docker.pulled == [image, RUNNER_IMAGE]
     assert harness.docker.run_calls[0]["image"] == "sha256:image"
     metadata = harness.gateway.experiments[0]["metadata"]
     assert metadata["image"] == image
@@ -1813,10 +1826,15 @@ def test_image_pull_failure_stops_the_run(tmp_path):
         pull_error=docker.errors.ImageNotFound("manifest unknown"),
     )
 
-    with pytest.raises(AppStartError, match="could not be pulled"):
+    with pytest.raises(AppStartError, match="could not be pulled") as error:
         harness.run()
 
+    # The app's own error, not the runner's, naming the app image.
+    assert type(error.value) is AppStartError
+    assert "ghcr.io/rhiza-research/weather-skills-chat:test" in str(error.value)
+    assert harness.docker.pulled == ["ghcr.io/rhiza-research/weather-skills-chat:test"]
     assert harness.docker.run_calls == []
+    assert harness.docker.events == []
     assert harness.gateway.experiments == []
     assert harness.gateway.flushed
 
@@ -1828,13 +1846,18 @@ def test_pull_false_runs_a_local_image_without_a_digest(tmp_path):
 
     summary = harness.run()
 
-    assert harness.docker.pulled == []
+    # The runner image is pulled whatever pull says.
+    assert harness.docker.pulled == [RUNNER_IMAGE]
     assert harness.docker.looked_up == ["ghcr.io/rhiza-research/weather-skills-chat:test"]
     assert harness.docker.run_calls[0]["image"] == "sha256:local"
+    assert harness.docker.source.image_id == "sha256:local"
+    assert harness.docker.create_calls[0]["image"] == "sha256:runner"
     metadata = harness.gateway.experiments[0]["metadata"]
     assert metadata["image_pulled"] == "false"
     assert metadata["image_id"] == "sha256:local"
     assert metadata["image_digest"] == ""
+    assert metadata["runner_image_id"] == "sha256:runner"
+    assert metadata["runner_image_digest"] == f"{RUNNER_REPOSITORY}@sha256:run"
     assert summary.goals_reached == 1
     assert harness.container.removed
 
@@ -1847,7 +1870,7 @@ def test_pull_false_records_the_local_image_repo_digest(tmp_path):
 
     harness.run()
 
-    assert harness.docker.pulled == []
+    assert harness.docker.pulled == [RUNNER_IMAGE]
     metadata = harness.gateway.experiments[0]["metadata"]
     assert metadata["image_digest"] == f"{APP_REPOSITORY}@sha256:def"
     assert metadata["image_id"] == "sha256:local"
@@ -1861,6 +1884,9 @@ def test_pull_false_with_missing_image_stops_the_run(tmp_path):
     with pytest.raises(AppStartError) as error:
         harness.run()
 
+    # The app's own error, not the runner's.
+    assert type(error.value) is AppStartError
+    assert harness.docker.events == []
     message = str(error.value)
     assert "ghcr.io/rhiza-research/weather-skills-chat:test" in message
     assert "is not on the Docker host" in message
@@ -2139,6 +2165,10 @@ def test_app_never_healthy_stops_the_run_with_logs(tmp_path):
         (lambda text: text + "replicas: 2\n", "replicas"),
         (lambda text: text + 'pull: "no"\n', "pull"),
         (lambda text: text + "pull: 1\n", "pull"),
+        (lambda text: text.replace(f"runner_image: {RUNNER_IMAGE}\n", ""), "runner_image"),
+        (lambda text: text.replace(RUNNER_IMAGE, '""'), "runner_image"),
+        (lambda text: text.replace(RUNNER_IMAGE, "${UNSET_RUNNER}"), "runner_image"),
+        (lambda text: text + "emulator_commit: abc\n", "emulator_commit"),
     ],
 )
 def test_bad_config_does_not_start_the_run(tmp_path, edit, field):
@@ -2153,3 +2183,490 @@ def test_bad_config_does_not_start_the_run(tmp_path, edit, field):
     assert field in str(error.value)
     assert harness.docker.run_calls == []
     assert harness.gateway.experiments == []
+    assert harness.docker.pulled == []
+
+
+# The sandbox runner
+
+
+def with_env(text: str, block: str) -> str:
+    """CONFIG with ``block`` added to its env, before SKILL_PACKS."""
+    return text.replace("  SKILL_PACKS:\n", block + "  SKILL_PACKS:\n")
+
+
+@pytest.mark.parametrize("name", RUNNER_ENV)
+def test_config_setting_a_runner_variable_does_not_start_the_run(tmp_path, name):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.config_path.write_text(with_env(CONFIG, f'  {name}: "x"\n'))
+
+    with pytest.raises(ConfigError) as error:
+        harness.run()
+
+    assert error.value.field == f"env.{name}"
+    assert "set by the harness" in str(error.value)
+    assert harness.docker.pulled == []
+
+
+def archive_files(data: bytes) -> dict[str, bytes]:
+    with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+        return {m.name: tar.extractfile(m).read() for m in tar.getmembers() if m.isfile()}
+
+
+def test_run_starts_the_runner_and_its_volume_before_the_app(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+
+    harness.run()
+
+    docker_ = harness.docker
+    [create] = docker_.create_calls
+    [app] = docker_.run_calls
+    run_id = app["labels"]["weather-skills-eval.run"]
+    runner_name = f"weather-skills-eval-runner-{run_id}"
+    volume_name = f"weather-skills-eval-data-{run_id}"
+    source_name = f"weather-skills-eval-emulator-{run_id}"
+    # The emulator is read from a container of the app image, never started and
+    # removed at once; the runner and the volume come next, then the app; all
+    # go when the run ends, the volume after the containers that use it.
+    source = docker_.source
+    assert source.image_id == "sha256:image"
+    assert source.labels == {"weather-skills-eval": "emulator", "weather-skills-eval.run": run_id}
+    assert source.read == list(APP_EMULATOR_PATHS)
+    assert not source.started
+    assert source.removed
+    assert docker_.events == [
+        f"create {source_name}",
+        f"remove {source_name}",
+        f"volume {volume_name}",
+        f"create {runner_name}",
+        f"run {app['name']}",
+        f"remove {app['name']}",
+        f"remove {runner_name}",
+        f"remove {volume_name}",
+    ]
+    assert docker_.volume().labels == {
+        "weather-skills-eval": "data",
+        "weather-skills-eval.run": run_id,
+    }
+    # The runner: the runner image, the emulator, the run's volume at /data.
+    assert create["image"] == "sha256:runner"
+    assert create["name"] == runner_name
+    assert create["user"] == "0"
+    assert create["command"] == ["python3", "-u", "/opt/sandbox/emulator/emulator.py"]
+    assert create["network"] == "weather-skills-eval"
+    assert create["labels"] == {"weather-skills-eval": "runner", "weather-skills-eval.run": run_id}
+    assert create["volumes"] == {volume_name: {"bind": "/data", "mode": "rw"}}
+    assert create["restart_policy"] == {"Name": "on-failure"}
+    token = create["environment"]["SKILL_K8S_BIND_TOKEN"]
+    assert len(token) >= 32
+    assert create["environment"] == {
+        "ARTIFACTS_DIR": "/data/artifacts",
+        "SKILL_K8S_EMULATOR_HOST": runner_name,
+        "SKILL_K8S_EMULATOR_API_PORT": "18080",
+        "SKILL_K8S_BIND_PORT": "9090",
+        "SKILL_K8S_EMULATOR_START_DELAY": "0",
+        "SKILL_K8S_BIND_TOKEN": token,
+    }
+    # The emulator files reach the runner by put_archive, before it starts.
+    [(path, data)] = docker_.runner.archives
+    assert path == "/"
+    assert archive_files(data) == {
+        "opt/sandbox/emulator/emulator.py": emulator_file("/app/sandbox/emulator/emulator.py"),
+        "opt/sandbox/emulator/local_runtime.py": emulator_file(
+            "/app/sandbox/emulator/local_runtime.py"
+        ),
+    }
+    assert docker_.runner.started
+    # The app: the emulator settings with this run's runner and token, the volume at its data dir.
+    assert app["volumes"] == {volume_name: {"bind": "/app/backend/data", "mode": "rw"}}
+    env = app["environment"]
+    assert {name: env[name] for name in RUNNER_ENV} == {
+        "SKILL_SANDLOCK": "false",
+        "SKILL_SANDBOX_BACKEND": "k8s",
+        "SKILL_K8S_SANDBOX_ENABLED": "true",
+        "SKILL_K8S_EMULATOR": "true",
+        "SKILL_K8S_APISERVER": f"http://{runner_name}:18080",
+        "SKILL_K8S_BIND_TOKEN": token,
+    }
+    assert env["BOOTSTRAP_ADMIN_API_KEY"] == "sk-test-key"
+    # The token is not recorded.
+    metadata = harness.gateway.experiments[0]["metadata"]
+    # The harness adds exactly the variables a configuration may not set.
+    assert set(env) - set(metadata["env_var_names"].split(",")) == set(RUNNER_ENV)
+    assert token not in json.dumps(metadata)
+    assert "SKILL_K8S_BIND_TOKEN" not in metadata["env_var_names"]
+
+
+def test_each_run_gets_its_own_bind_token(tmp_path):
+    tokens = []
+    for _ in range(2):
+        harness = Harness(tmp_path, [task("t1", "rain forecast kenya")], reply_done_on(1))
+        harness.run()
+        tokens.append(harness.docker.create_calls[0]["environment"]["SKILL_K8S_BIND_TOKEN"])
+    assert tokens[0] != tokens[1]
+
+
+@pytest.mark.parametrize(
+    "app_files, missing",
+    [
+        ({}, "/app/sandbox/emulator/emulator.py"),
+        (
+            {"/app/sandbox/emulator/emulator.py": b"# emulator\n"},
+            "/app/sandbox/emulator/local_runtime.py",
+        ),
+    ],
+    ids=["no-emulator", "no-local-runtime"],
+)
+def test_app_image_without_the_emulator_stops_the_run_before_the_runner(
+    tmp_path, app_files, missing
+):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1), app_files=app_files)
+
+    with pytest.raises(RunnerStartError) as error:
+        harness.run()
+
+    message = str(error.value)
+    assert "ghcr.io/rhiza-research/weather-skills-chat:test" in message
+    assert missing in message
+    # Neither the runner image nor any runner, volume or app.
+    assert harness.docker.pulled == ["ghcr.io/rhiza-research/weather-skills-chat:test"]
+    assert harness.docker.create_calls == []
+    assert harness.docker.volumes_created == {}
+    assert harness.docker.run_calls == []
+    assert harness.docker.source.removed
+    assert harness.gateway.experiments == []
+    assert harness.gateway.flushed
+
+
+def test_emulator_read_error_stops_the_run_before_the_runner(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(
+        tmp_path, items, reply_done_on(1), archive_error=docker.errors.APIError("daemon busy")
+    )
+
+    with pytest.raises(RunnerStartError, match="could not be read from image") as error:
+        harness.run()
+
+    assert "daemon busy" in str(error.value)
+    assert harness.docker.create_calls == []
+    assert harness.docker.source.removed
+
+
+def broken_stream():
+    yield b"\0" * 10
+    raise requests.exceptions.ChunkedEncodingError("connection broken")
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [lambda: iter([b"not a tar archive"]), broken_stream],
+    ids=["not-a-tar", "stream-broken"],
+)
+def test_unreadable_emulator_archive_stops_the_run_before_the_runner(tmp_path, stream):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1), archive_stream=stream)
+
+    with pytest.raises(RunnerStartError) as error:
+        harness.run()
+
+    message = str(error.value)
+    assert "/app/sandbox/emulator/emulator.py could not be read from image" in message
+    assert "ghcr.io/rhiza-research/weather-skills-chat:test" in message
+    assert harness.docker.create_calls == []
+    assert harness.docker.source.removed
+
+
+@pytest.mark.parametrize("pull", [True, False])
+def test_runner_image_pull_failure_stops_the_run_before_the_app(tmp_path, pull):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(
+        tmp_path,
+        items,
+        reply_done_on(1),
+        local=local_image(),
+        runner_pull_error=docker.errors.ImageNotFound("manifest unknown"),
+    )
+    harness.config_path.write_text(CONFIG + f"pull: {'true' if pull else 'false'}\n")
+
+    with pytest.raises(RunnerStartError) as error:
+        harness.run()
+
+    assert f"Runner image {RUNNER_IMAGE} could not be pulled" in str(error.value)
+    app_pulls = ["ghcr.io/rhiza-research/weather-skills-chat:test"] if pull else []
+    assert harness.docker.pulled == [*app_pulls, RUNNER_IMAGE]
+    assert harness.docker.create_calls == []
+    assert harness.docker.volumes_created == {}
+    assert harness.docker.run_calls == []
+    assert harness.gateway.experiments == []
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"volume_error": docker.errors.APIError("disk full")},
+        {"create_error": docker.errors.APIError("no such network")},
+        {"runner": FakeContainer([], put_archive_error=docker.errors.APIError("no space"))},
+        {"runner": FakeContainer([], start_error=docker.errors.APIError("port in use"))},
+    ],
+    ids=["volume", "create", "put-archive", "start"],
+)
+def test_runner_start_failure_stops_the_run_and_removes_what_it_created(tmp_path, options):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1), **options)
+
+    with pytest.raises(RunnerStartError, match="Runner container could not start"):
+        harness.run()
+
+    assert harness.docker.run_calls == []
+    for name, container in harness.docker.created.items():
+        assert container.removed, name
+    for volume in harness.docker.volumes_created.values():
+        assert volume.removed
+    assert harness.gateway.experiments == []
+
+
+def test_runner_that_exits_while_the_app_starts_stops_the_run_with_its_logs(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    runner = FakeContainer(["exited"], logs=b"missing /usr/local/bin/sandbox_runtime.py")
+    harness = Harness(tmp_path, items, reply_done_on(1), runner=runner)
+
+    with pytest.raises(RunnerStartError, match="sandbox_runtime.py"):
+        harness.run()
+
+    assert runner.removed
+    assert harness.container.removed
+    assert harness.docker.volume().removed
+
+
+def test_runner_that_disappears_stops_the_run(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1), runner=FakeContainer(["gone"]))
+
+    with pytest.raises(RunnerStartError, match="disappeared"):
+        harness.run()
+
+    assert harness.container.removed
+    assert harness.docker.volume().removed
+
+
+THREE_TASKS = [
+    task("t1", "rain forecast kenya"),
+    task("t2", "rain map kenya"),
+    task("t3", "weekly rain"),
+]
+
+
+# Running at /health, and through t1: two polls before it and one after.
+THROUGH_T1 = ["running"] * 4
+SHORT_WAIT = {"EVAL_APP_START_TIMEOUT_SECONDS": "30", "EVAL_POLL_INTERVAL_SECONDS": "5"}
+
+
+def test_runner_that_dies_and_restarts_plays_the_task_on_the_restarted_runner(tmp_path, caplog):
+    # Exited before t2, then Docker restarts it once: running twice with one restart.
+    restarted = ("running", 1, 0)
+    runner = FakeContainer([*THROUGH_T1, "exited", "restarting", restarted, restarted])
+    harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
+
+    with caplog.at_level("WARNING"):
+        summary = harness.run()
+
+    assert summary.items == 3 and summary.goals_reached == 3
+    assert len(harness.app.chats) == 3
+    assert "is not running before task t2; waiting up to 600 s" in caplog.text
+    # /health, 3 for t1, 4 polls and 1 check for t2, 3 for t3.
+    assert runner.reloads == 12
+    assert runner.removed
+
+
+def test_runner_that_does_not_come_back_stops_the_run_with_its_logs(tmp_path):
+    # Exited before t2 and never restarted.
+    runner = FakeContainer([*THROUGH_T1, "exited"], logs=b"emulator crashed")
+    harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
+
+    with pytest.raises(RunnerStartError, match="emulator crashed") as error:
+        harness.run(**SHORT_WAIT)
+
+    message = str(error.value)
+    assert "was not running steadily before task t2 after 30 s: it is exited" in message
+    # /health, 3 for t1, then every 5 s from 0 to 30 s.
+    assert runner.reloads == 4 + 7
+    assert len(harness.app.chats) == 1
+    assert runner.removed
+    assert harness.container.removed
+    assert harness.docker.volume().removed
+
+
+@pytest.mark.parametrize(
+    "statuses, message",
+    [
+        (["running", "gone"], "disappeared before task t1"),
+        (["running", "exited", "gone"], "disappeared before task t1"),
+        (["running", "api-error"], "could not be read before task t1"),
+    ],
+    ids=["gone", "gone-while-waiting", "reload-error"],
+)
+def test_runner_lost_mid_run_stops_the_run(tmp_path, statuses, message):
+    harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=FakeContainer(statuses))
+
+    with pytest.raises(RunnerStartError, match=message):
+        harness.run()
+
+    assert harness.app.chats == {}
+    assert harness.container.removed
+    assert harness.docker.volume().removed
+
+
+def keep_task_errors(harness, tasks_raised, then_raise=None):
+    """Make the experiment record a task's runner error on its item and go on,
+    then raise ``then_raise`` when given."""
+    record = harness.gateway.run_experiment
+
+    def run_experiment(*, task, **kwargs):
+        async def keeping(*, item, **task_kwargs):
+            try:
+                return await task(item=item, **task_kwargs)
+            except RunnerStartError as exc:
+                tasks_raised.append((item.id, exc))
+                return {}
+
+        result = record(task=keeping, **kwargs)
+        if then_raise:
+            raise then_raise
+        return result
+
+    harness.gateway.run_experiment = run_experiment
+
+
+def test_runner_death_stops_the_run_when_the_experiment_keeps_task_errors(tmp_path):
+    runner = FakeContainer([*THROUGH_T1, "exited"], logs=b"emulator crashed")
+    harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
+    tasks_raised = []
+    keep_task_errors(harness, tasks_raised)
+
+    with pytest.raises(RunnerStartError, match="not running steadily before task t2"):
+        harness.run(**SHORT_WAIT)
+
+    # t3 is not played: it raises the same error at once.
+    assert [item_id for item_id, _ in tasks_raised] == ["t2", "t3"]
+    assert tasks_raised[0][1] is tasks_raised[1][1]
+    assert len(harness.app.chats) == 1
+    assert harness.container.removed
+    assert harness.docker.volume().removed
+
+
+def test_a_later_experiment_error_does_not_hide_the_runner_failure(tmp_path):
+    runner = FakeContainer([*THROUGH_T1, "exited"], logs=b"emulator crashed")
+    harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
+    keep_task_errors(harness, [], then_raise=RuntimeError("Langfuse flush failed"))
+
+    with pytest.raises(RunnerStartError, match="emulator crashed") as error:
+        harness.run(**SHORT_WAIT)
+
+    assert isinstance(error.value.__context__, RuntimeError)
+
+
+def test_runner_crashing_while_the_app_starts_stops_the_run_with_its_logs(tmp_path):
+    # With restart policy on-failure, a runner that crashes at start is restarting.
+    runner = FakeContainer(["restarting"], logs=b"ImportError: local_runtime")
+    harness = Harness(
+        tmp_path, [task("t1", "rain forecast kenya")], reply_done_on(1), runner=runner
+    )
+
+    with pytest.raises(RunnerStartError, match="ImportError: local_runtime") as error:
+        harness.run()
+
+    assert "Runner container restarting before the app was ready" in str(error.value)
+    assert harness.app.chats == {}
+    assert runner.removed
+
+
+def test_runner_in_a_crash_loop_stops_the_run_by_the_timeout(tmp_path):
+    # Before t2 Docker keeps restarting it: running is never seen twice with one count.
+    loop = [("running" if n % 2 else "restarting", n, 0 if n % 2 else 1) for n in range(1, 40)]
+    runner = FakeContainer([*THROUGH_T1, *loop], logs=b"emulator crashed")
+    harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
+
+    with pytest.raises(RunnerStartError, match="emulator crashed") as error:
+        harness.run(**SHORT_WAIT)
+
+    assert "was not running steadily before task t2 after 30 s" in str(error.value)
+    assert len(harness.app.chats) == 1
+
+
+def test_runner_that_restarts_on_every_poll_is_not_taken_as_running(tmp_path):
+    # Running on each poll, but with a new restart count each time.
+    loop = [("running", n, 0) for n in range(1, 40)]
+    runner = FakeContainer([*THROUGH_T1, *loop])
+    harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
+
+    with pytest.raises(RunnerStartError, match="not running steadily before task t2"):
+        harness.run(**SHORT_WAIT)
+
+
+def test_runner_that_exits_with_code_0_stops_the_run_at_once(tmp_path):
+    # Docker does not restart a container that exited with code 0.
+    runner = FakeContainer([*THROUGH_T1, ("exited", 0, 0)], logs=b"emulator stopped")
+    harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
+
+    with pytest.raises(RunnerStartError, match="emulator stopped") as error:
+        harness.run(**SHORT_WAIT)
+
+    assert "exited with code 0 before task t2" in str(error.value)
+    assert runner.reloads == 5
+    assert len(harness.app.chats) == 1
+
+
+@pytest.mark.parametrize(
+    "after_t1",
+    [("running", 1, 0), "restarting", "exited"],
+    ids=["restarted", "restarting", "exited"],
+)
+def test_runner_that_dies_during_a_task_stops_the_run(tmp_path, after_t1):
+    # Running at /health and on both polls before t1; not the same runner after it.
+    runner = FakeContainer(["running"] * 3 + [after_t1], logs=b"emulator crashed")
+    harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
+
+    with pytest.raises(RunnerStartError, match="emulator crashed") as error:
+        harness.run()
+
+    assert "stopped during task t1" in str(error.value)
+    # The task is not scored.
+    assert harness.gateway.experiments == []
+    assert len(harness.app.chats) == 1
+    assert harness.container.removed
+    assert harness.docker.volume().removed
+
+
+def test_failed_run_removes_the_app_runner_and_volume(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.app.base_model_id = None
+
+    with pytest.raises(ChatError):
+        harness.run()
+
+    assert harness.container.removed
+    assert harness.docker.runner.removed
+    assert harness.docker.volume().removed
+
+
+def test_cleanup_errors_are_logged_and_do_not_replace_the_run_error(tmp_path, caplog):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(
+        tmp_path,
+        items,
+        reply_done_on(1),
+        container=FakeContainer(["exited"], logs=b"bad env", remove_error=RuntimeError("busy")),
+        runner=FakeContainer(["running"], remove_error=docker.errors.APIError("busy")),
+        volume_remove_error=docker.errors.APIError("volume is in use"),
+    )
+
+    with pytest.raises(AppStartError, match="bad env"):
+        harness.run()
+
+    logged = caplog.text
+    assert "Could not remove app container" in logged
+    assert "Could not remove runner container" in logged
+    assert "Could not remove volume" in logged

@@ -12,7 +12,14 @@ import httpx
 import litellm
 import pytest
 import scenario
-from fakes import FakeContainer, FakeModels, FakeRunApi
+from fakes import (
+    FakeContainer,
+    FakeModels,
+    FakeRunApi,
+    FakeSourceContainer,
+    FakeVolume,
+    app_image_files,
+)
 from langfuse import Langfuse
 from langfuse.api.core.api_error import ApiError as LangfuseApiError
 from opentelemetry.sdk.trace import TracerProvider
@@ -24,7 +31,12 @@ from weather_skills_eval import instance as instance_module
 from weather_skills_eval.app_client import AppClient, ChatError
 from weather_skills_eval.checks import Evidence, collect_evidence
 from weather_skills_eval.config import ConfigError, load_config, parse_config
-from weather_skills_eval.instance import AppInstance, AppStartError, repository_of
+from weather_skills_eval.instance import (
+    AppInstance,
+    AppStartError,
+    RunnerStartError,
+    repository_of,
+)
 from weather_skills_eval.judge import GoalJudge, rate_answer
 from weather_skills_eval.langfuse_gateway import LangfuseGateway, LangfuseRuns
 from weather_skills_eval.play import neutral_transcript
@@ -47,6 +59,7 @@ ENVIRON = {"S": "secret", "P": "password", "K": "sk-key", "EMPTY": "  "}
 def parse(env_extra=None, environ=ENVIRON):
     raw = {
         "image": "img:tag",
+        "runner_image": "runner:tag",
         "model": "m",
         "dataset": "d",
         "env": {**BASE_ENV, **(env_extra or {})},
@@ -164,6 +177,7 @@ def test_example_config_is_valid():
         name: "value"
         for name in (
             "APP_IMAGE",
+            "RUNNER_IMAGE",
             "APP_WEBUI_SECRET_KEY",
             "APP_ADMIN_PASSWORD",
             "APP_ADMIN_API_KEY",
@@ -175,9 +189,27 @@ def test_example_config_is_valid():
     }
     config = load_config(REPO / "configs" / "example.yaml", environ)
     assert config.name == "example"
+    assert config.runner_image == "value"
     assert json.loads(config.env["OPENAI_API_CONFIGS"]) == {
         "0": {"model_call_tracing": "openrouter"}
     }
+
+
+def env_example_names() -> list[str]:
+    """The variables ``.env.example`` sets (not the commented-out ones)."""
+    lines = (REPO / ".env.example").read_text().splitlines()
+    return [line.split("=", 1)[0] for line in lines if line and not line.startswith("#")]
+
+
+@pytest.mark.parametrize(
+    "path", sorted((REPO / "configs").glob("*.yaml")), ids=lambda path: path.name
+)
+def test_every_config_loads_with_the_env_example_variables(path):
+    assert "RUNNER_IMAGE" in env_example_names()
+    environ = {name: "value" for name in env_example_names()}
+    config = load_config(path, environ)
+    assert config.image == "value"
+    assert config.runner_image == "value"
 
 
 # Settings
@@ -578,6 +610,7 @@ def test_final_judge_reads_the_run_that_arun_leaves_current():
         (TaskError("dataset item t1: bad"), 2, "Run not started"),
         (DatasetError("Dataset d has no items"), 2, "Run not started"),
         (AppStartError("container exited"), 3, "the app did not start"),
+        (RunnerStartError("runner exited"), 3, "the sandbox runner did not start"),
         (docker.errors.APIError("daemon down"), 3, "Docker failed"),
         (ChatError("GET /api/v1/tool_summary returned 500"), 4, "the app failed"),
         (httpx.ConnectError("refused"), 4, "the app failed"),
@@ -797,7 +830,8 @@ def test_cli_delete_with_any_other_error_exits_1(capsys):
 
 def test_load_config_from_stdin_and_from_a_path(tmp_path):
     text = (
-        "name: from-stdin\nimage: img:tag\nmodel: m\ndataset: d\nenv:\n"
+        "name: from-stdin\nimage: img:tag\nrunner_image: runner:tag\n"
+        "model: m\ndataset: d\nenv:\n"
         "  WEBUI_SECRET_KEY: ${S}\n  BOOTSTRAP_ADMIN_EMAIL: admin\n"
         "  BOOTSTRAP_ADMIN_PASSWORD: ${P}\n  BOOTSTRAP_ADMIN_API_KEY: ${K}\n"
     )
@@ -810,14 +844,16 @@ def test_load_config_from_stdin_and_from_a_path(tmp_path):
 
 
 class SharedDaemon:
-    """One Docker daemon shared by several runs. Listing containers is not
-    allowed: a run must only touch the container it started."""
+    """One Docker daemon shared by several runs. Listing containers or volumes
+    is not allowed: a run must only touch the objects it created."""
 
     def __init__(self):
         self.containers_by_name: dict[str, FakeContainer] = {}
+        self.volumes_by_name: dict[str, FakeVolume] = {}
         self.labels: dict[str, dict] = {}
         image = types.SimpleNamespace(
-            id="sha256:image", attrs={"RepoDigests": ["ghcr.io/org/app@sha256:abc"]}
+            id="sha256:image",
+            attrs={"RepoDigests": ["ghcr.io/org/app@sha256:abc", "ghcr.io/org/runner@sha256:def"]},
         )
         daemon = self
 
@@ -832,6 +868,14 @@ class SharedDaemon:
                 daemon.labels[name] = labels
                 return container
 
+            def create(self, image_id, *, name, labels, **kwargs):
+                if "-emulator-" in name:
+                    source = FakeSourceContainer(image_id, app_image_files(), None)
+                    daemon.containers_by_name[name] = source
+                    daemon.labels[name] = labels
+                    return source
+                return self.run(image_id, name=name, labels=labels)
+
             def get(self, name):
                 if name not in daemon.containers_by_name:
                     raise docker.errors.NotFound(name)
@@ -840,14 +884,39 @@ class SharedDaemon:
             def list(self, **kwargs):
                 raise AssertionError("a run must not list other runs' containers")
 
+        class Volumes:
+            def create(self, name, labels):
+                daemon.volumes_by_name[name] = FakeVolume(name, labels)
+                daemon.labels[name] = labels
+                return daemon.volumes_by_name[name]
+
+            def get(self, name):
+                if name not in daemon.volumes_by_name:
+                    raise docker.errors.NotFound(name)
+                return daemon.volumes_by_name[name]
+
+            def list(self, **kwargs):
+                raise AssertionError("a run must not list other runs' volumes")
+
         self.images = Images()
         self.containers = Containers()
+        self.volumes = Volumes()
+
+    def removed(self, instance: AppInstance) -> list[bool]:
+        """Whether the run's emulator source, app, runner and volume were removed."""
+        return [
+            self.containers_by_name[instance.emulator_source_name].removed,
+            self.containers_by_name[instance.name].removed,
+            self.containers_by_name[instance.runner_name].removed,
+            self.volumes_by_name[instance.volume_name].removed,
+        ]
 
 
 def instance_on(daemon) -> AppInstance:
     return AppInstance(
         docker_client=daemon,
         image="ghcr.io/org/app:1",
+        runner_image="ghcr.io/org/runner:1",
         env={},
         network="n",
         port="8080",
@@ -865,13 +934,20 @@ def test_concurrent_runs_on_one_daemon_do_not_interfere():
         with second:
             run_ids = {labels["weather-skills-eval.run"] for labels in daemon.labels.values()}
             assert run_ids == {first.run_id, second.run_id}
-            assert len(run_ids) == 2
-        assert daemon.containers_by_name[second.name].removed
-        assert not daemon.containers_by_name[first.name].removed
-    assert daemon.containers_by_name[first.name].removed
+            # Each run's emulator source, app, runner and volume.
+            assert len(daemon.labels) == 8
+            # Each run's app is configured with its own runner and token.
+            first_env, second_env = first.app_env, second.app_env
+            assert first.runner_name in first_env["SKILL_K8S_APISERVER"]
+            assert second.runner_name in second_env["SKILL_K8S_APISERVER"]
+            assert first_env["SKILL_K8S_BIND_TOKEN"] != second_env["SKILL_K8S_BIND_TOKEN"]
+        assert daemon.removed(second) == [True, True, True, True]
+        # The emulator source goes once the emulator is read.
+        assert daemon.removed(first) == [True, False, False, False]
+    assert daemon.removed(first) == [True, True, True, True]
 
 
-def test_sigterm_during_a_run_removes_its_container():
+def test_sigterm_during_a_run_removes_its_containers_and_volume():
     daemon = SharedDaemon()
     instance = instance_on(daemon)
 
@@ -879,4 +955,4 @@ def test_sigterm_during_a_run_removes_its_container():
         with instance:
             cli._terminate(15, None)
 
-    assert daemon.containers_by_name[instance.name].removed
+    assert daemon.removed(instance) == [True, True, True, True]

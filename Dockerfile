@@ -19,10 +19,12 @@ RUN uv sync --locked --no-dev
 ARG HARNESS_COMMIT=""
 ENV EVAL_HARNESS_COMMIT=$HARNESS_COMMIT
 
-# The image the test service runs: dev dependencies, tests and the example configuration.
+# The image the test service runs: dev dependencies, tests, the configurations
+# and the variables .env.example lists for them.
 FROM base AS test
 RUN uv sync --locked --no-install-project
 COPY src ./src
 RUN uv sync --locked
 COPY tests ./tests
 COPY configs ./configs
+COPY .env.example ./
