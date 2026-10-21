@@ -18,25 +18,47 @@ reads the app's traces from the project its own keys belong to.
 """
 
 import asyncio
+import json
 import time
 from collections.abc import Awaitable, Callable
 
+import httpx
 import litellm
 from langfuse import Evaluation, Langfuse, propagate_attributes
+from langfuse.api.core.api_error import ApiError
 from opentelemetry import context as otel_context
 from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
 
-from .scoring import APP_TRACE_NAME
+from .llm import ModelReplyError
+from .scoring import APP_TRACE_NAME, TraceRead
 
 OBSERVATION_FIELDS = "core,basic,model,usage,metadata"
+TOOL_OUTPUT_FIELDS = "core,io"
 PAGE_SIZE = 1000
+# Tool outputs can be large.
+TOOL_OUTPUT_PAGE_SIZE = 100
 SESSION_ATTRIBUTE = "session.id"
 APP_COST_ROLLUP = "app-cost-rollup"
 
 
 class TraceReadError(Exception):
     """The app's traces could not be read from Langfuse."""
+
+
+def _transient(exc: Exception) -> bool:
+    """A read error that a later read may not hit: a transport error or
+    timeout, or a 429 or 5xx response. A 4xx such as 400, 401, 403 or 404 is
+    not, nor a Langfuse error without a status code."""
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+    elif isinstance(exc, ApiError):
+        status = exc.status_code
+    else:
+        return False
+    return status is not None and (status == 429 or status >= 500)
 
 
 def _usage(response) -> dict[str, int]:
@@ -58,9 +80,19 @@ def _cost(response) -> dict[str, float]:
     return {"total": float(cost)} if cost else {}
 
 
-def _normalize(observation) -> dict:
+def _ok(output):
+    """A tool output's ``"ok"`` value; None when the output is not a JSON object."""
+    if isinstance(output, str):
+        try:
+            output = json.loads(output)
+        except ValueError:
+            return None
+    return output.get("ok") if isinstance(output, dict) else None
+
+
+def _normalize(observation, tool_outputs: dict[str, object]) -> dict:
     level = observation.level
-    return {
+    normalized = {
         "id": observation.id,
         "trace_id": observation.trace_id,
         "type": observation.type,
@@ -74,6 +106,20 @@ def _normalize(observation) -> dict:
         "total_cost": observation.total_cost,
         "metadata": observation.metadata or {},
     }
+    # Absent until a read has returned the tool's output.
+    if observation.type == "TOOL" and observation.id in tool_outputs:
+        normalized["ok"] = _ok(tool_outputs[observation.id])
+    return normalized
+
+
+def _shape(observations: list[dict]) -> tuple:
+    """The observations and whether each has ended, without tool outputs."""
+    return tuple(sorted((o["id"], o["end_time"] is not None) for o in observations))
+
+
+def _unread(observations: list[dict]) -> int:
+    """Tool observations whose output has not been read."""
+    return sum(1 for o in observations if o["type"] == "TOOL" and "ok" not in o)
 
 
 def play_scores(*, output, **kwargs) -> list[Evaluation]:
@@ -92,6 +138,7 @@ class LangfuseGateway:
         trace_timeout: float,
         trace_settle: float,
         poll_interval: float,
+        model_max_tokens: int,
         model_retries: int = 2,
         client: Langfuse | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -105,6 +152,7 @@ class LangfuseGateway:
         self._trace_settle = trace_settle
         self._poll_interval = poll_interval
         self._model_retries = model_retries
+        self._model_max_tokens = model_max_tokens
         self._clock = clock
         self._sleep = sleep
 
@@ -155,6 +203,12 @@ class LangfuseGateway:
         # A fresh context makes the call a trace of its own instead of a child
         # of the experiment item, so it carries its own user id.
         kwargs.setdefault("num_retries", self._model_retries)
+        # Scenario's judge sends max_tokens=None.
+        if kwargs.get("max_completion_tokens") is not None:
+            if kwargs.get("max_tokens") is None:
+                kwargs.pop("max_tokens", None)
+        elif kwargs.get("max_tokens") is None:
+            kwargs["max_tokens"] = self._model_max_tokens
         token = otel_context.attach(otel_context.Context())
         try:
             with propagate_attributes(
@@ -170,22 +224,31 @@ class LangfuseGateway:
                     input=kwargs.get("messages"),
                 ) as generation:
                     response = litellm.completion(**kwargs)
-                    message = response.choices[0].message
+                    choice = response.choices[0]
+                    message = choice.message
                     generation.update(
                         output=message.model_dump() if hasattr(message, "model_dump") else message,
                         usage_details=_usage(response),
                         cost_details=_cost(response),
                     )
+                    if getattr(choice, "finish_reason", None) == "length":
+                        limit = "max_tokens" if "max_tokens" in kwargs else "max_completion_tokens"
+                        raise ModelReplyError(
+                            f"The {role} reply was cut off at {limit} {kwargs[limit]} "
+                            "(EVAL_MODEL_MAX_TOKENS unless the call set its own)"
+                        )
                     return response
         finally:
             otel_context.detach(token)
 
-    def _pages(self, **filters) -> list:
+    def _pages(
+        self, fields: str = OBSERVATION_FIELDS, page_size: int = PAGE_SIZE, **filters
+    ) -> list:
         observations, cursor, seen = [], None, set()
         while True:
             page = self.client.api.observations.get_many(
-                fields=OBSERVATION_FIELDS,
-                limit=PAGE_SIZE,
+                fields=fields,
+                limit=page_size,
                 cursor=cursor,
                 **filters,
             )
@@ -195,42 +258,144 @@ class LangfuseGateway:
                 return observations
             seen.add(cursor)
 
-    def _app_observations(self, chat_id: str) -> list[dict]:
+    def _app_observations(
+        self, chat_id: str, tool_outputs: dict[str, object], force: set[str] | None = None
+    ) -> list[dict]:
+        """``tool_outputs`` keeps the outputs read so far, by observation id,
+        across polls; a trace's tool outputs are read only while one is missing.
+        A tool in ``force`` has its output read whether or not it has ended."""
         # Only the app's traces: the session also holds the simulated user's
         # and the judge's traces, and the experiment item's.
         roots = self._pages(session_id=chat_id, name=APP_TRACE_NAME)
         trace_ids = sorted({o.trace_id for o in roots if o.trace_id and o.name == APP_TRACE_NAME})
         observations = []
         for trace_id in trace_ids:
-            observations.extend(_normalize(o) for o in self._pages(trace_id=trace_id))
+            found = self._pages(trace_id=trace_id)
+            # After the full read, so every tool it found can have its output.
+            # Inputs and outputs are read for tool observations only.
+            if any(o.type == "TOOL" and o.id not in tool_outputs for o in found):
+                tools = self._pages(
+                    fields=TOOL_OUTPUT_FIELDS,
+                    page_size=TOOL_OUTPUT_PAGE_SIZE,
+                    trace_id=trace_id,
+                    type="TOOL",
+                )
+                # A tool's output is read once the tool has ended, null or not;
+                # a running tool may still write it.
+                tool_outputs.update(
+                    {
+                        o.id: o.output
+                        for o in tools
+                        if o.end_time is not None or o.id in (force or set())
+                    }
+                )
+            observations.extend(_normalize(o, tool_outputs) for o in found)
         return observations
 
-    async def chat_observations(self, chat_id: str, turns: int) -> tuple[list[dict], bool]:
+    async def chat_observations(self, chat_id: str, turns: int) -> TraceRead:
         """The app's observations for a chat once they stop changing.
 
         ``turns`` is the number of turns the app accepted. Waits until there
-        is one app trace per such turn and the set of observations has not
-        changed for the settle time. Returns what it has, with ``False``, when
-        the timeout passes first. Raises ``TraceReadError`` when Langfuse
-        cannot be read.
+        is one app trace per such turn, every tool's output has been read, and
+        the observations have not changed for the settle time; the read is not
+        complete when the timeout passes first. When the traces have otherwise
+        settled and the only unread tools have no end time (a span a turn
+        timeout left open), their outputs are read once as they are. That
+        read is final when it finds the same traces and observations, complete
+        when it returned every one of them; otherwise polling goes on and the
+        outputs it read for tools still open are dropped. A read failing with a
+        transient error (see ``_transient``) is retried at the poll interval
+        until the timeout; it does not restart the settle time, which only a
+        change in the observations does.
+        ``TraceReadError`` is raised when no read succeeded by the timeout,
+        and at once for any other error before a read succeeded; after one,
+        any other error returns the last successful read as partial.
         """
         deadline = self._clock() + self._trace_timeout
         last_signature = None
         stable_since = self._clock()
+        observations: list[dict] | None = None
+        tool_outputs: dict[str, object] = {}
+        force: set[str] = set()
+        settled_shape: tuple | None = None
+
+        def arriving(observations: list[dict]) -> bool:
+            traces = {o["trace_id"] for o in observations}
+            return len(traces) < turns or self._clock() - stable_since < self._trace_settle
+
         while True:
             try:
-                observations = await asyncio.to_thread(self._app_observations, chat_id)
+                observations = await asyncio.to_thread(
+                    self._app_observations, chat_id, tool_outputs, force
+                )
+                read_error = None
             except Exception as exc:
-                raise TraceReadError(f"{type(exc).__name__}: {exc}") from exc
+                read_error = f"{type(exc).__name__}: {exc}"
+                if not _transient(exc):
+                    if observations is None:
+                        raise TraceReadError(read_error) from exc
+                    # After a read succeeded, that read is kept as partial.
+                    return TraceRead(
+                        observations,
+                        False,
+                        read_error=read_error,
+                        unread_tools=_unread(observations),
+                        traces_arriving=arriving(observations),
+                    )
+                if self._clock() >= deadline:
+                    if observations is None:
+                        raise TraceReadError(read_error) from exc
+                    return TraceRead(
+                        observations,
+                        False,
+                        read_error=read_error,
+                        unread_tools=_unread(observations),
+                        traces_arriving=arriving(observations),
+                    )
+                await self._sleep(self._poll_interval)
+                continue
             traces = {o["trace_id"] for o in observations}
-            signature = tuple(sorted((o["id"], o["end_time"] is not None) for o in observations))
+            shape = (len(traces), _shape(observations))
+            if force and shape == settled_shape:
+                unread_tools = _unread(observations)
+                return TraceRead(
+                    observations, not unread_tools, unread_tools=unread_tools, forced=True
+                )
+            if force:
+                # A forced read that found new observations polls on as usual,
+                # without the outputs it read for tools still open.
+                still_open = {
+                    o["id"] for o in observations if o["id"] in force and o["end_time"] is None
+                }
+                for observation in observations:
+                    if observation["id"] in still_open:
+                        tool_outputs.pop(observation["id"], None)
+                        observation.pop("ok", None)
+                force = set()
+            signature = tuple(
+                sorted(
+                    (o["id"], o["end_time"] is not None, o.get("ok", "unread"))
+                    for o in observations
+                )
+            )
             if signature != last_signature:
                 last_signature = signature
                 stable_since = self._clock()
             elif len(traces) >= turns and self._clock() - stable_since >= self._trace_settle:
-                return observations, True
+                unread = [o for o in observations if o["type"] == "TOOL" and "ok" not in o]
+                if not unread:
+                    return TraceRead(observations, True)
+                if all(o["end_time"] is None for o in unread):
+                    force = {o["id"] for o in unread}
+                    settled_shape = shape
+                    continue
             if self._clock() >= deadline:
-                return observations, False
+                return TraceRead(
+                    observations,
+                    False,
+                    unread_tools=_unread(observations),
+                    traces_arriving=arriving(observations),
+                )
             await self._sleep(self._poll_interval)
 
     def flush(self) -> None:

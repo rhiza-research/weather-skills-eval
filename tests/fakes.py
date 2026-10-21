@@ -15,6 +15,7 @@ import httpx
 import litellm
 
 from weather_skills_eval.langfuse_gateway import play_scores
+from weather_skills_eval.scoring import TraceRead
 
 
 class FakeClock:
@@ -46,8 +47,8 @@ class Reply:
     http_status: int | None = None
 
 
-def chain(fetcher: str = "arco-era5-fetch") -> list[dict]:
-    """A provenance chain: a fetch for western Kenya, then a weekly sum."""
+def chain(fetcher: str = "arco-era5-fetch", period: str = "weekly") -> list[dict]:
+    """A provenance chain: a fetch for western Kenya, then a sum over ``period``."""
     return [
         {
             "skill": fetcher,
@@ -58,7 +59,7 @@ def chain(fetcher: str = "arco-era5-fetch") -> list[dict]:
         {
             "skill": "aggregate-temporal",
             "version": "0.0.2",
-            "args": {"period": "weekly", "reducer": "sum"},
+            "args": {"period": period, "reducer": "sum"},
             "input": {
                 "basename": "rain.zarr",
                 "hash": hashlib.sha256(b"rain.zarr").hexdigest(),
@@ -104,9 +105,11 @@ def display_image(path: str) -> str:
     return tool_call("display_image", {"path": path}, [f"Showing `{path}`."])
 
 
-def image_entry(path: str, fetcher: str = "arco-era5-fetch", provenance: bool = True) -> dict:
-    """A PNG listing entry, with the provenance of ``chain(fetcher)`` unless told not."""
-    return _entry(path, "image", chain(fetcher) if provenance else None)
+def image_entry(
+    path: str, fetcher: str = "arco-era5-fetch", provenance: bool = True, period: str = "weekly"
+) -> dict:
+    """A PNG listing entry, with the provenance of ``chain(fetcher, period)`` unless told not."""
+    return _entry(path, "image", chain(fetcher, period) if provenance else None)
 
 
 def zarr_entry(path: str, fetcher: str = "arco-era5-fetch", provenance: bool = True) -> dict:
@@ -132,6 +135,11 @@ class FakeApp:
         self.catalog_model_requests: list[str] = []
         # (endpoint, path) of each file request: listings and downloads.
         self.file_requests: list[tuple[str, str | None]] = []
+        # How many more downloads of a path, or listings, fail with a 500.
+        self.failing_downloads: dict[str, int] = {}
+        self.failing_listings = 0
+        # Only file requests after this many fail.
+        self.failures_after = 0
         self.tools = [
             {
                 "id": "plot-1",
@@ -198,8 +206,15 @@ class FakeApp:
         wanted = params.get("path")
         self.file_requests.append((rest, wanted))
         files = state["files"]
+        can_fail = len(self.file_requests) > self.failures_after
+        if rest == "/artifacts" and can_fail and self.failing_listings:
+            self.failing_listings -= 1
+            return httpx.Response(500, json={"detail": "storage busy"})
         if rest == "/artifacts":
             return httpx.Response(200, json=state["artifacts"])
+        if rest == "/artifacts/content" and can_fail and self.failing_downloads.get(wanted):
+            self.failing_downloads[wanted] -= 1
+            return httpx.Response(500, json={"detail": "storage busy"})
         if rest == "/artifacts/content" and wanted in files:
             return httpx.Response(200, content=files[wanted])
         return httpx.Response(404, json={"detail": "Not found"})
@@ -365,22 +380,38 @@ class FakeModels:
     """The simulated user and judge models.
 
     ``user_replies`` maps a word in the opening message to the replies the
-    simulated user gives in order; the judge passes every criterion when the
-    messages it gets contain ``DONE`` and not ``judge_fails_on``.
+    simulated user gives in order, each a JSON object, a text sent as is,
+    None for a reply without text, or an exception the call raises. Past
+    those, the simulated user is done when the assistant's last message
+    contains ``DONE``, and asks it to go on otherwise. The judge passes every
+    criterion when the messages it gets contain ``DONE`` and not
+    ``judge_fails_on``; with ``judge_without_verdict`` its verdict call
+    answers in text, without the finish_test call; the answer-quality call
+    raises ``quality_error`` and the verdict call ``verdict_error`` when given.
     """
 
     def __init__(
         self,
         user_replies: dict[str, list[dict]] | None = None,
         judge_fails_on: str | None = None,
+        judge_without_verdict: bool = False,
+        quality_error: Exception | None = None,
+        verdict_error: Exception | None = None,
     ):
         self.user_replies = {k: list(v) for k, v in (user_replies or {}).items()}
         self.judge_fails_on = judge_fails_on
+        self.judge_without_verdict = judge_without_verdict
+        self.quality_error = quality_error
+        self.verdict_error = verdict_error
         self.calls: list[tuple[str, str | None, dict]] = []
 
     def verdict_calls(self) -> list[dict]:
         """The kwargs of each judge call that delivered a verdict."""
         return [c[2] for c in self.calls if c[0] == "judge" and c[2].get("tools")]
+
+    def user_calls(self) -> list[dict]:
+        """The kwargs of each simulated-user call."""
+        return [c[2] for c in self.calls if c[0] == "simulated-user"]
 
     def __call__(self, role: str, session_id: str | None, **kwargs):
         self.calls.append((role, session_id, kwargs))
@@ -389,20 +420,32 @@ class FakeModels:
             system = messages[0]["content"]
             for word, replies in self.user_replies.items():
                 if word in system and replies:
-                    return _response(json.dumps(replies.pop(0)))
+                    reply = replies.pop(0)
+                    if isinstance(reply, Exception):
+                        raise reply
+                    if reply is None:
+                        return _response(None)
+                    return _response(reply if isinstance(reply, str) else json.dumps(reply))
+            last_reply = messages[1]["content"].rsplit("Assistant:", 1)[-1]
+            done = "DONE" in last_reply
             return _response(
                 json.dumps(
                     {
-                        "classification": "progress",
+                        "classification": "answer" if done else "progress",
                         "revealed_hidden_step": False,
+                        "done": done,
                         "give_up": False,
                         "give_up_reason": "",
-                        "message": "please continue",
+                        "message": "" if done else "please continue",
                     }
                 )
             )
         assert role == "judge"
         tools = kwargs.get("tools")
+        if tools and self.verdict_error:
+            raise self.verdict_error
+        if tools and self.judge_without_verdict:
+            return _response("I think it looks fine.")
         if tools:
             finish = next(t for t in tools if t["function"]["name"] == "finish_test")
             keys = finish["function"]["parameters"]["properties"]["criteria"]["properties"]
@@ -422,11 +465,14 @@ class FakeModels:
                     ),
                 }
             )
+        if self.quality_error:
+            raise self.quality_error
         return _response(json.dumps({"score": 4, "reasoning": "clear answer"}))
 
 
 def app_observations(chat_id: str, turns: int) -> list[dict]:
-    """One app trace per turn: a cached call, a cache-missing call and a tool run."""
+    """One app trace per turn: a cached call, a cache-missing call and a tool run,
+    which fails at level ERROR on turn 0 and with ``ok`` false on turn 1."""
     observations = []
     for turn in range(turns):
         trace = f"{chat_id}-trace-{turn}"
@@ -475,6 +521,8 @@ def app_observations(chat_id: str, turns: int) -> list[dict]:
                 "type": "TOOL",
                 "name": "tool:plot",
                 "level": "ERROR" if turn == 0 else "DEFAULT",
+                # The app records a failed skill run at DEFAULT with "ok": false.
+                "ok": False if turn == 1 else None,
                 "usage_details": {},
                 "cost_details": {},
                 "total_cost": None,
@@ -545,7 +593,8 @@ class FakeGateway:
         self.app_costs: list[tuple[float, list[str]]] = []
         self.flushed = False
         self.observation_requests: list[tuple[str, int]] = []
-        # Replace to change what the app's traces hold, or to raise.
+        # Replace to change what the app's traces hold, or to raise. It returns
+        # (observations, complete), or with the last read error as a third item.
         self.observations = lambda chat_id, turns: (app_observations(chat_id, turns), True)
         self.dataset_error: Exception | None = None
         self.dataset_metadata: object = None
@@ -578,7 +627,8 @@ class FakeGateway:
 
     async def chat_observations(self, chat_id: str, turns: int):
         self.observation_requests.append((chat_id, turns))
-        return self.observations(chat_id, turns)
+        observations, complete, *read_error = self.observations(chat_id, turns)
+        return TraceRead(observations, complete, read_error=read_error[0] if read_error else None)
 
     def link_item_to_chat(self, chat_id: str) -> None:
         self.linked.append(chat_id)

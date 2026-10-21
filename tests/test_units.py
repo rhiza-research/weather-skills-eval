@@ -6,7 +6,8 @@ from weather_skills_eval.checks import presented_paths
 from weather_skills_eval.config import ConfigError, pack_name, parse_config
 from weather_skills_eval.scoring import split_usage, trace_metrics
 from weather_skills_eval.settings import SettingsError, load_settings
-from weather_skills_eval.tasks import TaskError, parse_task
+from weather_skills_eval.simulated_user import SYSTEM_PROMPT
+from weather_skills_eval.tasks import TaskError, parse_task, parse_tasks
 
 BASE_ENV = {
     "WEBUI_SECRET_KEY": "${S}",
@@ -189,6 +190,40 @@ def test_task_rejects_pause_past_turn_limit():
         )
 
 
+def test_task_turn_limit_is_optional():
+    metadata = {"facts": "K", "pauses": [{"before_turn": 9, "seconds": 1}]}
+    task = parse_task(item(metadata=metadata))
+    assert task.metadata.turn_limit is None
+    assert task.max_turns(20) == 20
+    assert parse_task(item()).max_turns(20) == 3
+    # Without turn_limit, pauses are checked against EVAL_MAX_TURNS when the run starts.
+    assert parse_tasks([item(metadata=metadata)], max_turns=9)
+    with pytest.raises(TaskError, match="i1: metadata.pauses: pause before turn 9 is past"):
+        parse_tasks([item(metadata=metadata)], max_turns=8)
+    # With it, against turn_limit only.
+    limited = {**metadata, "turn_limit": 10}
+    assert parse_tasks([item(metadata=limited)], max_turns=2)
+
+
+def test_simulated_user_prompt_holds_the_done_give_up_and_correction_rules():
+    for rule in (
+        "You are done when the assistant has presented everything you asked for, as you asked.",
+        "Give up only when the assistant says it cannot do what you asked",
+        "Compare what you received, the answer's text and any files, with what you asked for",
+        "say so plainly and ask for the fix",
+        '"done": true when the assistant has presented everything you asked for',
+    ):
+        assert rule in SYSTEM_PROMPT.replace("\n", " ")
+    assert "rovenance" not in SYSTEM_PROMPT
+
+
+def test_max_turns_defaults_to_20():
+    assert load_settings(settings_env()).max_turns == 20
+    assert load_settings(settings_env(EVAL_MAX_TURNS="50")).max_turns == 50
+    with pytest.raises(SettingsError, match="EVAL_MAX_TURNS"):
+        load_settings(settings_env(EVAL_MAX_TURNS="0"))
+
+
 def test_task_deliverables_are_image_or_zarr():
     task = parse_task(item(expected_output={"deliverables": ["image", "zarr"]}))
     assert task.expected.deliverables == ["image", "zarr"]
@@ -344,6 +379,31 @@ def test_trace_metrics_counts_failed_model_calls_and_missing_cost():
     assert metrics.model_calls == 2
     assert metrics.calls_without_cost == 1
     assert metrics.tool_calls == 1 and metrics.tool_failures == 0
+
+
+def test_tool_with_ok_false_output_is_a_failure():
+    metrics = trace_metrics(
+        [
+            {"trace_id": "t", "type": "TOOL", "level": "DEFAULT", "ok": False},
+            {"trace_id": "t", "type": "TOOL", "level": "DEFAULT", "ok": True},
+            # Output not a JSON object: not counted unless at level ERROR.
+            {"trace_id": "t", "type": "TOOL", "level": "DEFAULT", "ok": None},
+            {"trace_id": "t", "type": "TOOL", "level": "ERROR", "ok": None},
+        ]
+    )
+    assert metrics.tool_calls == 4
+    assert metrics.tool_failures == 2
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", "many"])
+def test_model_max_tokens_must_be_a_whole_number_of_at_least_1(value):
+    with pytest.raises(SettingsError, match="EVAL_MODEL_MAX_TOKENS"):
+        load_settings(settings_env(EVAL_MODEL_MAX_TOKENS=value))
+
+
+def test_model_max_tokens_defaults_to_8192():
+    assert load_settings(settings_env()).model_max_tokens == 8192
+    assert load_settings(settings_env(EVAL_MODEL_MAX_TOKENS="1024")).model_max_tokens == 1024
 
 
 def test_highest_skill_versions_compares_numerically():

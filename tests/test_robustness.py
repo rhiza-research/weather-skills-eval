@@ -2,25 +2,33 @@ import asyncio
 import io
 import json
 import types
+import uuid
 from pathlib import Path
 
 import docker.errors
 import httpx
 import litellm
 import pytest
-from fakes import FakeContainer
+import scenario
+from fakes import FakeContainer, FakeModels
+from langfuse import Langfuse
 from langfuse.api.core.api_error import ApiError as LangfuseApiError
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from scenario import AgentAdapter, AgentInput, AgentRole, ScenarioResult
 
 from weather_skills_eval import cli
 from weather_skills_eval import instance as instance_module
 from weather_skills_eval.app_client import AppClient, ChatError
-from weather_skills_eval.checks import collect_evidence
+from weather_skills_eval.checks import Evidence, collect_evidence
 from weather_skills_eval.config import ConfigError, load_config, parse_config
 from weather_skills_eval.instance import AppInstance, AppStartError, repository_of
-from weather_skills_eval.judge import rate_answer
+from weather_skills_eval.judge import GoalJudge, rate_answer
+from weather_skills_eval.langfuse_gateway import LangfuseGateway
 from weather_skills_eval.play import neutral_transcript
 from weather_skills_eval.runner import DatasetError, base_model
 from weather_skills_eval.settings import SettingsError, load_settings
+from weather_skills_eval.simulated_user import SimulatedUser
 from weather_skills_eval.tasks import TaskError, parse_task
 
 REPO = Path(__file__).resolve().parent.parent
@@ -258,6 +266,51 @@ def test_artifact_listing_error_is_reported():
     assert evidence.files == []
 
 
+def test_a_failed_extra_listing_falls_back_to_the_earlier_listing():
+    listings = []
+    entry = {
+        "path": "maps/rain.png",
+        "kind": "image",
+        "provenance_detail": {"branches": [{"label": None, "steps": [], "crumbs": []}]},
+    }
+
+    def handler(request):
+        if request.url.path.endswith("/artifacts"):
+            listings.append(request)
+            if len(listings) == 1:
+                return httpx.Response(200, json=[entry])
+            return httpx.Response(500, json={"detail": "busy"})
+        return httpx.Response(200, content=b"png")
+
+    waits = []
+
+    async def wait():
+        waits.append(1)
+
+    evidence = asyncio.run(
+        collect_evidence(
+            client(handler),
+            "c1",
+            ["maps/rain.png", "maps/gone.png"],
+            ["image"],
+            retries=1,
+            wait=wait,
+        )
+    )
+
+    # The lagging path is reported from the first listing; the other file keeps
+    # its provenance and image.
+    assert evidence.problem.startswith(
+        "Presented files are not in the chat's files: ['maps/gone.png']; "
+        "the listing read again failed: "
+    )
+    assert "500" in evidence.problem
+    assert evidence.files[0].provenance == entry["provenance_detail"]
+    assert evidence.files[0].image == b"png"
+    assert len(listings) == 2
+    assert waits == [1]
+
+
 def test_presented_file_missing_from_the_listing_is_named():
     entries = [{"path": None, "kind": "image"}, {"kind": "image"}, "junk"]
     app = client(lambda request: httpx.Response(200, json=entries))
@@ -344,6 +397,173 @@ def test_quality_transcript_uses_neutral_labels():
     assert "You:" not in prompts[0]
 
 
+class DoneAssistant(AgentAdapter):
+    role = AgentRole.AGENT
+
+    async def call(self, input):
+        return "DONE: 20 mm next week"
+
+
+class OneQuestionUser(AgentAdapter):
+    role = AgentRole.USER
+
+    def __init__(self):
+        self.calls = 0
+
+    async def call(self, input):
+        self.calls += 1
+        if self.calls == 1:
+            return "rain next week?"
+        return ScenarioResult(success=True, messages=list(input.messages), reasoning="done")
+
+
+def test_final_judge_and_quality_rating_send_8192_output_tokens(monkeypatch):
+    sent = []
+    models = FakeModels()
+
+    def completion(**kwargs):
+        sent.append(kwargs)
+        return models("judge", None, **kwargs)
+
+    monkeypatch.setattr(litellm, "completion", completion)
+    gateway = LangfuseGateway(
+        environment="eval",
+        trace_timeout=2,
+        trace_settle=1,
+        poll_interval=1,
+        model_max_tokens=load_settings(settings_env()).model_max_tokens,
+        client=Langfuse(
+            public_key=f"pk-test-{uuid.uuid4()}",
+            secret_key="sk-test",
+            base_url="http://langfuse.invalid",
+            span_exporter=InMemorySpanExporter(),
+            tracer_provider=TracerProvider(),
+        ),
+    )
+    judge = GoalJudge(
+        criteria=["The assistant gives the rain total"],
+        deliverables=[],
+        model="m",
+        complete=gateway.traced_completion,
+        session_id=lambda: "c1",
+        collect_evidence=lambda: None,
+    )
+    states = []
+
+    async def play_then_judge():
+        await scenario.arun(
+            name="t",
+            description="d",
+            agents=[DoneAssistant(), OneQuestionUser()],
+            script=[scenario.proceed(on_turn=states.append)],
+            max_turns=3,
+            verbose=False,
+        )
+        return await judge.rule(states[-1], at_turn_cap=False)
+
+    assert asyncio.run(play_then_judge()) is True
+    rate_answer(
+        complete=gateway.traced_completion,
+        model="m",
+        session_id="c1",
+        opening="o",
+        criteria=[],
+        transcript="t",
+    )
+    assert [call["max_tokens"] for call in sent] == [8192, 8192]
+    assert sent[0]["tools"] and "tools" not in sent[1]
+
+
+def test_simulated_user_call_sends_8192_output_tokens(monkeypatch):
+    sent = []
+
+    def completion(**kwargs):
+        sent.append(kwargs)
+        reply = {
+            "classification": "progress",
+            "revealed_hidden_step": False,
+            "done": False,
+            "give_up": False,
+            "give_up_reason": "",
+            "message": "go on",
+        }
+        return litellm.ModelResponse(
+            choices=[{"message": {"role": "assistant", "content": json.dumps(reply)}}]
+        )
+
+    monkeypatch.setattr(litellm, "completion", completion)
+    gateway = LangfuseGateway(
+        environment="eval",
+        trace_timeout=2,
+        trace_settle=1,
+        poll_interval=1,
+        model_max_tokens=load_settings(settings_env()).model_max_tokens,
+        client=Langfuse(
+            public_key=f"pk-test-{uuid.uuid4()}",
+            secret_key="sk-test",
+            base_url="http://langfuse.invalid",
+            span_exporter=InMemorySpanExporter(),
+            tracer_provider=TracerProvider(),
+        ),
+    )
+
+    async def no_files():
+        return Evidence()
+
+    user = SimulatedUser(
+        task=parse_task(
+            {
+                "id": "i1",
+                "input": "rain next week?",
+                "expected_output": {"judge_criteria": ["c"]},
+                "metadata": {"facts": "Kenya"},
+            }
+        ),
+        model="m",
+        complete=gateway.traced_completion,
+        session_id=lambda: "c1",
+        collect_evidence=no_files,
+    )
+    messages = [
+        {"role": "user", "content": "rain next week?"},
+        {"role": "assistant", "content": "Which region?"},
+    ]
+    agent_input = AgentInput(thread_id="t", messages=messages, new_messages=[], scenario_state=None)
+
+    assert asyncio.run(user.call(agent_input)) == "rain next week?"
+    assert asyncio.run(user.call(agent_input)) == "go on"
+    assert [call["max_tokens"] for call in sent] == [8192]
+
+
+def test_final_judge_reads_the_run_that_arun_leaves_current():
+    judge = GoalJudge(
+        criteria=["The assistant gives the rain total"],
+        deliverables=[],
+        model="m",
+        complete=FakeModels(),
+        session_id=lambda: "c1",
+        collect_evidence=lambda: None,
+    )
+    states = []
+
+    async def play_then_judge():
+        await scenario.arun(
+            name="t",
+            description="d",
+            agents=[DoneAssistant(), OneQuestionUser()],
+            script=[scenario.proceed(on_turn=states.append)],
+            max_turns=3,
+            verbose=False,
+        )
+        return await judge.rule(states[-1], at_turn_cap=False)
+
+    assert asyncio.run(play_then_judge()) is True
+    assert judge.verdict == "verdict passed"
+    # Outside the context arun ran in, Scenario's judge finds no run.
+    with pytest.raises(LookupError):
+        asyncio.run(judge.rule(states[-1], at_turn_cap=False))
+
+
 # CLI
 
 
@@ -369,6 +589,16 @@ def test_cli_exit_codes_and_messages(monkeypatch, capsys, error, code, message):
     monkeypatch.setattr(cli, "run", failing_run)
     assert cli.main(["run", "configs/example.yaml"]) == code
     assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "name, value", [("EVAL_MAX_TURNS", "0"), ("EVAL_MODEL_MAX_TOKENS", "lots")]
+)
+def test_cli_with_a_bad_turn_cap_or_token_limit_exits_2(monkeypatch, capsys, name, value):
+    for key, setting in settings_env(**{name: value}).items():
+        monkeypatch.setenv(key, setting)
+    assert cli.main(["run", str(REPO / "configs" / "example.yaml")]) == 2
+    assert name in capsys.readouterr().err
 
 
 def test_cli_without_settings_exits_2(monkeypatch, capsys):

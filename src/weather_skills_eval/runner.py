@@ -169,7 +169,7 @@ def _run(
     dataset = _read_dataset(gateway, config.dataset)
     required_packs = _required_packs(dataset, config.dataset)
     _check_packs(required_packs, config, config.dataset)
-    tasks = parse_tasks(dataset.items)
+    tasks = parse_tasks(dataset.items, settings.max_turns)
     dataset_version = getattr(dataset, "version", None)
 
     with AppInstance(
@@ -208,6 +208,7 @@ def _run(
             "tool_ids": ",".join(tool_ids),
             "simulated_user_model": settings.simulated_user_model,
             "judge_model": settings.judge_model,
+            "max_turns": str(settings.max_turns),
             "harness_commit": settings.harness_commit or "unrecorded",
             "dataset": config.dataset,
             "dataset_version": dataset_version.isoformat() if dataset_version else "latest",
@@ -226,6 +227,7 @@ def _run(
                         tool_ids=tool_ids,
                         simulated_user_model=settings.simulated_user_model,
                         judge_model=settings.judge_model,
+                        max_turns=settings.max_turns,
                         complete=gateway.traced_completion,
                         chat_observations=gateway.chat_observations,
                         turn_timeout=settings.turn_timeout,
@@ -270,4 +272,5 @@ def _default_gateway(settings: Settings) -> LangfuseGateway:
         trace_settle=settings.trace_settle,
         poll_interval=settings.poll_interval,
         model_retries=settings.model_retries,
+        model_max_tokens=settings.model_max_tokens,
     )

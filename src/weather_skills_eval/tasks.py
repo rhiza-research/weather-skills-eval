@@ -5,11 +5,13 @@
   kinds of file the result must include (``image``, ``zarr``); when it is
   not empty, the files the assistant presents are the result, and each must
   carry provenance. ``judge_criteria`` are read by the judge. The goal is
-  reached when the judge passes every criterion.
+  reached when the simulated user is done and the judge passes every
+  criterion.
 - ``metadata``: what the simulated user knows and how the play runs:
   ``facts`` (the facts sheet the user answers from), ``hidden_steps`` (hints
   the user reveals only when the assistant is stuck), ``pauses`` (waits
-  before given turns), ``turn_limit`` and ``tags``.
+  before given turns), ``turn_limit`` (optional; overrides the harness's
+  ``EVAL_MAX_TURNS`` for the task) and ``tags``.
 """
 
 from typing import Literal
@@ -50,7 +52,7 @@ class TaskMetadata(_Strict):
     facts: str = Field(min_length=1)
     hidden_steps: list[str] = Field(default_factory=list)
     pauses: list[Pause] = Field(default_factory=list)
-    turn_limit: int = Field(ge=1)
+    turn_limit: int | None = Field(default=None, ge=1)
     tags: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -58,10 +60,15 @@ class TaskMetadata(_Strict):
         turns = [p.before_turn for p in self.pauses]
         if len(turns) != len(set(turns)):
             raise ValueError("pauses name the same turn twice")
-        for pause in self.pauses:
-            if pause.before_turn > self.turn_limit:
-                raise ValueError(f"pause before turn {pause.before_turn} is past the turn limit")
+        if self.turn_limit is not None:
+            _check_pauses(self.pauses, self.turn_limit, "the turn limit")
         return self
+
+
+def _check_pauses(pauses: list[Pause], turns: int, limit: str) -> None:
+    for pause in pauses:
+        if pause.before_turn > turns:
+            raise ValueError(f"pause before turn {pause.before_turn} is past {limit}")
 
 
 class Task(_Strict):
@@ -69,6 +76,10 @@ class Task(_Strict):
     opening_message: str = Field(min_length=1)
     expected: ExpectedOutput
     metadata: TaskMetadata
+
+    def max_turns(self, cap: int) -> int:
+        """The most user messages the play sends: ``turn_limit``, else ``cap``."""
+        return self.metadata.turn_limit or cap
 
     def pause_before(self, turn: int) -> float:
         for pause in self.metadata.pauses:
@@ -110,12 +121,19 @@ def _problems(field: str, exc: ValidationError) -> str:
     )
 
 
-def parse_tasks(items) -> dict[str, Task]:
-    """All tasks of a dataset, keyed by item id. Item ids must be unique."""
+def parse_tasks(items, max_turns: int) -> dict[str, Task]:
+    """All tasks of a dataset, keyed by item id. Item ids must be unique. The
+    pauses of a task without ``turn_limit`` must fit in ``max_turns``
+    (``EVAL_MAX_TURNS``)."""
     tasks: dict[str, Task] = {}
     for item in items:
         task = parse_task(item)
         if task.id in tasks:
             raise TaskError(f"dataset item {task.id}: the id appears more than once")
+        if task.metadata.turn_limit is None:
+            try:
+                _check_pauses(task.metadata.pauses, max_turns, "EVAL_MAX_TURNS")
+            except ValueError as exc:
+                raise TaskError(f"dataset item {task.id}: metadata.pauses: {exc}") from exc
         tasks[task.id] = task
     return tasks

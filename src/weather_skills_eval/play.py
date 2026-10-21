@@ -1,16 +1,21 @@
 """One play: one task played once through the app's chat API with LangWatch Scenario.
 
-Each Scenario turn is: the simulated user speaks, the app answers, the judge
-checks the goal. Scenario's ``max_turns`` is the task's turn limit, so a play
-that has not reached the goal by then ends as a failure. A pause scheduled
-before turn k runs at the start of that turn, before the user speaks; it is
-outside every app answer, so the time to answer does not include it.
+Each Scenario turn is: the simulated user speaks, the app answers. The play
+ends when the simulated user is done or gives up, or when the turn cap
+passes: the task's ``turn_limit``, else ``EVAL_MAX_TURNS``, given to Scenario
+as ``max_turns``. At the cap the simulated user reads the last reply once
+more, outside Scenario's run, so it can still be done or give up; nothing
+more is sent to the app. The judge then rules once on the final result. A pause scheduled before turn
+k runs at the start of that turn, before the user speaks; it is outside every
+app answer, so the time to answer does not include it.
 
-Outcomes: ``goal_reached``; ``turn_limit`` (the limit passed without the
-goal); ``user_gave_up``; ``chat_error`` (the app returned an error, or a
-reply the harness cannot read); ``error`` (anything else stopped the play,
-such as a harness model reply that cannot be used); ``not_reached`` (the
-play ended without the goal for none of these reasons).
+Outcomes: ``goal_reached`` (the user is done and the judge passed);
+``chat_error`` (the app returned an error, or a reply the harness cannot
+read); ``error`` (anything else stopped the play, such as a harness model
+reply that cannot be used); ``user_done`` (the user is done, and the judge
+failed or no result could be judged); ``user_gave_up``; ``turn_cap`` (the
+play sent as many user messages as the cap allows, and the user was neither
+done nor gave up); ``not_reached`` (the run ended for none of these reasons).
 """
 
 import asyncio
@@ -19,23 +24,26 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 import scenario
-from scenario import AgentAdapter, AgentInput, AgentRole
+from scenario import AgentAdapter, AgentInput, AgentRole, ScenarioResult
+from scenario.scenario_state import ScenarioState
 
 from .app_client import AppClient, Conversation, visible_text
-from .checks import collect_evidence, presented_paths
+from .checks import Evidence, collect_evidence, presented_paths
 from .judge import GoalJudge, rate_answer
 from .llm import Complete
-from .scoring import PlayFacts, Score, TraceMetrics, build_scores, trace_metrics
+from .scoring import PlayFacts, Score, TraceMetrics, TraceRead, build_scores, trace_metrics
 from .simulated_user import SimulatedUser
 from .tasks import Task
 
-ChatObservations = Callable[[str, int], Awaitable[tuple[list[dict], bool]]]
+ChatObservations = Callable[[str, int], Awaitable[TraceRead]]
 
 
 class AppAgent(AgentAdapter):
     """The agent under test: the app, reached over HTTP. Keeps the exchanges
     that got a reply, so the conversation survives a play that errors, and
-    the files presented by the latest reply that presents any."""
+    the files presented by the latest reply that presents any, the number of
+    replies that presented files, and every path presented during the play
+    with the turn that last presented it, in that order."""
 
     role = AgentRole.AGENT
     name = "weather-skills-chat"
@@ -44,6 +52,8 @@ class AppAgent(AgentAdapter):
         self._conversation = conversation
         self.exchanges: list[tuple[str, str]] = []
         self.presented: list[str] = []
+        self.presentations = 0
+        self.presented_on: dict[str, int] = {}
 
     async def call(self, input: AgentInput):
         text = input.last_new_user_message_str()
@@ -51,9 +61,24 @@ class AppAgent(AgentAdapter):
         presented = presented_paths(answer.content)
         if presented:
             self.presented = presented
+            self.presentations += 1
+            for path in presented:
+                # Moved to the end: the latest presentation of a path wins.
+                self.presented_on.pop(path, None)
+                self.presented_on[path] = len(self.exchanges) + 1
         reply = visible_text(answer.content) or "(the reply has no text)"
         self.exchanges.append((text, reply))
         return reply
+
+
+def last_reply_input(state: ScenarioState) -> AgentInput:
+    """The simulated user's input for reading the reply to the last allowed turn."""
+    return AgentInput(
+        thread_id=state.thread_id,
+        messages=list(state.messages),
+        new_messages=[],
+        scenario_state=state,
+    )
 
 
 def neutral_transcript(exchanges: list[tuple[str, str]]) -> str:
@@ -98,6 +123,8 @@ class PlayDeps:
     tool_ids: list[str]
     simulated_user_model: str
     judge_model: str
+    # EVAL_MAX_TURNS, for tasks without a turn_limit.
+    max_turns: int
     complete: Complete
     chat_observations: ChatObservations
     turn_timeout: float
@@ -121,29 +148,76 @@ async def play(task: Task, deps: PlayDeps) -> PlayResult:
         return conversation.chat_id
 
     agent = AppAgent(conversation)
+    max_turns = task.max_turns(deps.max_turns)
+
+    # The user's evidence, the latest presenting reply's files, as
+    # (presentations, evidence): collected again only after a reply presents
+    # files, so each presented image is downloaded once per presenting reply.
+    collected: tuple[int, Evidence] | None = None
+    # (presentations, images by path) downloaded for that presentation.
+    downloaded: tuple[int, dict[str, bytes]] = (0, {})
+
+    async def evidence() -> Evidence:
+        nonlocal collected, downloaded
+        if collected is not None and collected[0] == agent.presentations:
+            return collected[1]
+        if downloaded[0] != agent.presentations:
+            downloaded = (agent.presentations, {})
+        found = await collect_evidence(
+            deps.app,
+            conversation.chat_id,
+            agent.presented,
+            list(task.expected.deliverables),
+            known_images=downloaded[1],
+        )
+        downloaded[1].update({f.path: f.image for f in found.files if f.image is not None})
+        # Dropped when the listing or a download failed, or a path is not
+        # listed yet: the listing and the failed downloads are read again on
+        # the next turn, and the images already downloaded for this
+        # presentation are reused by path.
+        collected = None if found.read_failed or found.unlisted else (agent.presentations, found)
+        return found
+
     user = SimulatedUser(
         task=task,
         model=deps.simulated_user_model,
         complete=deps.complete,
         session_id=session_id,
+        collect_evidence=evidence,
     )
+
+    def every_presented_file() -> Awaitable[Evidence]:
+        return collect_evidence(
+            deps.app,
+            conversation.chat_id,
+            list(agent.presented_on),
+            list(task.expected.deliverables),
+            turns=dict(agent.presented_on),
+            blocking=list(agent.presented),
+            # A failed listing or download is tried once more, after the poll
+            # interval, before it counts.
+            retries=1,
+            wait=lambda: deps.sleep(deps.poll_interval),
+        )
+
     judge = GoalJudge(
         criteria=list(task.expected.judge_criteria),
         deliverables=list(task.expected.deliverables),
         model=deps.judge_model,
         complete=deps.complete,
         session_id=session_id,
-        collect_evidence=lambda: collect_evidence(
-            deps.app, conversation.chat_id, agent.presented, list(task.expected.deliverables)
-        ),
+        collect_evidence=every_presented_file,
     )
     paused = 0.0
+    # The run's state, which the judge rules on once the run has ended.
+    final_state = None
 
     async def before_turn(state) -> None:
-        nonlocal paused
+        nonlocal paused, final_state
+        final_state = state
         # Scenario counts turns from 0 and calls this after starting a new
-        # one, before checking the turn limit.
-        if state.current_turn >= task.metadata.turn_limit:
+        # one, before checking the turn cap.
+        if state.current_turn >= max_turns:
             return
         seconds = task.pause_before(state.current_turn + 1)
         if seconds:
@@ -151,6 +225,7 @@ async def play(task: Task, deps: PlayDeps) -> PlayResult:
             paused += seconds
 
     error: str | None = None
+    passed = False
     try:
         result = await scenario.arun(
             name=task.id,
@@ -158,29 +233,51 @@ async def play(task: Task, deps: PlayDeps) -> PlayResult:
                 f"A user asks a weather assistant: {task.opening_message}\n\n"
                 f"What the user knows:\n{task.metadata.facts}"
             ),
-            agents=[agent, user, judge],
+            agents=[agent, user],
             script=[scenario.proceed(on_turn=before_turn)],
-            max_turns=task.metadata.turn_limit,
+            max_turns=max_turns,
             verbose=False,
         )
-        goal_reached = bool(result.success)
         reasoning = result.reasoning or ""
     except Exception as exc:
-        goal_reached = False
         error = conversation.error or f"{type(exc).__name__}: {exc}"
         reasoning = error
+    reached_cap = conversation.turns >= max_turns
+    if error is None and final_state is not None and reached_cap and not user.ended:
+        try:
+            last = await user.read_last_reply(last_reply_input(final_state))
+            if isinstance(last, ScenarioResult):
+                reasoning = last.reasoning or ""
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            reasoning = error
+    at_turn_cap = reached_cap and not user.ended
+    if error is None and final_state is None:
+        error = "Scenario ended the run before any turn, so there is nothing to judge"
+        reasoning = error
+    if error is None:
+        try:
+            passed = await judge.rule(final_state, at_turn_cap=at_turn_cap)
+        except Exception as exc:
+            error = f"The final judge call failed: {type(exc).__name__}: {exc}"
+            reasoning = error
+    goal_reached = error is None and user.done and passed
     if goal_reached:
         outcome = "goal_reached"
+        reasoning = judge.verdict or ""
     elif error is not None:
         outcome = "chat_error" if conversation.error else "error"
+    elif user.done:
+        outcome = "user_done"
     elif user.gave_up:
         outcome = "user_gave_up"
-    elif conversation.turns >= task.metadata.turn_limit:
-        outcome = "turn_limit"
+    elif at_turn_cap:
+        outcome = "turn_cap"
     else:
         outcome = "not_reached"
-    if outcome in ("turn_limit", "user_gave_up", "not_reached") and judge.last_verdict:
-        reasoning = f"{reasoning} (last check: {judge.last_verdict})"
+    if outcome not in ("goal_reached", "chat_error", "error"):
+        result_word = "passed" if passed else "failed"
+        reasoning = f"{reasoning} (final check {result_word}: {judge.verdict})"
 
     quality: int | None = None
     quality_reasoning = ""
@@ -211,26 +308,28 @@ async def play(task: Task, deps: PlayDeps) -> PlayResult:
 
     metrics: TraceMetrics | None = None
     traces_complete = False
+    partial = ""
     problem: str | None = None
     if conversation.chat_id is None or conversation.turns_reached == 0:
         problem = "no turn reached the app"
     else:
         try:
-            observations, traces_complete = await deps.chat_observations(
-                conversation.chat_id, conversation.turns_reached
-            )
+            read = await deps.chat_observations(conversation.chat_id, conversation.turns_reached)
         except Exception as exc:
-            observations = []
             problem = f"Langfuse could not be read: {exc}"
-        if observations:
-            metrics = trace_metrics(observations)
-        elif problem is None:
-            problem = "no app traces arrived"
+        else:
+            traces_complete, partial = read.complete, read.partial_reason()
+            if read.observations:
+                metrics = trace_metrics(read.observations)
+            elif read.read_error:
+                problem = f"Langfuse could not be read: {read.read_error}"
+            else:
+                problem = "no app traces arrived"
 
     if metrics is None:
         trace_scores = f"missing: {problem}"
     else:
-        trace_scores = "complete" if traces_complete else "partial: traces were still arriving"
+        trace_scores = "complete" if traces_complete else f"partial: {partial}"
 
     return PlayResult(
         task_id=task.id,
@@ -239,7 +338,7 @@ async def play(task: Task, deps: PlayDeps) -> PlayResult:
         goal_reached=goal_reached,
         reasoning=reasoning,
         error=error,
-        scores=build_scores(facts, metrics, traces_complete, problem),
+        scores=build_scores(facts, metrics, traces_complete, problem, partial),
         trace_scores=trace_scores,
         app_trace_ids=metrics.trace_ids if metrics else [],
         provider_models=metrics.provider_models if metrics else [],

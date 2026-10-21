@@ -1,17 +1,20 @@
-"""The judge: after every assistant reply, Scenario's judge rules on the goal.
+"""The judge: once the play has ended, Scenario's judge rules on the final result.
 
-When the task expects files, the result is the files the assistant presents
-(see ``checks``). While no result can be judged (nothing presented, a kind
-missing, a file unreadable or without provenance), the play continues and
-no judge model is called. Otherwise the judge rules on the task's criteria
-plus ``PROVENANCE_CRITERION``, from the visible transcript and one message
-of harness evidence: each presented file's path, kind and provenance (the
-listing's ``provenance_detail``) as JSON, and each image. A task that expects no file is judged on the
-transcript and its criteria alone.
+When the task expects files, the result is every file the assistant
+presented during the play, one per path, at its latest presentation (see
+``checks``); the criteria decide which of them the user wanted at the end.
+A file of the last reply that presents files blocks the ruling when it has a
+problem; an earlier file's problem is a note next to it instead. When no
+result can be judged (nothing presented, a kind missing, or a last-reply
+file missing from the chat's listing, unreadable or without provenance), the
+verdict is that reason and no judge model is called. Otherwise the judge
+rules on the task's criteria plus ``PROVENANCE_CRITERION``, from the visible
+transcript and one message of harness evidence: each presented file's path,
+kind, the turn that presented it and provenance (the listing's
+``provenance_detail``) as JSON, and each image. A task that expects no file
+is judged on the transcript and its criteria alone.
 
-A passing verdict ends the play as a success; a failing one lets the play
-continue, so the goal can still be reached on a later turn. Plays that never
-reach the goal end at the turn limit or when the simulated user gives up.
+The judge never ends a play: the simulated user or the turn cap does.
 """
 
 import base64
@@ -19,9 +22,10 @@ import json
 from collections.abc import Awaitable, Callable
 
 from scenario import AgentInput, JudgeAgent, JudgmentRequest, ScenarioResult
+from scenario.scenario_state import ScenarioState
 
 from .checks import Evidence
-from .llm import JUDGE, Complete, reply_json
+from .llm import JUDGE, Complete, ModelReplyError, reply_json
 
 PROVENANCE_CRITERION = (
     "Each presented file's provenance (data source, region, period, aggregation, units) "
@@ -29,23 +33,29 @@ PROVENANCE_CRITERION = (
 )
 
 EVIDENCE_HEADER = (
-    "Harness evidence, not part of the conversation: the files the assistant presented "
-    "as its result, each with the weather_skills_history provenance the app read from it: "
-    "per branch, the skills that produced it in order, with their arguments."
+    "Harness evidence, not part of the conversation: every file the assistant presented "
+    "during the conversation, in order, each once at the latest turn that presented it, "
+    "with the weather_skills_history provenance the app read from it: per branch, the "
+    "skills that produced it in order, with their arguments."
 )
 
 
 def evidence_message(evidence: Evidence) -> dict:
+    """The judge's evidence; it is built only for evidence without a problem.
+    A file presented before the last reply that presents files may carry a
+    note of its own problem."""
     parts: list[dict] = [{"type": "text", "text": EVIDENCE_HEADER}]
     for file in evidence.files:
-        provenance = json.dumps(file.provenance, indent=2, sort_keys=True)
-        parts.append(
-            {
-                "type": "text",
-                "text": f"File: {file.path} ({file.kind})\nProvenance:\n{provenance}",
-            }
-        )
-        if file.image is not None:
+        text = f"File: {file.path} ({file.kind}), presented on turn {file.turn}"
+        if file.kind == "image" and not file.shown_as_image:
+            text += " (not shown as an image)"
+        if file.note:
+            text += f"\nNote: {file.note}"
+        if file.provenance is not None:
+            provenance = json.dumps(file.provenance, indent=2, sort_keys=True)
+            text += f"\nProvenance:\n{provenance}"
+        parts.append({"type": "text", "text": text})
+        if file.image is not None and file.shown_as_image:
             encoded = base64.b64encode(file.image).decode("ascii")
             parts.append(
                 {
@@ -75,7 +85,7 @@ class GoalJudge(JudgeAgent):
         self._session_id = session_id
         self._collect_evidence = collect_evidence
         self._evidence: Evidence | None = None
-        self.last_verdict: str | None = None
+        self.verdict: str | None = None
 
     def _completion(self, **kwargs):
         if self._evidence is not None:
@@ -85,26 +95,47 @@ class GoalJudge(JudgeAgent):
             kwargs["messages"] = messages
         return self._complete_fn(JUDGE, self._session_id(), **kwargs)
 
-    async def call(self, input: AgentInput):
+    async def rule(self, state: ScenarioState, *, at_turn_cap: bool) -> bool:
+        """The verdict on the play's final result; its reasoning is ``verdict``.
+
+        Called after ``scenario.arun`` returns, in the same context: Scenario's
+        judge reads the run it left current there. Raises ``ModelReplyError``
+        when the judge returns no verdict.
+
+        Scenario's judge tells the model the conversation reached the turn cap
+        whenever the last turn was the cap's; unless the play ended at the
+        turn cap, it gets a state whose ``max_turns`` is past the last turn.
+        """
+        # Verified against langwatch-scenario 1.6.0: JudgeAgent.call reads
+        # scenario_state.config.max_turns and current_turn, and its cache reads
+        # the run arun leaves current.
+        if not at_turn_cap:
+            config = state.config.model_copy(update={"max_turns": state.current_turn + 2})
+            state = state.model_copy(update={"config": config})
         criteria = list(self.criteria)
         evidence = None
         if self._deliverables:
             evidence = await self._collect_evidence()
             if evidence.problem:
-                self.last_verdict = evidence.problem
-                return []
+                self.verdict = evidence.problem
+                return False
             criteria.append(PROVENANCE_CRITERION)
-        forced = input.model_copy(update={"judgment_request": JudgmentRequest(criteria=criteria)})
+        request = AgentInput(
+            thread_id=state.thread_id,
+            messages=list(state.messages),
+            new_messages=[],
+            judgment_request=JudgmentRequest(criteria=criteria),
+            scenario_state=state,
+        )
         self._evidence = evidence
         try:
-            verdict = await super().call(forced)
+            result = await self.call(request)
         finally:
             self._evidence = None
-        if isinstance(verdict, ScenarioResult):
-            self.last_verdict = verdict.reasoning
-            if verdict.success:
-                return verdict
-        return []
+        if not isinstance(result, ScenarioResult):
+            raise ModelReplyError(f"The judge returned no verdict: {result!r}")
+        self.verdict = result.reasoning or ("passed" if result.success else "no reasoning given")
+        return bool(result.success)
 
 
 QUALITY_PROMPT = """You rate how well a weather assistant answered a user, from 1 to 5.

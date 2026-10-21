@@ -76,7 +76,7 @@ def _cost(obs: dict) -> float | None:
 
 def trace_metrics(observations: list[dict]) -> TraceMetrics:
     """Observations are dicts with type, name, level, model, usage_details,
-    cost_details, total_cost and metadata."""
+    cost_details, total_cost and metadata; a TOOL observation also has ``ok``."""
     metrics = TraceMetrics()
     metrics.trace_ids = sorted({o["trace_id"] for o in observations if o.get("trace_id")})
     metrics.provider_models = sorted(
@@ -105,9 +105,35 @@ def trace_metrics(observations: list[dict]) -> TraceMetrics:
             metrics.model_calls += 1
         elif kind == "TOOL":
             metrics.tool_calls += 1
-            if level == "ERROR":
+            # The app records a failed skill run at DEFAULT, with "ok": false in its output.
+            if level == "ERROR" or obs.get("ok") is False:
                 metrics.tool_failures += 1
     return metrics
+
+
+@dataclass
+class TraceRead:
+    """The app's observations of a chat as read from Langfuse. When not
+    ``complete``, ``read_error`` is the last read's error when it failed, and
+    ``unread_tools`` the tool observations whose output was not read."""
+
+    observations: list[dict]
+    complete: bool
+    read_error: str | None = None
+    unread_tools: int = 0
+    # At the timeout: traces were missing or still changing.
+    traces_arriving: bool = False
+    # Returned by the read of tools left open, before the timeout.
+    forced: bool = False
+
+    def partial_reason(self) -> str:
+        if self.read_error:
+            return f"Langfuse reads failed: {self.read_error}"
+        if self.forced:
+            return f"the outputs of tools left open could not be read: {self.unread_tools}"
+        if self.traces_arriving or not self.unread_tools:
+            return "traces were still arriving"
+        return f"tool outputs not read by the timeout: {self.unread_tools}"
 
 
 @dataclass
@@ -134,10 +160,12 @@ def build_scores(
     metrics: TraceMetrics | None,
     traces_complete: bool,
     trace_problem: str | None = None,
+    partial_reason: str = "traces were still arriving",
 ) -> list[Score]:
     """The play's scores. Without ``metrics`` the trace-based scores are left
-    out and the goal_reached comment says why (``trace_problem``)."""
-    scope = "up to the goal" if facts.goal_reached else f"over the whole play ({facts.outcome})"
+    out and the goal_reached comment says why (``trace_problem``); with
+    incomplete traces, their comments give ``partial_reason``."""
+    scope = f"over the whole play ({facts.outcome})"
     goal_comment = facts.outcome
     if metrics is None:
         goal_comment = f"{facts.outcome}; trace scores missing: {trace_problem or 'no app traces'}"
@@ -156,7 +184,7 @@ def build_scores(
         scores.append(Score("answer_quality", facts.answer_quality, facts.answer_quality_reasoning))
     if metrics is None:
         return scores
-    note = scope if traces_complete else f"{scope}; traces were still arriving when read"
+    note = scope if traces_complete else f"{scope}; {partial_reason}"
     cost_note = note
     if metrics.calls_without_cost:
         cost_note = f"{note}; {metrics.calls_without_cost} model calls carried no cost"
