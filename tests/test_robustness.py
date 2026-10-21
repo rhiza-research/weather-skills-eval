@@ -12,7 +12,7 @@ import httpx
 import litellm
 import pytest
 import scenario
-from fakes import FakeContainer, FakeModels
+from fakes import FakeContainer, FakeModels, FakeRunApi
 from langfuse import Langfuse
 from langfuse.api.core.api_error import ApiError as LangfuseApiError
 from opentelemetry.sdk.trace import TracerProvider
@@ -26,7 +26,7 @@ from weather_skills_eval.checks import Evidence, collect_evidence
 from weather_skills_eval.config import ConfigError, load_config, parse_config
 from weather_skills_eval.instance import AppInstance, AppStartError, repository_of
 from weather_skills_eval.judge import GoalJudge, rate_answer
-from weather_skills_eval.langfuse_gateway import LangfuseGateway
+from weather_skills_eval.langfuse_gateway import LangfuseGateway, LangfuseRuns
 from weather_skills_eval.play import neutral_transcript
 from weather_skills_eval.runner import DatasetError, base_model
 from weather_skills_eval.settings import SettingsError, load_settings
@@ -695,6 +695,104 @@ def test_cli_passes_dash_through_to_read_stdin(monkeypatch):
     monkeypatch.setattr(cli, "run", recording_run)
     cli.main(["run", "-"])
     assert str(seen[0]) == "-"
+
+
+def run_api(**options) -> FakeRunApi:
+    """Experiment e1 (cfg): one item with a chat, one without."""
+    defaults = {
+        "experiments": {"e1": "cfg", "e2": "empty"},
+        "items": {"e1": [("item-1", {"chat_id": "chat-1"}), ("item-2", {"chat_id": None})]},
+        "sessions": {"chat-1": ["item-1", "app-a", "user-1", "judge-1"]},
+    }
+    defaults.update(options)
+    return FakeRunApi(**defaults)
+
+
+PROMPT = "Type yes to delete these traces: "
+
+
+def delete_with(api: FakeRunApi, *args: str) -> int:
+    return cli.main(["delete", *args], runs_factory=lambda: LangfuseRuns(client=api))
+
+
+def answer(monkeypatch, text: str) -> None:
+    monkeypatch.setattr("sys.stdin", io.StringIO(text))
+
+
+def test_cli_delete_deletes_every_trace_of_the_run_on_yes(monkeypatch, capsys):
+    # Only the Langfuse settings are needed, not the run's.
+    for name in ("OPENROUTER_API_KEY", "EVAL_SIMULATED_USER_MODEL", "EVAL_JUDGE_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+    answer(monkeypatch, "yes\n")
+    api = run_api()
+
+    assert delete_with(api, "e1") == 0
+
+    assert api.deleted == ["app-a", "item-1", "item-2", "judge-1", "user-1"]
+    assert capsys.readouterr().out == (
+        f"Experiment cfg: 2 items, 5 traces\n{PROMPT}Deleted experiment cfg: 2 items, 5 traces\n"
+    )
+
+
+def test_cli_delete_with_yes_flag_deletes_without_asking(monkeypatch, capsys):
+    # Nothing is read from stdin.
+    monkeypatch.setattr("sys.stdin", None)
+    api = run_api()
+
+    assert delete_with(api, "--yes", "e1") == 0
+
+    assert api.deleted == ["app-a", "item-1", "item-2", "judge-1", "user-1"]
+    assert capsys.readouterr().out == (
+        "Experiment cfg: 2 items, 5 traces\nDeleted experiment cfg: 2 items, 5 traces\n"
+    )
+
+
+@pytest.mark.parametrize("text", ["no\n", "y\n", "YES\n", "\n", ""], ids=repr)
+def test_cli_delete_without_yes_deletes_nothing(monkeypatch, capsys, text):
+    answer(monkeypatch, text)
+    api = run_api()
+
+    assert delete_with(api, "e1") == 0
+
+    assert "trace.delete_multiple" not in api.methods()
+    assert capsys.readouterr().out == (
+        f"Experiment cfg: 2 items, 5 traces\n{PROMPT}Nothing deleted\n"
+    )
+
+
+def test_cli_delete_of_an_unknown_id_exits_2(capsys):
+    api = run_api()
+
+    assert delete_with(api, "missing") == 2
+
+    assert "trace.delete_multiple" not in api.methods()
+    assert "no experiment has id missing" in capsys.readouterr().err
+
+
+def test_cli_delete_of_an_experiment_without_items_exits_0(capsys):
+    api = run_api()
+
+    assert delete_with(api, "e2") == 0
+
+    assert "trace.delete_multiple" not in api.methods()
+    assert capsys.readouterr().out == "Experiment empty has no items; nothing to delete\n"
+
+
+def test_cli_delete_with_a_langfuse_error_exits_5(capsys):
+    api = run_api(error=LangfuseApiError(status_code=503, body="unavailable"))
+
+    assert delete_with(api, "--yes", "e1") == 5
+
+    assert api.deleted == []
+    assert "Delete stopped, Langfuse returned an error" in capsys.readouterr().err
+
+
+def test_cli_delete_with_any_other_error_exits_1(capsys):
+    def broken():
+        raise RuntimeError("unexpected")
+
+    assert cli.main(["delete", "e1"], runs_factory=broken) == 1
+    assert "Delete failed: RuntimeError: unexpected" in capsys.readouterr().err
 
 
 def test_load_config_from_stdin_and_from_a_path(tmp_path):

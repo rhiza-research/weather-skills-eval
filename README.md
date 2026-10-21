@@ -33,6 +33,26 @@ docker compose run --rm -T eval run - < configs/<name>.yaml
 | 5 | Langfuse returned an error |
 | 143 | The harness was stopped with SIGTERM; the app container was removed |
 
+### Deleting a run
+
+```sh
+docker compose run --rm -it eval delete <experiment-id>
+docker compose run --rm eval delete --yes <experiment-id>
+```
+
+The experiment id is the `baseline=` value in the experiment's Langfuse URL. Langfuse has no call that deletes an experiment; the experiment goes away once its traces are deleted. `delete` lists the experiment's items and finds each item's trace plus every trace in the session whose id is the item output's `chat_id`: the app's `weather-skills-chat` traces, the `simulated-user` and `judge` traces, and the item trace. An item without a chat id has only its own trace. No other trace is deleted.
+
+It prints the experiment name, item count and trace count, then asks for `yes` on stdin, which needs `-it`. It deletes only on `yes`; any other answer, or end of input, deletes nothing. `--yes` skips the question and deletes after printing the counts, so it works without `-it`. After deleting, it prints the experiment name and the number of items and traces it deleted.
+
+It needs only `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` and `LANGFUSE_BASE_URL`, read by the Langfuse SDK, not the run's settings.
+
+| Code | Meaning |
+|-|-|
+| 0 | The traces were deleted, the experiment has no items (nothing to delete), or the answer was not `yes` (nothing deleted) |
+| 1 | The delete failed for any other reason |
+| 2 | No experiment has that id; nothing was deleted |
+| 5 | Langfuse returned an error |
+
 ## Configuration file
 
 `configs/example.yaml` is a complete example. Its keys:

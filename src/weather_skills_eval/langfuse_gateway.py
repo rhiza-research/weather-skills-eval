@@ -15,12 +15,18 @@ reads the app's traces from the project its own keys belong to.
 - The app's traces: one per chat turn, named ``weather-skills-chat``, with
   session id = the chat id. They are read back through the observations API
   once they stop changing.
+- Deleting a run (``LangfuseRuns``): Langfuse has no call that deletes an
+  experiment; it goes away once its traces are deleted. A run's traces are
+  each item's trace plus every trace in the session of the item output's
+  ``chat_id``.
 """
 
 import asyncio
 import json
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import httpx
 import litellm
@@ -40,10 +46,51 @@ PAGE_SIZE = 1000
 TOOL_OUTPUT_PAGE_SIZE = 100
 SESSION_ATTRIBUTE = "session.id"
 APP_COST_ROLLUP = "app-cost-rollup"
+EXPERIMENT_ITEM_FIELDS = "core,io"
+# The experiments API's maximum page size.
+EXPERIMENT_PAGE_SIZE = 100
+# The experiments API needs a lower bound on start time; the epoch finds an
+# experiment of any age.
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 class TraceReadError(Exception):
     """The app's traces could not be read from Langfuse."""
+
+
+class ExperimentNotFound(Exception):
+    """No experiment has the given id."""
+
+
+@dataclass
+class RunTraces:
+    experiment_name: str
+    items: int
+    trace_ids: list[str]
+
+
+def _all_pages(read: Callable[[str | None], object]) -> list:
+    """Every page's data; ``read`` takes the cursor. Stops on an empty or
+    repeated cursor."""
+    data, cursor, seen = [], None, set()
+    while True:
+        page = read(cursor)
+        data.extend(page.data)
+        cursor = page.meta.cursor
+        if not cursor or cursor in seen:
+            return data
+        seen.add(cursor)
+
+
+def _chat_id(output) -> str | None:
+    """The ``chat_id`` of an experiment item's output; None when there is none."""
+    if isinstance(output, str):
+        try:
+            output = json.loads(output)
+        except ValueError:
+            return None
+    chat_id = output.get("chat_id") if isinstance(output, dict) else None
+    return chat_id if isinstance(chat_id, str) and chat_id else None
 
 
 def _transient(exc: Exception) -> bool:
@@ -244,19 +291,14 @@ class LangfuseGateway:
     def _pages(
         self, fields: str = OBSERVATION_FIELDS, page_size: int = PAGE_SIZE, **filters
     ) -> list:
-        observations, cursor, seen = [], None, set()
-        while True:
-            page = self.client.api.observations.get_many(
+        return _all_pages(
+            lambda cursor: self.client.api.observations.get_many(
                 fields=fields,
                 limit=page_size,
                 cursor=cursor,
                 **filters,
             )
-            observations.extend(page.data)
-            cursor = page.meta.cursor
-            if not cursor or cursor in seen:
-                return observations
-            seen.add(cursor)
+        )
 
     def _app_observations(
         self, chat_id: str, tool_outputs: dict[str, object], force: set[str] | None = None
@@ -400,3 +442,48 @@ class LangfuseGateway:
 
     def flush(self) -> None:
         self.client.flush()
+
+
+class LangfuseRuns:
+    """Finds a run's traces and deletes them. Needs only the Langfuse
+    settings the SDK reads, not the run's."""
+
+    def __init__(self, client: Langfuse | None = None):
+        self.client = client or Langfuse(tracer_provider=TracerProvider())
+
+    def run_traces(self, experiment_id: str) -> RunTraces:
+        """The experiment's name, item count and trace ids.
+
+        Raises ``ExperimentNotFound`` when no experiment has the id.
+        """
+        api = self.client.api
+        found = api.experiments.list(from_start_time=EPOCH, id=experiment_id)
+        experiment = next((e for e in found.data if e.id == experiment_id), None)
+        if experiment is None:
+            raise ExperimentNotFound(experiment_id)
+        items = _all_pages(
+            lambda cursor: api.experiments.list_items(
+                from_start_time=experiment.start_time,
+                experiment_id=experiment_id,
+                fields=EXPERIMENT_ITEM_FIELDS,
+                limit=EXPERIMENT_PAGE_SIZE,
+                cursor=cursor,
+            )
+        )
+        trace_ids = {item.trace_id for item in items if item.trace_id}
+        for chat_id in sorted({c for c in (_chat_id(item.output) for item in items) if c}):
+            # The session holds the app's, the simulated user's, the judge's
+            # and the item's traces.
+            session = _all_pages(
+                lambda cursor, chat_id=chat_id: api.observations.get_many(
+                    fields="core",
+                    limit=PAGE_SIZE,
+                    cursor=cursor,
+                    session_id=chat_id,
+                )
+            )
+            trace_ids.update(o.trace_id for o in session if o.trace_id)
+        return RunTraces(experiment.name, len(items), sorted(trace_ids))
+
+    def delete_traces(self, trace_ids: list[str]) -> None:
+        self.client.api.trace.delete_multiple(trace_ids=trace_ids)

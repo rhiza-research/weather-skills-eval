@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import httpx
 import litellm
 import pytest
-from fakes import FakeClock
+from fakes import FakeClock, FakeRunApi
 from langfuse import Langfuse
 from langfuse.api.core.api_error import ApiError as LangfuseApiError
 from opentelemetry.sdk.trace import TracerProvider
@@ -15,7 +15,10 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from weather_skills_eval import runner
 from weather_skills_eval.langfuse_gateway import (
     TOOL_OUTPUT_PAGE_SIZE,
+    ExperimentNotFound,
     LangfuseGateway,
+    LangfuseRuns,
+    RunTraces,
     TraceReadError,
     play_scores,
 )
@@ -873,3 +876,168 @@ def test_play_scores_become_evaluations():
         output={"scores": [{"name": "turns_to_goal", "value": 2, "comment": "c"}]}
     )
     assert [(e.name, e.value, e.comment) for e in evaluations] == [("turns_to_goal", 2, "c")]
+
+
+# Deleting a run
+
+ALLOWED_RUN_CALLS = {
+    "experiments.list",
+    "experiments.list_items",
+    "observations.get_many",
+    "trace.delete_multiple",
+}
+
+
+def run_api(**options) -> FakeRunApi:
+    """Experiment e1 (cfg) with three items: two with chats, one without.
+    chat-9 belongs to another run."""
+    defaults = {
+        "experiments": {"e1": "cfg", "e2": "empty"},
+        "items": {
+            "e1": [
+                ("item-1", {"chat_id": "chat-1", "app_trace_ids": ["app-a"]}),
+                # Langfuse can return the output as JSON text.
+                ("item-2", json.dumps({"chat_id": "chat-2"})),
+                ("item-3", {"chat_id": None}),
+            ]
+        },
+        "sessions": {
+            "chat-1": ["item-1", "app-a", "app-b", "user-1", "judge-1"],
+            "chat-2": ["item-2", "app-c"],
+            "chat-9": ["other-run"],
+        },
+    }
+    defaults.update(options)
+    return FakeRunApi(**defaults)
+
+
+def test_a_run_is_its_item_traces_plus_every_trace_in_their_chat_sessions():
+    api = run_api()
+    runs = LangfuseRuns(client=api)
+
+    found = runs.run_traces("e1")
+    runs.delete_traces(found.trace_ids)
+
+    expected = ["app-a", "app-b", "app-c", "item-1", "item-2", "item-3", "judge-1", "user-1"]
+    assert found == RunTraces("cfg", 3, expected)
+    assert api.deleted == expected
+    assert api.methods() <= ALLOWED_RUN_CALLS
+    deletes = [kwargs for method, kwargs in api.calls if method == "trace.delete_multiple"]
+    assert len(deletes) == 1
+    # Each session is read whole, page by page.
+    sessions = [kwargs for method, kwargs in api.calls if method == "observations.get_many"]
+    assert [(s["session_id"], s["cursor"]) for s in sessions] == [
+        ("chat-1", None),
+        ("chat-1", "2"),
+        ("chat-1", "4"),
+        ("chat-2", None),
+    ]
+    # Every item page is read before anything is deleted.
+    item_reads = [kwargs for method, kwargs in api.calls if method == "experiments.list_items"]
+    assert [r["cursor"] for r in item_reads] == [None, "2"]
+    assert all(r["experiment_id"] == "e1" for r in item_reads)
+    assert [method for method, _ in api.calls][-1] == "trace.delete_multiple"
+
+
+def test_an_item_without_a_chat_id_contributes_only_its_own_trace():
+    api = run_api(items={"e1": [("item-3", {"chat_id": None}), ("item-4", None)]})
+
+    found = LangfuseRuns(client=api).run_traces("e1")
+
+    assert found == RunTraces("cfg", 2, ["item-3", "item-4"])
+    assert "observations.get_many" not in api.methods()
+
+
+def test_an_unknown_experiment_id_is_not_found():
+    api = run_api()
+
+    with pytest.raises(ExperimentNotFound):
+        LangfuseRuns(client=api).run_traces("missing")
+
+    assert api.methods() == {"experiments.list"}
+
+
+def test_an_experiment_without_items_has_no_traces():
+    api = run_api()
+
+    assert LangfuseRuns(client=api).run_traces("e2") == RunTraces("empty", 0, [])
+    assert api.methods() == {"experiments.list", "experiments.list_items"}
+
+
+def test_a_langfuse_error_while_finding_a_run_is_raised():
+    api = run_api(error=LangfuseApiError(status_code=500, body="boom"))
+
+    with pytest.raises(LangfuseApiError):
+        LangfuseRuns(client=api).run_traces("e1")
+
+
+def test_real_client_finds_and_deletes_a_run_through_the_http_layer():
+    """Only the HTTP layer is stubbed: the Langfuse client builds the requests."""
+    requests = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        path, params = request.url.path, dict(request.url.params)
+        if path == "/api/public/experiments":
+            data = [
+                {
+                    "id": "e1",
+                    "name": "cfg",
+                    "startTime": "2026-10-20T09:00:00Z",
+                    "endTime": "2026-10-20T10:00:00Z",
+                    "itemCount": 1,
+                }
+            ]
+        elif path == "/api/public/experiment-items":
+            data = [
+                {
+                    "id": "x1",
+                    "traceId": "item-1",
+                    "startTime": "2026-10-20T09:00:01Z",
+                    "level": "DEFAULT",
+                    "environment": "sdk-experiment",
+                    "experimentId": "e1",
+                    "experimentName": "cfg",
+                    "experimentItemId": "i1",
+                    "output": json.dumps({"chat_id": "chat-1"}),
+                }
+            ]
+        elif path == "/api/public/v2/observations":
+            assert params["sessionId"] == "chat-1"
+            data = [
+                {
+                    "id": "o1",
+                    "traceId": "app-a",
+                    "startTime": "2026-10-20T09:00:02Z",
+                    "projectId": "p",
+                    "type": "SPAN",
+                }
+            ]
+        elif path == "/api/public/traces" and request.method == "DELETE":
+            return httpx.Response(200, json={"message": "Traces deleted"})
+        else:
+            raise AssertionError(f"unexpected request {request.method} {path}")
+        return httpx.Response(200, json={"data": data, "meta": {"cursor": None}})
+
+    client = Langfuse(
+        public_key=f"pk-test-{uuid.uuid4()}",
+        secret_key="sk-test",
+        base_url="http://langfuse.invalid",
+        httpx_client=httpx.Client(transport=httpx.MockTransport(handle)),
+        span_exporter=InMemorySpanExporter(),
+        tracer_provider=TracerProvider(),
+    )
+    runs = LangfuseRuns(client=client)
+
+    found = runs.run_traces("e1")
+    runs.delete_traces(found.trace_ids)
+
+    assert found == RunTraces("cfg", 1, ["app-a", "item-1"])
+    experiments, items, session, delete = requests
+    assert dict(experiments.url.params)["id"] == "e1"
+    assert dict(experiments.url.params)["fromStartTime"].startswith("1970-01-01T00:00:00")
+    assert dict(items.url.params)["experimentId"] == "e1"
+    assert dict(items.url.params)["fromStartTime"].startswith("2026-10-20T09:00:00")
+    assert "io" in dict(items.url.params)["fields"].split(",")
+    assert dict(session.url.params)["sessionId"] == "chat-1"
+    assert json.loads(delete.content) == {"traceIds": ["app-a", "item-1"]}

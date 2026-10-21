@@ -8,6 +8,7 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import docker.errors
@@ -638,3 +639,90 @@ class FakeGateway:
 
     def flush(self) -> None:
         self.flushed = True
+
+
+def _page(data: list, size: int, cursor: str | None) -> SimpleNamespace:
+    """One page of ``data``; the cursor is the next page's start index."""
+    start = int(cursor or 0)
+    end = start + size
+    next_cursor = str(end) if end < len(data) else None
+    return SimpleNamespace(data=data[start:end], meta=SimpleNamespace(cursor=next_cursor))
+
+
+class FakeRunApi:
+    """Langfuse's experiments, observations and trace APIs, with only the four
+    methods a delete may call; any other attribute does not exist.
+
+    ``experiments`` maps an experiment id to its name; ``items`` maps it to
+    its items as (trace_id, output); ``sessions`` maps a chat id to the trace
+    ids of its observations. Pages hold ``page_size`` entries, so a delete must
+    follow the cursor. ``error`` is raised by every call. ``calls`` records
+    (method, kwargs) of each call.
+    """
+
+    START = datetime(2026, 10, 20, 9, 0, tzinfo=UTC)
+
+    def __init__(
+        self,
+        experiments: dict[str, str] | None = None,
+        items: dict[str, list[tuple[str, object]]] | None = None,
+        sessions: dict[str, list[str]] | None = None,
+        page_size: int = 2,
+        error: Exception | None = None,
+    ):
+        self._experiments = experiments or {}
+        self._items = items or {}
+        self._sessions = sessions or {}
+        self._page_size = page_size
+        self._error = error
+        self.calls: list[tuple[str, dict]] = []
+        self.deleted: list[str] = []
+        fake = self
+
+        def record(method: str, kwargs: dict) -> None:
+            fake.calls.append((method, kwargs))
+            if fake._error:
+                raise fake._error
+
+        def list_experiments(**kwargs):
+            record("experiments.list", kwargs)
+            assert kwargs["from_start_time"] == datetime(1970, 1, 1, tzinfo=UTC)
+            ids = kwargs["id"].split(",")
+            data = [
+                SimpleNamespace(id=i, name=name, start_time=fake.START)
+                for i, name in fake._experiments.items()
+                if i in ids
+            ]
+            return SimpleNamespace(data=data, meta=SimpleNamespace(cursor=None))
+
+        def list_items(**kwargs):
+            record("experiments.list_items", kwargs)
+            assert kwargs["from_start_time"] == fake.START
+            assert "io" in kwargs["fields"].split(",")
+            items = [
+                SimpleNamespace(trace_id=trace_id, output=output)
+                for trace_id, output in fake._items.get(kwargs["experiment_id"], [])
+            ]
+            return _page(items, fake._page_size, kwargs.get("cursor"))
+
+        def get_many(**kwargs):
+            record("observations.get_many", kwargs)
+            session = [
+                SimpleNamespace(id=f"o{n}", trace_id=trace_id)
+                for n, trace_id in enumerate(fake._sessions.get(kwargs["session_id"], []))
+            ]
+            return _page(session, fake._page_size, kwargs.get("cursor"))
+
+        def delete_multiple(**kwargs):
+            record("trace.delete_multiple", kwargs)
+            fake.deleted.extend(kwargs["trace_ids"])
+            return SimpleNamespace(message="deleted")
+
+        self.api = SimpleNamespace(
+            experiments=SimpleNamespace(list=list_experiments, list_items=list_items),
+            observations=SimpleNamespace(get_many=get_many),
+            trace=SimpleNamespace(delete_multiple=delete_multiple),
+        )
+
+    def methods(self) -> set[str]:
+        return {method for method, _ in self.calls}

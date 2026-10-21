@@ -13,6 +13,15 @@ Exit codes:
   skill packs, or reported no base model for the catalog model.
 - 5: Langfuse returned an error.
 - 143: the harness was stopped with SIGTERM; the app container was removed.
+
+``weather-skills-eval delete [--yes] <experiment-id>`` deletes every trace of
+one run, after ``yes`` on stdin unless ``--yes`` is given. Exit codes:
+
+- 0: the traces were deleted, the experiment has no items, or the answer was
+  not ``yes`` and nothing was deleted.
+- 1: the delete failed for any other reason.
+- 2: no experiment has that id; nothing was deleted.
+- 5: Langfuse returned an error.
 """
 
 import argparse
@@ -30,6 +39,7 @@ from langfuse.api.core.api_error import ApiError as LangfuseApiError
 from .app_client import ChatError
 from .config import ConfigError
 from .instance import AppStartError
+from .langfuse_gateway import ExperimentNotFound, LangfuseRuns
 from .runner import DatasetError, run
 from .settings import SettingsError
 from .tasks import TaskError
@@ -81,7 +91,52 @@ def _terminate(signum, frame):
     raise SystemExit(EXIT_TERMINATED)
 
 
-def main(argv: list[str] | None = None, *, docker_client_factory=_docker_client) -> int:
+def _fail(code: int, message: str) -> int:
+    print(message, file=sys.stderr)
+    return code
+
+
+def _confirmed() -> bool:
+    """True only when the answer on stdin is ``yes``; end of input is no."""
+    try:
+        answer = input("Type yes to delete these traces: ")
+    except EOFError:
+        return False
+    return answer.strip() == "yes"
+
+
+def delete(experiment_id: str, *, yes: bool, runs_factory=LangfuseRuns) -> int:
+    """Prints the run's counts, then deletes its traces on ``yes`` (or with
+    ``--yes``); any other answer deletes nothing."""
+    try:
+        runs = runs_factory()
+        found = runs.run_traces(experiment_id)
+        if not found.items:
+            print(f"Experiment {found.experiment_name} has no items; nothing to delete")
+            return 0
+        counts = f"{found.items} items, {len(found.trace_ids)} traces"
+        print(f"Experiment {found.experiment_name}: {counts}")
+        if not (yes or _confirmed()):
+            print("Nothing deleted")
+            return 0
+        runs.delete_traces(found.trace_ids)
+    except ExperimentNotFound:
+        return _fail(EXIT_NOT_STARTED, f"Nothing deleted: no experiment has id {experiment_id}")
+    except LangfuseApiError as exc:
+        return _fail(EXIT_LANGFUSE, f"Delete stopped, Langfuse returned an error: {exc}")
+    except Exception as exc:
+        return _fail(EXIT_FAILED, f"Delete failed: {type(exc).__name__}: {exc}")
+
+    print(f"Deleted experiment {found.experiment_name}: {counts}")
+    return 0
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    docker_client_factory=_docker_client,
+    runs_factory=LangfuseRuns,
+) -> int:
     parser = argparse.ArgumentParser(prog="weather-skills-eval")
     commands = parser.add_subparsers(dest="command", required=True)
     run_parser = commands.add_parser(
@@ -90,29 +145,35 @@ def main(argv: list[str] | None = None, *, docker_client_factory=_docker_client)
     run_parser.add_argument(
         "config", type=Path, help="Configuration file (YAML), or - to read it from stdin"
     )
+    delete_parser = commands.add_parser("delete", help="Delete every trace of one run")
+    delete_parser.add_argument(
+        "experiment_id", help="The experiment id: the baseline= value in the experiment URL"
+    )
+    delete_parser.add_argument(
+        "--yes", action="store_true", help="Delete without asking for yes on stdin"
+    )
     args = parser.parse_args(argv)
+
+    if args.command == "delete":
+        return delete(args.experiment_id, yes=args.yes, runs_factory=runs_factory)
 
     signal.signal(signal.SIGTERM, _terminate)
     silence_langwatch()
 
-    def fail(code: int, message: str) -> int:
-        print(message, file=sys.stderr)
-        return code
-
     try:
         summary = run(args.config, os.environ, docker_client_factory=docker_client_factory)
     except (SettingsError, ConfigError, TaskError, DatasetError) as exc:
-        return fail(EXIT_NOT_STARTED, f"Run not started: {exc}")
+        return _fail(EXIT_NOT_STARTED, f"Run not started: {exc}")
     except AppStartError as exc:
-        return fail(EXIT_APP_NOT_STARTED, f"Run stopped, the app did not start: {exc}")
+        return _fail(EXIT_APP_NOT_STARTED, f"Run stopped, the app did not start: {exc}")
     except docker.errors.DockerException as exc:
-        return fail(EXIT_APP_NOT_STARTED, f"Run stopped, Docker failed: {exc}")
+        return _fail(EXIT_APP_NOT_STARTED, f"Run stopped, Docker failed: {exc}")
     except (ChatError, httpx.HTTPError) as exc:
-        return fail(EXIT_APP_FAILED, f"Run stopped, the app failed: {exc}")
+        return _fail(EXIT_APP_FAILED, f"Run stopped, the app failed: {exc}")
     except LangfuseApiError as exc:
-        return fail(EXIT_LANGFUSE, f"Run stopped, Langfuse returned an error: {exc}")
+        return _fail(EXIT_LANGFUSE, f"Run stopped, Langfuse returned an error: {exc}")
     except Exception as exc:
-        return fail(EXIT_FAILED, f"Run failed: {type(exc).__name__}: {exc}")
+        return _fail(EXIT_FAILED, f"Run failed: {type(exc).__name__}: {exc}")
 
     print(f"Experiment {summary.experiment_name}, run {summary.run_name}")
     print(f"Goal reached on {summary.goals_reached} of {summary.items} tasks")
