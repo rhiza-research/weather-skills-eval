@@ -16,9 +16,11 @@ Exit codes:
 """
 
 import argparse
+import logging
 import os
 import signal
 import sys
+import warnings
 from pathlib import Path
 
 import docker.errors
@@ -46,6 +48,31 @@ def _docker_client():
     return docker.from_env()
 
 
+LANGWATCH_NO_TRACE = r"No trace in context when calling langwatch\.get_current_trace\(\)"
+LANGWATCH_NO_API_KEY = "No LangWatch api_key configured"
+
+
+class _DropLangWatchApiKeyWarning(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not record.getMessage().startswith(LANGWATCH_NO_API_KEY)
+
+
+def silence_langwatch() -> None:
+    """Drop the two LangWatch notices Scenario emits: the harness traces to
+    Langfuse, not LangWatch, so neither applies to a run."""
+    # Scenario asks LangWatch for its current trace; with no LangWatch trace it warns.
+    warnings.filterwarnings(
+        "ignore",
+        message=LANGWATCH_NO_TRACE,
+        category=UserWarning,
+        module=r"langwatch\.telemetry\.context",
+    )
+    # Scenario's event reporter logs this once per process when no LangWatch key is set.
+    reporter = logging.getLogger("scenario._events.event_reporter")
+    if not any(isinstance(f, _DropLangWatchApiKeyWarning) for f in reporter.filters):
+        reporter.addFilter(_DropLangWatchApiKeyWarning())
+
+
 def _terminate(signum, frame):
     # Raising here unwinds the run, so the container is removed on the way out.
     raise SystemExit(EXIT_TERMINATED)
@@ -63,6 +90,7 @@ def main(argv: list[str] | None = None, *, docker_client_factory=_docker_client)
     args = parser.parse_args(argv)
 
     signal.signal(signal.SIGTERM, _terminate)
+    silence_langwatch()
 
     def fail(code: int, message: str) -> int:
         print(message, file=sys.stderr)

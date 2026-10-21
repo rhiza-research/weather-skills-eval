@@ -1,8 +1,10 @@
 import asyncio
 import io
 import json
+import logging
 import types
 import uuid
+import warnings
 from pathlib import Path
 
 import docker.errors
@@ -623,6 +625,47 @@ def test_cli_with_an_unset_image_reference_exits_2(monkeypatch, capsys):
     # configs/example.yaml sets image: ${APP_IMAGE}.
     assert cli.main(["run", str(REPO / "configs" / "example.yaml")]) == 2
     assert "image: references ${APP_IMAGE}, which is not set" in capsys.readouterr().err
+
+
+def test_only_the_two_langwatch_notices_are_silenced(caplog):
+    no_trace = (
+        "No trace in context when calling langwatch.get_current_trace(), "
+        "perhaps you forgot to use @langwatch.trace()?"
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cli.silence_langwatch()
+        warnings.warn_explicit(
+            no_trace, UserWarning, "context.py", 47, "langwatch.telemetry.context"
+        )
+        warnings.warn_explicit(
+            "Failed to set LangWatch trace context: x",
+            UserWarning,
+            "context.py",
+            107,
+            "langwatch.telemetry.context",
+        )
+        warnings.warn_explicit(no_trace, UserWarning, "other.py", 1, "weather_skills_eval.other")
+    assert [(str(w.message), w.filename) for w in caught] == [
+        ("Failed to set LangWatch trace context: x", "context.py"),
+        (no_trace, "other.py"),
+    ]
+
+    reporter = logging.getLogger("scenario._events.event_reporter")
+    cli.silence_langwatch()
+    # Calling it again adds no second filter.
+    assert len(reporter.filters) == 1
+    with caplog.at_level(logging.WARNING, logger="scenario._events.event_reporter"):
+        reporter.warning(
+            "No LangWatch api_key configured (set LANGWATCH_API_KEY env var or call "
+            "langwatch.setup(api_key=...) before scenarios run); scenario events will not be reported."
+        )
+        reporter.warning("No LANGWATCH_ENDPOINT configured, skipping event posting")
+    assert [r.getMessage() for r in caplog.records] == [
+        "No LANGWATCH_ENDPOINT configured, skipping event posting"
+    ]
+    for f in list(reporter.filters):
+        reporter.removeFilter(f)
 
 
 def test_sigterm_handler_unwinds_with_exit_code_143():
