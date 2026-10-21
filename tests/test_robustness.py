@@ -627,7 +627,7 @@ def test_cli_with_an_unset_image_reference_exits_2(monkeypatch, capsys):
     assert "image: references ${APP_IMAGE}, which is not set" in capsys.readouterr().err
 
 
-def test_only_the_two_langwatch_notices_are_silenced(caplog):
+def test_only_the_langwatch_notices_are_silenced(caplog):
     no_trace = (
         "No trace in context when calling langwatch.get_current_trace(), "
         "perhaps you forgot to use @langwatch.trace()?"
@@ -666,6 +666,17 @@ def test_only_the_two_langwatch_notices_are_silenced(caplog):
     ]
     for f in list(reporter.filters):
         reporter.removeFilter(f)
+
+
+def test_the_langwatch_banner_is_not_printed(monkeypatch, capsys):
+    from scenario._events.event_alert_message_logger import EventAlertMessageLogger
+
+    monkeypatch.delenv("SCENARIO_DISABLE_SIMULATION_REPORT_INFO", raising=False)
+    monkeypatch.delenv("LANGWATCH_API_KEY", raising=False)
+    monkeypatch.setattr(EventAlertMessageLogger, "_shown_batch_ids", set())
+    cli.silence_langwatch()
+    EventAlertMessageLogger().handle_greeting()
+    assert "LangWatch API key not configured" not in capsys.readouterr().out
 
 
 def test_sigterm_handler_unwinds_with_exit_code_143():

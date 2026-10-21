@@ -58,8 +58,11 @@ class _DropLangWatchApiKeyWarning(logging.Filter):
 
 
 def silence_langwatch() -> None:
-    """Drop the two LangWatch notices Scenario emits: the harness traces to
-    Langfuse, not LangWatch, so neither applies to a run."""
+    """Drop the LangWatch notices Scenario emits (the no-trace warning, the
+    no-api-key log line and the startup banner): the harness traces to
+    Langfuse, not LangWatch, so none applies to a run."""
+    # Scenario prints its "LangWatch API key not configured" banner unless this is set.
+    os.environ.setdefault("SCENARIO_DISABLE_SIMULATION_REPORT_INFO", "1")
     # Scenario asks LangWatch for its current trace; with no LangWatch trace it warns.
     warnings.filterwarnings(
         "ignore",
