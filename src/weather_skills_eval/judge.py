@@ -17,6 +17,7 @@ is judged on the transcript and its criteria alone.
 The judge never ends a play: the simulated user or the turn cap does.
 """
 
+import asyncio
 import base64
 import json
 from collections.abc import Awaitable, Callable
@@ -99,7 +100,10 @@ class GoalJudge(JudgeAgent):
         """The verdict on the play's final result; its reasoning is ``verdict``.
 
         Called after ``scenario.arun`` returns, in the same context: Scenario's
-        judge reads the run it left current there. Raises ``ModelReplyError``
+        judge reads the run it left current there. Scenario's judge calls the
+        model synchronously from its async code, so it runs on a thread with
+        its own event loop, and other plays keep polling the app meanwhile;
+        the thread gets a copy of this context. Raises ``ModelReplyError``
         when the judge returns no verdict.
 
         Scenario's judge tells the model the conversation reached the turn cap
@@ -128,10 +132,15 @@ class GoalJudge(JudgeAgent):
             scenario_state=state,
         )
         self._evidence = evidence
-        try:
-            result = await self.call(request)
-        finally:
-            self._evidence = None
+
+        async def verdict():
+            # Cleared in the thread: a cancelled await leaves the call running.
+            try:
+                return await self.call(request)
+            finally:
+                self._evidence = None
+
+        result = await asyncio.to_thread(asyncio.run, verdict())
         if not isinstance(result, ScenarioResult):
             raise ModelReplyError(f"The judge returned no verdict: {result!r}")
         self.verdict = result.reasoning or ("passed" if result.success else "no reasoning given")

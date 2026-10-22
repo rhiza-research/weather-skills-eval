@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import docker.errors
 import httpx
 import litellm
+import requests.exceptions
 
 from weather_skills_eval.langfuse_gateway import play_scores
 from weather_skills_eval.scoring import TraceRead
@@ -268,7 +269,9 @@ class FakeApp:
 class FakeContainer:
     """``statuses`` are returned by successive reloads; the status ``gone``
     makes reload raise NotFound, as for a container removed from outside,
-    and ``api-error`` makes it raise APIError. An entry may also be a
+    ``api-error`` makes it raise APIError, and ``connection-error`` and
+    ``read-timeout`` make it raise the requests error docker-py raises when
+    the daemon connection fails or times out. An entry may also be a
     (status, restart count, exit code) tuple, which sets ``attrs``.
     ``archives`` holds each (path, tar bytes) given to ``put_archive``;
     ``put_archive_error`` and ``start_error`` fail those calls, and
@@ -324,6 +327,10 @@ class FakeContainer:
             raise docker.errors.NotFound("container gone")
         if self.status == "api-error":
             raise docker.errors.APIError("daemon unavailable")
+        if self.status == "connection-error":
+            raise requests.exceptions.ConnectionError("connection aborted")
+        if self.status == "read-timeout":
+            raise requests.exceptions.ReadTimeout("read timed out")
 
     def logs(self, tail: int = 200) -> bytes:
         return self._logs

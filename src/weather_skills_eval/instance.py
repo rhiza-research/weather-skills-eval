@@ -42,8 +42,13 @@ from collections.abc import Callable
 
 import docker.errors
 import httpx
+import requests.exceptions
 
 log = logging.getLogger(__name__)
+
+# docker-py raises requests' errors, not a DockerException, when the connection
+# to the daemon fails, times out or breaks during a response.
+DOCKER_ERRORS = (docker.errors.DockerException, requests.exceptions.RequestException)
 
 LABEL = "weather-skills-eval"
 LABEL_VALUE = "app"
@@ -220,7 +225,7 @@ class AppInstance:
                 name=self.emulator_source_name,
                 labels=self._labels(EMULATOR_LABEL_VALUE),
             )
-        except docker.errors.DockerException as exc:
+        except DOCKER_ERRORS as exc:
             raise RunnerStartError(
                 f"The emulator could not be read from image {self._image_ref}: {exc}"
             ) from exc
@@ -246,7 +251,7 @@ class AppInstance:
     def _pull(self, ref: str, error: type[AppStartError], what: str):
         try:
             return self._docker.images.pull(ref)
-        except docker.errors.DockerException as exc:
+        except DOCKER_ERRORS as exc:
             raise error(f"{what} {ref} could not be pulled: {exc}") from exc
 
     def _local(self, ref: str, error: type[AppStartError], what: str):
@@ -254,7 +259,7 @@ class AppInstance:
             return self._docker.images.get(ref)
         except docker.errors.ImageNotFound as exc:
             raise error(f"{what} {ref} is not on the Docker host") from exc
-        except docker.errors.DockerException as exc:
+        except DOCKER_ERRORS as exc:
             raise error(f"{what} {ref} could not be read from the Docker host: {exc}") from exc
 
     @staticmethod
@@ -313,7 +318,7 @@ class AppInstance:
             if not self.runner.put_archive("/", _archive(files)):
                 raise RunnerStartError("The emulator files could not be copied into the runner")
             self.runner.start()
-        except docker.errors.DockerException as exc:
+        except DOCKER_ERRORS as exc:
             raise RunnerStartError(f"Runner container could not start: {exc}") from exc
 
     def _runner_state(self, when: str) -> tuple[str, object, object]:
@@ -323,7 +328,7 @@ class AppInstance:
             self.runner.reload()
         except docker.errors.NotFound as exc:
             raise RunnerStartError(f"Runner container disappeared {when}") from exc
-        except docker.errors.DockerException as exc:
+        except DOCKER_ERRORS as exc:
             raise RunnerStartError(f"Runner container could not be read {when}: {exc}") from exc
         attrs = self.runner.attrs or {}
         state = attrs.get("State") or {}
@@ -408,6 +413,10 @@ class AppInstance:
                 self.container.reload()
             except docker.errors.NotFound as exc:
                 raise AppStartError("App container disappeared before answering /health") from exc
+            except DOCKER_ERRORS as exc:
+                raise AppStartError(
+                    f"App container could not be read before answering /health: {exc}"
+                ) from exc
             if self.container.status in ("exited", "dead"):
                 raise AppStartError(
                     f"App container exited before answering /health.\n"
@@ -472,7 +481,7 @@ class AppInstance:
             self._wait_for_health()
         except BaseException as exc:
             self.remove()
-            if isinstance(exc, docker.errors.DockerException):
+            if isinstance(exc, DOCKER_ERRORS):
                 raise AppStartError(f"App container could not start: {exc}") from exc
             raise
         return self

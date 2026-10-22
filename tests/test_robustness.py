@@ -4,9 +4,13 @@ import io
 import json
 import logging
 import os
+import re
+import threading
+import time
 import types
 import uuid
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 
 import docker.errors
@@ -14,14 +18,20 @@ import httpx
 import langwatch.state
 import litellm
 import pytest
+import requests.exceptions
 import scenario
 from fakes import (
+    APP_REPOSITORY,
+    RUNNER_IMAGE,
+    FakeClock,
     FakeContainer,
+    FakeDocker,
     FakeModels,
     FakeRunApi,
     FakeSourceContainer,
     FakeVolume,
     app_image_files,
+    local_image,
 )
 from langfuse import Langfuse
 from langfuse.api.core.api_error import ApiError as LangfuseApiError
@@ -36,8 +46,14 @@ from scenario._tracing import _reset_tracing_for_tests, judge_span_collector
 
 from weather_skills_eval import cli
 from weather_skills_eval import instance as instance_module
-from weather_skills_eval.app_client import AppClient, ChatError
-from weather_skills_eval.checks import Evidence, ReplyFiles, collect_evidence, reply_files
+from weather_skills_eval.app_client import AppClient, ChatError, Conversation
+from weather_skills_eval.checks import (
+    Evidence,
+    PresentedFile,
+    ReplyFiles,
+    collect_evidence,
+    reply_files,
+)
 from weather_skills_eval.config import ConfigError, load_config, parse_config
 from weather_skills_eval.instance import (
     AppInstance,
@@ -300,6 +316,76 @@ def test_unreadable_app_responses_are_chat_errors(response):
     app = client(lambda request: response)
     with pytest.raises(ChatError):
         asyncio.run(app.get_chat("c1"))
+
+
+def chat_returning(stored) -> tuple[Conversation, list[str]]:
+    """A conversation whose chat reads return ``stored(assistant id)``, and
+    the ids of the assistant messages it posted."""
+    assistant_ids = []
+
+    def handler(request):
+        if request.url.path == "/api/v1/chats/new":
+            return httpx.Response(200, json={"id": "c1"})
+        if request.url.path == "/api/chat/completions":
+            assistant_ids.append(json.loads(request.content)["id"])
+            return httpx.Response(200, json={"status": True})
+        return httpx.Response(200, json=stored(assistant_ids[-1]))
+
+    conversation = Conversation(
+        client(handler), model="m", tool_ids=[], turn_timeout=60, poll_interval=0
+    )
+    return conversation, assistant_ids
+
+
+def stored_reply(reply) -> Callable:
+    return lambda assistant_id: {"chat": {"history": {"messages": {assistant_id: reply}}}}
+
+
+@pytest.mark.parametrize(
+    "stored, level",
+    [
+        (lambda _: {"chat": ["x"]}, "chat"),
+        (lambda _: {"chat": ""}, "chat"),
+        (lambda _: {"chat": {"history": []}}, "chat.history"),
+        (lambda _: {"chat": {"history": {"messages": 0}}}, "chat.history.messages"),
+        (lambda _: {"chat": {"history": {"messages": [{"done": True}]}}}, "chat.history.messages"),
+        (stored_reply([]), "chat.history.messages."),
+        (stored_reply({"done": True, "content": []}), "not text"),
+        (stored_reply({"done": True, "content": [{"type": "text", "text": "20 mm"}]}), "not text"),
+    ],
+    ids=[
+        "chat-list",
+        "chat-empty-text",
+        "history-empty-list",
+        "messages-zero",
+        "messages-list",
+        "reply-empty-list",
+        "content-empty-list",
+        "content-list",
+    ],
+)
+def test_a_chat_reply_of_an_unexpected_shape_is_a_chat_error_and_not_answered(stored, level):
+    conversation, _ = chat_returning(stored)
+    with pytest.raises(ChatError, match=re.escape(level)):
+        asyncio.run(conversation.send("rain next week?"))
+    # The play ends as chat_error, and the turn got no reply.
+    assert conversation.error
+    assert conversation.answer_seconds == []
+
+
+def test_null_chat_levels_are_not_there_yet_and_null_content_is_empty():
+    polls = []
+
+    def stored(assistant_id):
+        polls.append(assistant_id)
+        if len(polls) == 1:
+            return {"chat": {"history": None}}
+        return stored_reply({"done": True, "content": None})(assistant_id)
+
+    conversation, _ = chat_returning(stored)
+    assert asyncio.run(conversation.send("rain next week?")).content == ""
+    assert len(polls) == 2
+    assert len(conversation.answer_seconds) == 1
 
 
 def test_create_chat_without_id_is_a_chat_error():
@@ -575,6 +661,116 @@ def test_health_check_needs_a_status_object(monkeypatch, response, healthy):
     assert instance_module._health_ok("http://app/health") is healthy
 
 
+TRANSPORT_ERRORS = [
+    requests.exceptions.ConnectionError("connection aborted"),
+    requests.exceptions.ReadTimeout("read timed out"),
+    requests.exceptions.ChunkedEncodingError("response ended early"),
+]
+
+
+def transport_error_id(error) -> str:
+    return type(error).__name__
+
+
+def docker_instance(daemon, *, pull: bool = True) -> AppInstance:
+    clock = FakeClock()
+    return AppInstance(
+        docker_client=daemon,
+        image=f"{APP_REPOSITORY}:1",
+        runner_image=RUNNER_IMAGE,
+        env={},
+        network="n",
+        port="8080",
+        start_timeout=10,
+        poll_interval=1,
+        pull=pull,
+        health_check=lambda url: True,
+        clock=clock,
+        sleep=clock.sleep_sync,
+    )
+
+
+@pytest.mark.parametrize("status", ["connection-error", "read-timeout"])
+def test_a_docker_transport_error_reading_the_runner_is_a_runner_failure(status):
+    instance = docker_instance(FakeDocker(FakeContainer(["running"])))
+    # Before a task, and after one.
+    instance.runner = FakeContainer([status], name="runner")
+    with pytest.raises(RunnerStartError, match="could not be read before task t1"):
+        instance.wait_for_runner("before task t1")
+    instance.runner = FakeContainer([status], name="runner")
+    with pytest.raises(RunnerStartError, match="could not be read during task t1") as error:
+        instance.check_runner_unchanged("during task t1", 0)
+    # Not one Docker restarts: the run stops (exit 3).
+    assert not error.value.restartable
+
+
+@pytest.mark.parametrize("error", TRANSPORT_ERRORS, ids=transport_error_id)
+def test_a_docker_transport_error_getting_the_app_image_stops_the_start(error):
+    pulled = FakeDocker(FakeContainer(["running"]), pull_error=error)
+    with pytest.raises(AppStartError, match="could not be pulled"):
+        docker_instance(pulled).__enter__()
+    local = FakeDocker(FakeContainer(["running"]), local=local_image(), get_error=error)
+    with pytest.raises(AppStartError, match="could not be read from the Docker host"):
+        docker_instance(local, pull=False).__enter__()
+
+
+@pytest.mark.parametrize("error", TRANSPORT_ERRORS, ids=transport_error_id)
+def test_a_docker_transport_error_pulling_the_runner_image_stops_the_start(error):
+    daemon = FakeDocker(FakeContainer(["running"]), runner_pull_error=error)
+    with pytest.raises(RunnerStartError, match=f"Runner image {RUNNER_IMAGE} could not be pulled"):
+        docker_instance(daemon).__enter__()
+
+
+@pytest.mark.parametrize("error", TRANSPORT_ERRORS, ids=transport_error_id)
+@pytest.mark.parametrize(
+    "step, start_error, message",
+    [
+        ("volume", RunnerStartError, "Runner container could not start"),
+        ("runner-create", RunnerStartError, "Runner container could not start"),
+        ("put-archive", RunnerStartError, "Runner container could not start"),
+        ("runner-start", RunnerStartError, "Runner container could not start"),
+        ("app-run", AppStartError, "App container could not start"),
+    ],
+)
+def test_a_docker_transport_error_starting_a_container_stops_the_start(
+    error, step, start_error, message
+):
+    runner = FakeContainer(
+        ["running"],
+        name="runner",
+        put_archive_error=error if step == "put-archive" else None,
+        start_error=error if step == "runner-start" else None,
+    )
+    daemon = FakeDocker(
+        FakeContainer(["running"]),
+        runner=runner,
+        volume_error=error if step == "volume" else None,
+        create_error=error if step == "runner-create" else None,
+        run_error=error if step == "app-run" else None,
+    )
+    with pytest.raises(start_error, match=message):
+        docker_instance(daemon).__enter__()
+
+
+def test_a_docker_transport_error_creating_the_emulator_source_stops_the_start():
+    daemon = FakeDocker(FakeContainer(["running"]))
+
+    def create(image_id, **kwargs):
+        raise requests.exceptions.ConnectionError("connection aborted")
+
+    daemon.containers.create = create
+    with pytest.raises(RunnerStartError, match="The emulator could not be read from image"):
+        docker_instance(daemon).__enter__()
+
+
+@pytest.mark.parametrize("status", ["connection-error", "read-timeout", "api-error"])
+def test_a_docker_error_during_the_health_check_stops_the_start(status):
+    daemon = FakeDocker(FakeContainer([status]))
+    with pytest.raises(AppStartError, match="could not be read before answering /health"):
+        docker_instance(daemon).__enter__()
+    assert daemon.container.removed and daemon.runner.removed and daemon.volume().removed
+
+
 def test_repository_of_image_references():
     assert repository_of("ghcr.io/org/app:1.2") == "ghcr.io/org/app"
     assert repository_of("ghcr.io/org/app@sha256:abc") == "ghcr.io/org/app"
@@ -795,6 +991,110 @@ def test_final_judge_reads_the_run_that_arun_leaves_current():
     # Outside the context arun ran in, Scenario's judge finds no run.
     with pytest.raises(LookupError):
         asyncio.run(judge.rule(states[-1], at_turn_cap=False))
+
+
+def test_the_final_judge_call_leaves_the_event_loop_free_for_other_plays():
+    models = FakeModels()
+    # How many times another play got the event loop, and whether it is to stop.
+    passes = [0]
+    stop = threading.Event()
+    # Per verdict call: whether the other play ran 3 times while the call was out.
+    ran_during_verdict = []
+
+    def complete(role, session_id, **kwargs):
+        if kwargs.get("tools"):
+            # Bounded, so a verdict call that holds the loop fails the test, not hangs it.
+            deadline = time.monotonic() + 5
+            while passes[0] < 3 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            ran_during_verdict.append(passes[0] >= 3)
+        return models(role, session_id, **kwargs)
+
+    judge = GoalJudge(
+        criteria=["The assistant gives the rain total"],
+        deliverables=[],
+        model="m",
+        complete=complete,
+        session_id=lambda: "c1",
+        collect_evidence=lambda: None,
+    )
+    states = []
+
+    async def other_play():
+        while not stop.is_set():
+            passes[0] += 1
+            await asyncio.sleep(0)
+
+    async def play_then_judge():
+        await scenario.arun(
+            name="t",
+            description="d",
+            agents=[DoneAssistant(), OneQuestionUser()],
+            script=[scenario.proceed(on_turn=states.append)],
+            max_turns=3,
+            verbose=False,
+        )
+        other = asyncio.create_task(other_play())
+        try:
+            return await judge.rule(states[-1], at_turn_cap=False)
+        finally:
+            stop.set()
+            await other
+
+    assert asyncio.run(play_then_judge()) is True
+    assert ran_during_verdict == [True]
+    assert judge.verdict == "verdict passed"
+
+
+def test_a_cancelled_final_judge_call_keeps_its_evidence_until_the_verdict_ends():
+    models = FakeModels()
+    in_flight, release = threading.Event(), threading.Event()
+    # Per verdict call: whether the judge still held its evidence after the wait.
+    evidence_after_cancel = []
+    evidence = Evidence(
+        files=[PresentedFile(path="maps/rain.png", kind="image", provenance=PROVENANCE, turn=1)]
+    )
+
+    async def collect():
+        return evidence
+
+    def complete(role, session_id, **kwargs):
+        if kwargs.get("tools"):
+            in_flight.set()
+            release.wait(timeout=5)
+            evidence_after_cancel.append(judge._evidence is evidence)
+        return models(role, session_id, **kwargs)
+
+    judge = GoalJudge(
+        criteria=["The assistant gives the rain total"],
+        deliverables=["image"],
+        model="m",
+        complete=complete,
+        session_id=lambda: "c1",
+        collect_evidence=collect,
+    )
+    states = []
+
+    async def play_then_cancel_the_judge():
+        await scenario.arun(
+            name="t",
+            description="d",
+            agents=[DoneAssistant(), OneQuestionUser()],
+            script=[scenario.proceed(on_turn=states.append)],
+            max_turns=3,
+            verbose=False,
+        )
+        ruling = asyncio.create_task(judge.rule(states[-1], at_turn_cap=False))
+        assert await asyncio.to_thread(in_flight.wait, 5)
+        ruling.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await ruling
+        release.set()
+
+    # asyncio.run waits for the verdict's thread before it returns.
+    asyncio.run(play_then_cancel_the_judge())
+    assert evidence_after_cancel == [True]
+    assert judge._evidence is None
 
 
 # CLI

@@ -248,18 +248,28 @@ class Conversation:
 
     async def _wait_done(self, assistant_id: str, started: float) -> str:
         while True:
-            chat = await self._app.get_chat(self.chat_id)
-            history = (chat.get("chat") or {}).get("history") or {}
-            messages = history.get("messages") if isinstance(history, dict) else None
-            message = (messages or {}).get(assistant_id) or {}
-            if not isinstance(message, dict):
-                raise ChatError(f"The chat holds an unreadable reply: {message!r}")
+            # chat.history.messages[assistant_id]; a level that is null or not
+            # there yet is empty.
+            message = await self._app.get_chat(self.chat_id)
+            level = ""
+            for key in ("chat", "history", "messages", assistant_id):
+                level = f"{level}.{key}" if level else key
+                message = message.get(key)
+                if message is None:
+                    message = {}
+                elif not isinstance(message, dict):
+                    raise ChatError(f"The chat's {level} is not an object: {message!r}")
             if message.get("done"):
                 error = message.get("error")
                 if error:
                     content = error.get("content") if isinstance(error, dict) else error
                     raise ChatError(f"The app reported an error: {content}")
-                return message.get("content") or ""
+                content = message.get("content")
+                if content is None:
+                    content = ""
+                if not isinstance(content, str):
+                    raise ChatError(f"The chat holds a reply that is not text: {content!r}")
+                return content
             if self._clock() - started >= self._turn_timeout:
                 raise ChatError(f"No reply within {self._turn_timeout:g} s")
             await self._sleep(self._poll_interval)

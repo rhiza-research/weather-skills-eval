@@ -245,6 +245,38 @@ def test_task_turn_limit_is_optional():
     assert parse_tasks([item(metadata=limited)], max_turns=2)
 
 
+@pytest.mark.parametrize("turn_limit", [True, "3", 2.0, 3.0], ids=repr)
+def test_task_turn_limit_must_be_an_integer(turn_limit):
+    with pytest.raises(TaskError, match="metadata.turn_limit"):
+        parse_task(item(metadata={"facts": "K", "turn_limit": turn_limit}))
+
+
+@pytest.mark.parametrize("before_turn", [True, "3", 3.0], ids=repr)
+def test_task_pause_turn_must_be_an_integer(before_turn):
+    metadata = {"facts": "K", "pauses": [{"before_turn": before_turn, "seconds": 1}]}
+    with pytest.raises(TaskError, match="metadata.pauses.0.before_turn"):
+        parse_task(item(metadata=metadata))
+
+
+def test_task_pause_seconds_may_be_a_whole_or_fractional_number():
+    for seconds in (600, 0.5):
+        metadata = {"facts": "K", "pauses": [{"before_turn": 2, "seconds": seconds}]}
+        assert parse_task(item(metadata=metadata)).pause_before(2) == seconds
+
+
+@pytest.mark.parametrize("seconds", [float("inf"), "inf", float("nan"), True], ids=repr)
+def test_task_pause_seconds_must_be_a_finite_number(seconds):
+    metadata = {"facts": "K", "pauses": [{"before_turn": 2, "seconds": seconds}]}
+    with pytest.raises(TaskError, match="metadata.pauses.0.seconds"):
+        parse_task(item(metadata=metadata))
+
+
+@pytest.mark.parametrize("criteria", [[""], ["   "], ["gives totals", "\t\n"]], ids=repr)
+def test_task_judge_criteria_must_hold_text(criteria):
+    with pytest.raises(TaskError, match="expected_output.judge_criteria"):
+        parse_task(item(expected_output={"judge_criteria": criteria}))
+
+
 def test_simulated_user_prompt_holds_the_done_give_up_and_correction_rules():
     for rule in (
         "You are done when the assistant has presented everything you asked for, as you asked.",

@@ -14,9 +14,16 @@
   ``EVAL_MAX_TURNS`` for the task) and ``tags``.
 """
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    model_validator,
+)
 
 
 class TaskError(Exception):
@@ -30,11 +37,17 @@ class _Strict(BaseModel):
 Deliverable = Literal["image", "zarr"]
 
 
+def _has_text(text: str) -> str:
+    if not text.strip():
+        raise ValueError("must hold text other than whitespace")
+    return text
+
+
 class ExpectedOutput(_Strict):
     deliverables: list[Deliverable] = Field(
         default_factory=list, description="Kinds of file the presented result must include"
     )
-    judge_criteria: list[str] = Field(default_factory=list)
+    judge_criteria: list[Annotated[str, AfterValidator(_has_text)]] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _has_a_goal(self):
@@ -44,15 +57,20 @@ class ExpectedOutput(_Strict):
 
 
 class Pause(_Strict):
-    before_turn: int = Field(ge=2, description="The pause runs before this turn (1 is the first)")
-    seconds: float = Field(gt=0)
+    # Strict, like turn_limit: lax mode would read "3" or 3.0 as turn 3.
+    before_turn: int = Field(
+        ge=2, strict=True, description="The pause runs before this turn (1 is the first)"
+    )
+    # A pause of inf seconds would never end. Strict: lax mode would read true as 1.
+    seconds: float = Field(gt=0, allow_inf_nan=False, strict=True)
 
 
 class TaskMetadata(_Strict):
     facts: str = Field(min_length=1)
     hidden_steps: list[str] = Field(default_factory=list)
     pauses: list[Pause] = Field(default_factory=list)
-    turn_limit: int | None = Field(default=None, ge=1)
+    # Strict: lax mode would read true as a turn limit of 1.
+    turn_limit: int | None = Field(default=None, ge=1, strict=True)
     tags: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
