@@ -93,6 +93,18 @@ def silence_langwatch() -> None:
         reporter.addFilter(_DropLangWatchApiKeyWarning())
 
 
+def keep_runs_off_langwatch() -> None:
+    """Remove every casing of ``LANGWATCH_API_KEY`` from ``os.environ`` before
+    Scenario starts. With a key, Scenario posts every run event, transcripts
+    included, to LangWatch and exports its spans there; the harness records
+    runs only to Langfuse. Scenario has no setting that turns either off, skips
+    both when it finds no key, and reads the key ignoring case. Configs still
+    resolve ``${LANGWATCH_API_KEY}`` from the copy ``main`` takes first."""
+    for name in list(os.environ):
+        if name.upper() == "LANGWATCH_API_KEY":
+            del os.environ[name]
+
+
 def _terminate(signum, frame):
     # Raising here unwinds the run, so the container is removed on the way out.
     raise SystemExit(EXIT_TERMINATED)
@@ -175,9 +187,11 @@ def main(
 
     signal.signal(signal.SIGTERM, _terminate)
     silence_langwatch()
+    environ = dict(os.environ)
+    keep_runs_off_langwatch()
 
     try:
-        summary = run(args.config, os.environ, docker_client_factory=docker_client_factory)
+        summary = run(args.config, environ, docker_client_factory=docker_client_factory)
     except (SettingsError, ConfigError, TaskError, DatasetError) as exc:
         return _fail(EXIT_NOT_STARTED, f"Run not started: {exc}")
     except RunnerStartError as exc:

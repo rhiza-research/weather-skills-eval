@@ -6,6 +6,8 @@ Measures what a change to weather-skills-chat (model, prompt, code, skills, sett
 
 The harness talks to the app only over HTTP and Docker. Fetches use live data.
 
+The harness never sends run data to LangWatch. Before Scenario starts, `run` removes every casing of `LANGWATCH_API_KEY` from the harness's environment, so Scenario neither posts its run events nor exports its spans to LangWatch. A configuration still resolves `${LANGWATCH_API_KEY}` from the harness's environment.
+
 ## Running
 
 Everything runs in Docker.

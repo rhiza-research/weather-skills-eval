@@ -1,7 +1,9 @@
 import asyncio
+import contextlib
 import io
 import json
 import logging
+import os
 import types
 import uuid
 import warnings
@@ -9,6 +11,7 @@ from pathlib import Path
 
 import docker.errors
 import httpx
+import langwatch.state
 import litellm
 import pytest
 import scenario
@@ -22,9 +25,14 @@ from fakes import (
 )
 from langfuse import Langfuse
 from langfuse.api.core.api_error import ApiError as LangfuseApiError
+from langwatch.client import Client as LangWatchClient
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SpanExportResult
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from scenario import AgentAdapter, AgentInput, AgentRole, ScenarioResult
+from scenario._tracing import _reset_tracing_for_tests, judge_span_collector
 
 from weather_skills_eval import cli
 from weather_skills_eval import instance as instance_module
@@ -925,6 +933,137 @@ def test_the_langwatch_banner_is_not_printed(monkeypatch, capsys):
     cli.silence_langwatch()
     EventAlertMessageLogger().handle_greeting()
     assert "LangWatch API key not configured" not in capsys.readouterr().out
+
+
+def record_langwatch_traffic(monkeypatch) -> tuple[list[str], list[str]]:
+    """Records the URLs Scenario posts and the OTLP exporters it builds, with
+    neither reaching the network."""
+    posts: list[str] = []
+    exporters: list[str] = []
+
+    async def record_post(self, url, **kwargs):
+        posts.append(str(url))
+        return httpx.Response(200, json={}, request=httpx.Request("POST", url))
+
+    build_exporter = OTLPSpanExporter.__init__
+
+    def record_exporter(self, *args, **kwargs):
+        exporters.append(str(kwargs.get("endpoint")))
+        build_exporter(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", record_post)
+    monkeypatch.setattr(OTLPSpanExporter, "__init__", record_exporter)
+    monkeypatch.setattr(OTLPSpanExporter, "export", lambda self, spans: SpanExportResult.SUCCESS)
+    return posts, exporters
+
+
+@contextlib.contextmanager
+def fresh_scenario_tracing():
+    """Makes the next Scenario run set up its tracing again, and yields the span
+    processors that run attaches; they are detached afterwards."""
+    provider = trace.get_tracer_provider()
+    if not isinstance(provider, TracerProvider):
+        trace.set_tracer_provider(TracerProvider())
+        provider = trace.get_tracer_provider()
+    processors = provider._active_span_processor
+    before = processors._span_processors
+    _reset_tracing_for_tests()
+    attached: list = []
+    try:
+        yield attached
+    finally:
+        attached.extend(p for p in processors._span_processors if p not in before)
+        processors._span_processors = before
+        for processor in attached:
+            if processor is not judge_span_collector:
+                processor.shutdown()
+
+
+def play_one_scenario() -> None:
+    asyncio.run(
+        scenario.arun(
+            name="t",
+            description="d",
+            agents=[DoneAssistant(), OneQuestionUser()],
+            max_turns=3,
+            verbose=False,
+        )
+    )
+
+
+def isolate_langwatch_client(monkeypatch) -> None:
+    """With a key in the environment, ``langwatch.trace`` sets up the LangWatch
+    client, whose class state (the key among it) outlives the test; this
+    restores it afterwards."""
+    for name in (
+        "_instance",
+        "_debug",
+        "_api_key",
+        "_project_id",
+        "_endpoint_url",
+        "_base_attributes",
+        "_instrumentors",
+        "_disable_sending",
+        "_flush_on_exit",
+        "_span_exclude_rules",
+        "_ignore_global_tracer_provider_override_warning",
+        "_skip_open_telemetry_setup",
+        "_tracer_provider",
+        "_is_dedicated_provider",
+        "_exporter_attached_providers",
+        "_langwatch_processor",
+        "_rest_api_client",
+        "_registered_instrumentors",
+        "_prompts_path",
+    ):
+        value = getattr(LangWatchClient, name)
+        if isinstance(value, (set, dict, list)):
+            value = value.copy()
+        monkeypatch.setattr(LangWatchClient, name, value)
+    monkeypatch.setattr(langwatch.state, "__instance", langwatch.state.get_instance())
+
+
+def test_scenario_with_a_langwatch_key_posts_events_and_exports_spans(monkeypatch):
+    # The control for the test below: the patches see what a key turns on.
+    isolate_langwatch_client(monkeypatch)
+    posts, exporters = record_langwatch_traffic(monkeypatch)
+    monkeypatch.setenv("LANGWATCH_API_KEY", "lw-test")
+    with fresh_scenario_tracing() as attached:
+        play_one_scenario()
+    assert any(url.endswith("/api/scenario-events") for url in posts)
+    assert [e for e in exporters if "langwatch" in e]
+    assert [p for p in attached if p is not judge_span_collector]
+
+
+def test_cli_main_keeps_scenario_off_langwatch_when_a_key_is_set(monkeypatch):
+    posts, exporters = record_langwatch_traffic(monkeypatch)
+    monkeypatch.setenv("LANGWATCH_API_KEY", "lw-test")
+    monkeypatch.setenv("langwatch_api_key", "lw-lower")
+    seen = {}
+
+    def play_and_resolve(path, environ, **kwargs):
+        seen["os.environ"] = [n for n in os.environ if n.upper() == "LANGWATCH_API_KEY"]
+        # A configuration still resolves the key from the harness's environment.
+        config = parse({"LANGWATCH_API_KEY": "${LANGWATCH_API_KEY}"}, {**ENVIRON, **environ})
+        seen["config"] = config.env["LANGWATCH_API_KEY"]
+        play_one_scenario()
+        return RunSummary(
+            experiment_name="cfg",
+            run_name="cfg - run",
+            experiment_url=None,
+            items=1,
+            goals_reached=1,
+            metadata={},
+            runner_lost=[],
+        )
+
+    monkeypatch.setattr(cli, "run", play_and_resolve)
+    with fresh_scenario_tracing() as attached:
+        assert cli.main(["run", "configs/example.yaml"]) == 0
+    assert seen == {"os.environ": [], "config": "lw-test"}
+    assert posts == []
+    assert exporters == []
+    assert all(p is judge_span_collector for p in attached)
 
 
 def test_sigterm_handler_unwinds_with_exit_code_143():
