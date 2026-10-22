@@ -210,7 +210,8 @@ def main(
     except Exception as exc:
         return _fail(EXIT_FAILED, f"Run failed: {type(exc).__name__}: {exc}")
 
-    print(f"Experiment {summary.experiment_name}, run {summary.run_name}")
+    config_name = summary.metadata["config_name"]
+    print(f"Experiment {summary.experiment_name} ({config_name}), run {summary.run_name}")
     print(f"Goal reached on {summary.goals_reached} of {summary.items} tasks")
     if summary.runner_lost:
         lost = len(summary.runner_lost)

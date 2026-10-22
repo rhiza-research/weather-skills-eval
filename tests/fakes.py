@@ -829,6 +829,12 @@ class FakeGateway:
         self.observations = lambda chat_id, turns: (app_observations(chat_id, turns), True)
         self.dataset_error: Exception | None = None
         self.dataset_metadata: object = None
+        # The base model of each served-model request. ``served`` is the model
+        # OpenRouter answers with, the requested one when None;
+        # ``served_error`` is raised instead.
+        self.served_requests: list[str] = []
+        self.served: str | None = None
+        self.served_error: Exception | None = None
 
     def dataset(self, name: str):
         if self.dataset_error:
@@ -852,6 +858,12 @@ class FakeGateway:
         }
         self.experiments.append(experiment)
         return SimpleNamespace(run_name=f"{name} - run", experiment_url=None, item_results=results)
+
+    def served_model(self, model: str) -> str:
+        self.served_requests.append(model)
+        if self.served_error:
+            raise self.served_error
+        return self.served or model
 
     def traced_completion(self, role, session_id, **kwargs):
         return self.models(role, session_id, **kwargs)

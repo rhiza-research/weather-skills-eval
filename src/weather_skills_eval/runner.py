@@ -9,7 +9,8 @@ Order of a run:
    image, start the runner container and its volume, then the app
    container, and wait for /health.
 4. Read the resolved configuration from the app (the catalog model's base
-   model, tools, skill pack commits).
+   model, tools, skill pack commits), and ask OpenRouter which model answers
+   for that base model; the experiment is named after it.
 5. Run the experiment: each item's task waits for the runner to be running
    (Docker restarts one that died), plays the task and returns its scores,
    which the evaluator records on the item. A runner that Docker restarted,
@@ -207,8 +208,10 @@ def _run(
                 await app.aclose()
 
         tool_ids, packs, model = asyncio.run(read_resolved())
+        served_model = gateway.served_model(model)
         metadata = {
             "config_name": config.name,
+            "served_model": served_model,
             "image": config.image,
             "image_digest": instance.image_digest or "",
             "image_id": instance.image_id or "",
@@ -304,7 +307,7 @@ def _run(
         try:
             result = gateway.run_experiment(
                 dataset=dataset,
-                name=config.name,
+                name=served_model,
                 description=model,
                 task=task_fn,
                 metadata=metadata,
@@ -323,7 +326,7 @@ def _run(
 
     outputs = [r.output or {} for r in result.item_results]
     return RunSummary(
-        experiment_name=config.name,
+        experiment_name=served_model,
         run_name=result.run_name,
         experiment_url=result.experiment_url,
         items=len(result.item_results),

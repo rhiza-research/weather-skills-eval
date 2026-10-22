@@ -1,9 +1,9 @@
-name: gpt-agent
+name: ling-3.1-flash-agent
 image: ${APP_IMAGE}
 runner_image: ${RUNNER_IMAGE}
 # false runs the image already on the Docker host instead of pulling it.
 pull: false
-model: weather-agent-gpt
+model: weather-agent-ling-3.1-flash
 dataset: weather-eval-tasks
 env:
   WEBUI_SECRET_KEY: ${APP_WEBUI_SECRET_KEY}
@@ -19,14 +19,14 @@ env:
       model_call_tracing: openrouter
 
   CATALOG_MODELS:
-    - id: weather-agent-gpt
-      name: "Weather Agent GPT"
-      base_model_id: "open-router-.openai/gpt-5.5"
+    - id: weather-agent-ling-3.1-flash
+      name: "Weather Agent Ling 3.1 Flash"
+      base_model_id: "open-router-.inclusionai/ling-3.1-flash"
       meta:
         profile_image_url: /static/favicon.png
-        description: "The primary chat for weather skills. Backed by GPT"
+        description: "The primary chat for weather skills. Backed by Ling 3.1 Flash"
         capabilities:
-          vision: true
+          vision: false
           usage: false
           citations: true
         suggestion_prompts: null

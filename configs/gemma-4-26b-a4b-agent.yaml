@@ -1,9 +1,9 @@
-name: gemma-agent
+name: gemma-4-26b-a4b-agent
 image: ${APP_IMAGE}
 runner_image: ${RUNNER_IMAGE}
 # false runs the image already on the Docker host instead of pulling it.
 pull: false
-model: weather-agent-gemma
+model: weather-agent-gemma-4-26b-a4b
 dataset: weather-eval-tasks
 env:
   WEBUI_SECRET_KEY: ${APP_WEBUI_SECRET_KEY}
@@ -19,7 +19,7 @@ env:
       model_call_tracing: openrouter
 
   CATALOG_MODELS:
-    - id: weather-agent-gemma
+    - id: weather-agent-gemma-4-26b-a4b
       name: "Weather Agent Gemma"
       base_model_id: "open-router-.google/gemma-4-26b-a4b-it"
       meta:

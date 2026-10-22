@@ -1,9 +1,9 @@
-name: gpt-luna-agent
+name: opus-agent
 image: ${APP_IMAGE}
 runner_image: ${RUNNER_IMAGE}
 # false runs the image already on the Docker host instead of pulling it.
 pull: false
-model: weather-agent-gpt-luna
+model: weather-agent-opus
 dataset: weather-eval-tasks
 env:
   WEBUI_SECRET_KEY: ${APP_WEBUI_SECRET_KEY}
@@ -19,12 +19,12 @@ env:
       model_call_tracing: openrouter
 
   CATALOG_MODELS:
-    - id: weather-agent-gpt-luna
-      name: "Weather Agent GPT-6 Luna"
-      base_model_id: "open-router-.openai/gpt-6-luna"
+    - id: weather-agent-opus
+      name: "Weather Agent Opus"
+      base_model_id: "open-router-.~anthropic/claude-opus-latest"
       meta:
         profile_image_url: /static/favicon.png
-        description: "The primary chat for weather skills. Backed by GPT-6 Luna"
+        description: "The primary chat for weather skills. Backed by Claude Opus"
         capabilities:
           vision: true
           usage: false

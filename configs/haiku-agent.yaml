@@ -21,7 +21,7 @@ env:
   CATALOG_MODELS:
     - id: weather-agent-haiku
       name: "Weather Agent Haiku"
-      base_model_id: "open-router-.anthropic/claude-haiku-5.5"
+      base_model_id: "open-router-.~anthropic/claude-haiku-latest"
       meta:
         profile_image_url: /static/favicon.png
         description: "The primary chat for weather skills. Backed by Claude Haiku"

@@ -1,9 +1,9 @@
-name: prod-agent
+name: glm-5.3-flash-agent
 image: ${APP_IMAGE}
 runner_image: ${RUNNER_IMAGE}
 # false runs the image already on the Docker host instead of pulling it.
 pull: false
-model: weather-agent
+model: weather-agent-glm-5.3-flash
 dataset: weather-eval-tasks
 env:
   WEBUI_SECRET_KEY: ${APP_WEBUI_SECRET_KEY}
@@ -19,12 +19,12 @@ env:
       model_call_tracing: openrouter
 
   CATALOG_MODELS:
-    - id: weather-agent
-      name: "Weather Agent"
-      base_model_id: "open-router-.~anthropic/claude-opus-latest"
+    - id: weather-agent-glm-5.3-flash
+      name: "Weather Agent GLM 5.3 Flash"
+      base_model_id: "open-router-.z-ai/glm-5.3-flash"
       meta:
         profile_image_url: /static/favicon.png
-        description: "The primary chat for weather skills. Backed by Claude"
+        description: "The primary chat for weather skills. Backed by GLM 5.3 Flash"
         capabilities:
           vision: true
           usage: false
@@ -34,6 +34,8 @@ env:
       params:
         stream_response: true
         function_calling: native
+        provider:
+          quantizations: ["fp8"]
         system: |-
           You are an agent helping forecasters, agricultural researchers, and data scientists fetch, transform, and visualize forecast and observational data. Prefer the installed weather skills for every fetch, transform, and plot so users can trust the output. Discover the skills you actually have and follow each skill's own description. Do not interpret results unless the user explicitly asks; display the artifacts (plots, paths, numbers) and stop.
 

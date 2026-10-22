@@ -12,6 +12,9 @@ reads the app's traces from the project its own keys belong to.
 - The simulated user's and the judge's model calls: each call is its own
   trace, with user id ``simulated-user`` or ``judge``, session id = the chat
   id, in the harness's Langfuse environment.
+- Not Langfuse: the one request that finds which model OpenRouter serves for
+  the base model (``served_model``), made before the experiment it names and
+  not traced.
 - The app's traces: one per chat turn, named ``weather-skills-chat``, with
   session id = the chat id. They are read back through the observations API
   once they stop changing.
@@ -57,6 +60,8 @@ DELETE_BATCH_SIZE = 1000
 # The experiments API needs a lower bound on start time; the epoch finds an
 # experiment of any age.
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+# The served-model request needs only the model named in the reply.
+SERVED_MODEL_MAX_TOKENS = 16
 
 
 class TraceReadError(Exception):
@@ -231,6 +236,25 @@ class LangfuseGateway:
             max_concurrency=concurrency,
             metadata=metadata,
         )
+
+    def served_model(self, model: str) -> str:
+        """The model OpenRouter answers ``model`` with, from one short request
+        with the harness's own key. An alias such as
+        ``~anthropic/claude-opus-latest`` resolves only when a request is made,
+        to the model it points to. The request is not traced."""
+        response = litellm.completion(
+            model=f"openrouter/{model}",
+            messages=[{"role": "user", "content": "Reply with OK."}],
+            max_tokens=SERVED_MODEL_MAX_TOKENS,
+            num_retries=self._model_retries,
+        )
+        served = (getattr(response, "model", None) or "").strip().removeprefix("openrouter/")
+        if not served:
+            raise ModelReplyError(f"OpenRouter named no model in its reply for {model}")
+        # An alias name back means the reply did not say what it resolved to.
+        if served.startswith("~"):
+            raise ModelReplyError(f"OpenRouter's reply for {model} names the alias {served}")
+        return served
 
     def link_item_to_chat(self, chat_id: str) -> None:
         """Give the current experiment item's trace the chat id as its session.

@@ -229,7 +229,12 @@ def test_run_plays_every_task_into_one_experiment_and_removes_the_container(tmp_
     assert harness.docker.volume().removed
     assert len(harness.gateway.experiments) == 1
     experiment = harness.gateway.experiments[0]
-    assert experiment["name"] == "production-agent"
+    # Named after the model OpenRouter answers the base model with.
+    assert harness.gateway.served_requests == ["anthropic/claude-haiku-5.5"]
+    assert experiment["name"] == "anthropic/claude-haiku-5.5"
+    assert experiment["metadata"]["served_model"] == "anthropic/claude-haiku-5.5"
+    assert experiment["metadata"]["config_name"] == "production-agent"
+    assert summary.experiment_name == "anthropic/claude-haiku-5.5"
     assert len(experiment["items"]) == 3
     for index in range(3):
         assert harness.scores(index)["goal_reached"] == 1.0
@@ -287,8 +292,40 @@ def test_config_read_from_stdin(tmp_path):
 
     harness.run(config_path=Path("-"), stdin=io.BytesIO(CONFIG.encode()))
 
-    assert harness.gateway.experiments[0]["name"] == "production-agent"
+    assert harness.gateway.experiments[0]["metadata"]["config_name"] == "production-agent"
     assert harness.scores()["goal_reached"] == 1.0
+
+
+def test_an_alias_names_the_experiment_after_the_model_it_points_to(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.app.base_model_id = "open-router-.~anthropic/claude-opus-latest"
+    harness.gateway.served = "anthropic/claude-opus-5.5"
+
+    summary = harness.run()
+
+    assert harness.gateway.served_requests == ["~anthropic/claude-opus-latest"]
+    experiment = harness.gateway.experiments[0]
+    assert experiment["name"] == "anthropic/claude-opus-5.5"
+    assert experiment["description"] == "~anthropic/claude-opus-latest"
+    assert experiment["metadata"]["model"] == "~anthropic/claude-opus-latest"
+    assert experiment["metadata"]["served_model"] == "anthropic/claude-opus-5.5"
+    assert summary.experiment_name == "anthropic/claude-opus-5.5"
+
+
+def test_a_failed_served_model_request_stops_the_run_before_the_experiment(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.gateway.served_error = ModelReplyError("OpenRouter named no model in its reply")
+
+    with pytest.raises(ModelReplyError, match="named no model"):
+        harness.run()
+
+    assert harness.gateway.experiments == []
+    assert harness.app.chats == {}
+    assert harness.container.removed
+    assert harness.docker.runner.removed
+    assert harness.docker.volume().removed
 
 
 def test_image_reference_is_pulled_and_recorded_resolved(tmp_path):

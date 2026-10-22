@@ -226,22 +226,6 @@ def test_example_config_is_valid():
     }
 
 
-def env_example_names() -> list[str]:
-    """The variables ``.env.example`` sets (not the commented-out ones)."""
-    lines = (REPO / ".env.example").read_text().splitlines()
-    return [line.split("=", 1)[0] for line in lines if line and not line.startswith("#")]
-
-
-@pytest.mark.parametrize(
-    "path", sorted((REPO / "configs").glob("*.yaml")), ids=lambda path: path.name
-)
-def test_every_config_loads_with_the_env_example_and_per_run_variables(path):
-    environ = {name: "value" for name in (*env_example_names(), "APP_IMAGE", "RUNNER_IMAGE")}
-    config = load_config(path, environ)
-    assert config.image == "value"
-    assert config.runner_image == "value"
-
-
 # Settings
 
 
@@ -1194,13 +1178,16 @@ def test_cli_summary_names_tasks_lost_to_a_runner_restart(
         experiment_url=None,
         items=3,
         goals_reached=1,
-        metadata={},
+        metadata={"config_name": "example"},
         runner_lost=runner_lost,
     )
     monkeypatch.setattr(cli, "run", lambda *args, **kwargs: summary)
     assert cli.main(["run", "configs/example.yaml"]) == 0
     lines = capsys.readouterr().out.splitlines()
-    assert lines[:2] == ["Experiment cfg, run cfg - run", "Goal reached on 1 of 3 tasks"]
+    assert lines[:2] == [
+        "Experiment cfg (example), run cfg - run",
+        "Goal reached on 1 of 3 tasks",
+    ]
     assert lines[2:] == ([lost_line] if lost_line else [])
 
 

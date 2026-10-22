@@ -791,6 +791,48 @@ def test_a_reply_cut_off_at_max_tokens_is_named(monkeypatch):
         )
 
 
+def test_served_model_is_the_model_openrouter_names_in_its_reply(monkeypatch):
+    gateway = gateway_for(real_client(InMemorySpanExporter()), model_retries=3)
+    calls = []
+
+    def completion(**kwargs):
+        calls.append(kwargs)
+        return litellm.ModelResponse(
+            model="openrouter/anthropic/claude-opus-5.5",
+            choices=[{"message": {"role": "assistant", "content": "OK"}}],
+        )
+
+    monkeypatch.setattr(litellm, "completion", completion)
+
+    assert gateway.served_model("~anthropic/claude-opus-latest") == "anthropic/claude-opus-5.5"
+    [sent] = calls
+    assert sent["model"] == "openrouter/~anthropic/claude-opus-latest"
+    assert sent["max_tokens"] == 16
+    assert sent["num_retries"] == 3
+
+
+def test_a_reply_that_names_no_model_is_an_error(monkeypatch):
+    gateway = gateway_for(real_client(InMemorySpanExporter()))
+    reply = litellm.ModelResponse(choices=[{"message": {"role": "assistant", "content": "OK"}}])
+    reply.model = None
+    monkeypatch.setattr(litellm, "completion", lambda **kwargs: reply)
+
+    with pytest.raises(ModelReplyError, match="named no model in its reply for m"):
+        gateway.served_model("m")
+
+
+def test_a_reply_that_names_the_alias_is_an_error(monkeypatch):
+    gateway = gateway_for(real_client(InMemorySpanExporter()))
+    reply = litellm.ModelResponse(
+        model="openrouter/~anthropic/claude-opus-latest",
+        choices=[{"message": {"role": "assistant", "content": "OK"}}],
+    )
+    monkeypatch.setattr(litellm, "completion", lambda **kwargs: reply)
+
+    with pytest.raises(ModelReplyError, match="names the alias ~anthropic/claude-opus-latest"):
+        gateway.served_model("~anthropic/claude-opus-latest")
+
+
 def _completion_kwargs(monkeypatch, gateway, **kwargs) -> dict:
     calls = []
 
