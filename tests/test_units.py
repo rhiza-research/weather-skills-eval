@@ -307,6 +307,20 @@ def test_simulated_user_prompt_reveals_the_next_step_when_stuck_or_past_it_and_s
     assert "only mention one when the assistant is stuck" not in prompt
 
 
+def test_simulated_user_prompt_answers_only_what_is_asked_and_checks_plans():
+    prompt = SYSTEM_PROMPT.replace("\n", " ")
+    # After the facts instruction, and in the comparison paragraph.
+    assert (
+        "{facts}  Answer only what the assistant asked. Raise another fact only when a result "
+        "lacks it or contradicts it.  Hidden steps."
+    ) in prompt
+    assert (
+        "ask for the fix, the way a busy person would. When the assistant proposes a plan, "
+        "check it against what you asked for and your facts before agreeing, the same way you "
+        "check results.  You are done"
+    ) in prompt
+
+
 def test_max_turns_defaults_to_20():
     assert load_settings(settings_env()).max_turns == 20
     assert load_settings(settings_env(EVAL_MAX_TURNS="50")).max_turns == 50

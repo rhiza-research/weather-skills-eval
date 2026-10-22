@@ -12,8 +12,13 @@ one. The runner has the Docker restart policy ``on-failure``, so a runner
 that dies is restarted, and the harness waits for it to be running again
 before each task. The app gets the emulator settings and a bind token
 generated for the run; the runner gets the same token. One Docker volume per run is mounted at
-the app's data directory and at ``/data`` in the runner, so the files a skill
-writes land in the chat's artifacts folder that the app reads.
+the app's data directory; the runner mounts only its ``artifacts`` folder, at
+``/data/artifacts``, so the files a skill writes land in the chat's artifacts
+folder that the app reads, and a skill cannot read the app's database or
+uploads. The harness creates that folder on the empty volume first, through a
+container of the app image, never started, with the volume at the app's data
+directory, so the volume is filled from the app image as the app's own mount
+would fill it.
 
 By default the app image is pulled before every run, so a stale local tag
 never runs. With ``pull`` off, the app image already on the Docker host is
@@ -43,6 +48,7 @@ from collections.abc import Callable
 import docker.errors
 import httpx
 import requests.exceptions
+from docker.types import Mount
 
 log = logging.getLogger(__name__)
 
@@ -54,12 +60,16 @@ LABEL = "weather-skills-eval"
 LABEL_VALUE = "app"
 RUNNER_LABEL_VALUE = "runner"
 EMULATOR_LABEL_VALUE = "emulator"
+VOLUME_SETUP_LABEL_VALUE = "volume-setup"
 VOLUME_LABEL_VALUE = "data"
 RUN_LABEL = "weather-skills-eval.run"
 
-# Where the volume is mounted: the app's data directory, and the runner's.
+# The app mounts the whole volume at its data directory. The runner mounts
+# only the volume's artifacts folder, at the path its emulator reads as
+# ARTIFACTS_DIR, so it sees the chat files and nothing else, as on the cluster.
 APP_DATA_DIR = "/app/backend/data"
-RUNNER_DATA_DIR = "/data"
+ARTIFACTS_SUBPATH = "artifacts"
+RUNNER_ARTIFACTS_DIR = "/data/artifacts"
 # Where the app image ships the emulator, and where the runner gets it.
 APP_EMULATOR_DIR = "/app/sandbox/emulator"
 EMULATOR_FILES = ("emulator.py", "local_runtime.py")
@@ -111,13 +121,15 @@ def repository_of(ref: str) -> str:
     return f"{head}/{last}" if head else last
 
 
-def _archive(files: dict[str, bytes]) -> bytes:
-    """A tar of ``files`` (absolute paths) with their parent directories, to
-    extract at ``/``."""
+def _archive(files: dict[str, bytes], folders: tuple[str, ...] = ()) -> bytes:
+    """A tar of ``files`` and ``folders`` with their parent directories; their
+    paths are taken relative to where it is extracted (a leading ``/`` is
+    dropped)."""
     directories: set[str] = set()
-    for path in files:
-        parents = path.strip("/").split("/")[:-1]
-        directories.update("/".join(parents[: i + 1]) for i in range(len(parents)))
+    chains = [path.strip("/").split("/")[:-1] for path in files]
+    chains += [folder.strip("/").split("/") for folder in folders]
+    for parts in chains:
+        directories.update("/".join(parts[: i + 1]) for i in range(len(parts)))
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as tar:
         for directory in sorted(directories):
@@ -175,6 +187,7 @@ class AppInstance:
         self.name = f"weather-skills-eval-app-{self.run_id}"
         self.runner_name = f"weather-skills-eval-runner-{self.run_id}"
         self.emulator_source_name = f"weather-skills-eval-emulator-{self.run_id}"
+        self.volume_setup_name = f"weather-skills-eval-volume-setup-{self.run_id}"
         self.volume_name = f"weather-skills-eval-data-{self.run_id}"
         self._bind_token = secrets.token_hex(32)
         self.container = None
@@ -205,7 +218,7 @@ class AppInstance:
     @property
     def runner_env(self) -> dict[str, str]:
         return {
-            "ARTIFACTS_DIR": f"{RUNNER_DATA_DIR}/artifacts",
+            "ARTIFACTS_DIR": RUNNER_ARTIFACTS_DIR,
             "SKILL_K8S_EMULATOR_HOST": self.runner_name,
             "SKILL_K8S_EMULATOR_API_PORT": EMULATOR_API_PORT,
             "SKILL_K8S_BIND_PORT": EMULATOR_BIND_PORT,
@@ -298,11 +311,31 @@ class AppInstance:
         except Exception as exc:  # the logs are a diagnostic; never mask the start error
             return f"<logs unavailable: {exc}>"
 
-    def _start_runner(self, image, files: dict[str, bytes]) -> None:
+    def _create_artifacts_folder(self, app_image) -> None:
+        """Create the artifacts folder on the new, empty volume before the
+        runner mounts it as a subpath: copied into a container of the app
+        image that has the whole volume at the app's data directory, is never
+        started, and is removed at once. As the volume's first mount, it
+        fills the volume from the app image's data directory, as the app's
+        own mount did before."""
+        setup = self._docker.containers.create(
+            app_image.id,
+            name=self.volume_setup_name,
+            labels=self._labels(VOLUME_SETUP_LABEL_VALUE),
+            volumes={self.volume_name: {"bind": APP_DATA_DIR, "mode": "rw"}},
+        )
+        try:
+            if not setup.put_archive(APP_DATA_DIR, _archive({}, (ARTIFACTS_SUBPATH,))):
+                raise RunnerStartError("The artifacts folder could not be created on the volume")
+        finally:
+            self._remove_container(self.volume_setup_name, "volume setup")
+
+    def _start_runner(self, image, app_image, files: dict[str, bytes]) -> None:
         try:
             self._docker.volumes.create(
                 name=self.volume_name, labels=self._labels(VOLUME_LABEL_VALUE)
             )
+            self._create_artifacts_folder(app_image)
             self.runner = self._docker.containers.create(
                 image.id,
                 command=["python3", "-u", f"{EMULATOR_DIR}/emulator.py"],
@@ -311,7 +344,14 @@ class AppInstance:
                 environment=self.runner_env,
                 network=self._network,
                 labels=self._labels(RUNNER_LABEL_VALUE),
-                volumes={self.volume_name: {"bind": RUNNER_DATA_DIR, "mode": "rw"}},
+                mounts=[
+                    Mount(
+                        target=RUNNER_ARTIFACTS_DIR,
+                        source=self.volume_name,
+                        type="volume",
+                        subpath=ARTIFACTS_SUBPATH,
+                    )
+                ],
                 # Docker restarts a runner that dies, as the cluster replaces a dead runner pod.
                 restart_policy={"Name": "on-failure"},
             )
@@ -440,13 +480,14 @@ class AppInstance:
             log.error("Could not remove %s container %s: %s", what, name, exc)
 
     def remove(self) -> None:
-        """Remove this run's emulator source, app container, runner container
-        and volume by name, in that order, since a volume in use cannot be
-        removed. Never
+        """Remove this run's emulator source, volume setup, app container,
+        runner container and volume by name, in that order, since a volume in
+        use cannot be removed. Never
         raises: a cleanup error must not replace the error that ended the run."""
         self.container = None
         self.runner = None
         self._remove_container(self.emulator_source_name, "emulator source")
+        self._remove_container(self.volume_setup_name, "volume setup")
         self._remove_container(self.name, "app")
         self._remove_container(self.runner_name, "runner")
         try:
@@ -468,7 +509,7 @@ class AppInstance:
                 self._runner_image_ref, RunnerStartError, "Runner image", True
             )
             self.runner_image_id = runner_image.id
-            self._start_runner(runner_image, files)
+            self._start_runner(runner_image, image, files)
             self.container = self._docker.containers.run(
                 image.id,
                 detach=True,

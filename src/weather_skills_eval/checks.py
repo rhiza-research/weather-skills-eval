@@ -7,7 +7,9 @@ text in single backticks in its text, outside fenced code blocks, that is
 exactly the path of a listed entry other than a folder; backtick text that
 is not such a path presents nothing. Text inside tool-call and reasoning
 blocks presents nothing. A path named only in backticks never blocks the
-judge: its problems are notes. The simulated user is shown the files of the
+judge: its problems are notes, and the judge is told it was named in passing
+and not presented, unless it is of a kind the task needs and no file of that
+kind was presented outright. The simulated user is shown the files of the
 latest reply that presents any; the judge rules on every file presented
 during the play, one per path. Each one's kind and provenance come from its
 entry in the chat's file listing: the app reads the
@@ -21,7 +23,7 @@ import json
 import mimetypes
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 from urllib.parse import unquote
 
@@ -147,6 +149,11 @@ def _is_folder(entry: dict) -> bool:
     )
 
 
+def _definite(replies: list[ReplyFiles]) -> set[str]:
+    """The paths some reply names other than in backticks."""
+    return {p for reply in replies for p in reply.paths if p not in reply.candidates}
+
+
 def _resolve(
     replies: list[ReplyFiles], entries: dict[str, dict], every: bool
 ) -> tuple[list[str], dict[str, int], set[str]]:
@@ -154,9 +161,11 @@ def _resolve(
     the blocking ones: the files of the latest reply that presents any,
     except paths no reply names other than in backticks. With ``every``,
     the paths are every presented path, each at its latest presentation;
-    without, only that reply's."""
+    without, only that reply's. A path some reply names other than in
+    backticks keeps the turn of its latest such reply: a later backtick
+    mention does not move it."""
     listed = {path for path, entry in entries.items() if not _is_folder(entry)}
-    definite = {p for reply in replies for p in reply.paths if p not in reply.candidates}
+    definite = _definite(replies)
     latest: list[str] = []
     turns: dict[str, int] = {}
     for reply in replies:
@@ -165,6 +174,8 @@ def _resolve(
             continue
         latest = found
         for path in found:
+            if path in definite and path in reply.candidates and path in turns:
+                continue
             # Moved to the end: the latest presentation of a path wins.
             turns.pop(path, None)
             turns[path] = reply.turn
@@ -199,6 +210,10 @@ class PresentedFile:
     note: str | None = None
     # A listed image whose download failed.
     download_failed: bool = False
+    # No reply names the path other than in backticks, and a file of its kind
+    # was presented outright or the task does not need its kind: the judge is
+    # told it was named in passing and not presented.
+    named_in_passing: bool = False
 
     @property
     def media_type(self) -> str:
@@ -337,12 +352,14 @@ async def collect_evidence(
     if not presented:
         return Evidence(problem=NOTHING_PRESENTED, unlisted_candidates=unlisted_candidates)
     kinds = {p: entries[p].get("kind") for p in presented if p in entries}
+    definite = _definite(replies)
     files, missing, unproven = [], [], []
     unreadable, read_failed = None, False
     for path in presented:
         turn = turns[path]
         entry = entries.get(path)
         if entry is None:
+            # Unlisted, so some reply names it other than in backticks.
             if path in blocks:
                 missing.append(path)
             else:
@@ -387,8 +404,18 @@ async def collect_evidence(
                 turn=turn,
                 note="; ".join(notes) or None,
                 download_failed=download_failed,
+                named_in_passing=path not in definite,
             )
         )
+    # Files named in passing count as presented when they are the only files
+    # of a kind the task needs: no file of that kind was presented outright.
+    outright = {file.kind for file in files if not file.named_in_passing}
+    files = [
+        replace(file, named_in_passing=False)
+        if file.named_in_passing and file.kind in deliverables and file.kind not in outright
+        else file
+        for file in files
+    ]
 
     if missing:
         problem = f"Presented files are not in the chat's files: {missing}"

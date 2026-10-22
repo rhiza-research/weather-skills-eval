@@ -11,6 +11,7 @@ import types
 import uuid
 import warnings
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 import docker.errors
@@ -523,6 +524,44 @@ def test_a_path_named_only_in_backticks_never_blocks_the_judge():
     assert notes["out.zarr"] is None
     assert notes["era5_kenya.zarr"] == "it has no provenance"
     assert notes["maps/input.png"].startswith("it could not be read:")
+    # Two zarr stores: the one named only in backticks is not the only file of its kind.
+    assert {f.path: f.named_in_passing for f in evidence.files} == {
+        "out.zarr": False,
+        "era5_kenya.zarr": True,
+        "maps/input.png": True,
+    }
+
+
+def test_a_path_named_in_backticks_and_linked_in_another_reply_is_presented():
+    entries = [
+        {"path": "out.zarr", "kind": "zarr", "is_dir": True, "provenance_detail": PROVENANCE}
+    ]
+    app = client(lambda request: httpx.Response(200, json=entries))
+    replies = [
+        ReplyFiles(1, ["out.zarr"], frozenset({"out.zarr"})),
+        ReplyFiles(2, ["out.zarr"]),
+        ReplyFiles(3, ["out.zarr"], frozenset({"out.zarr"})),
+    ]
+    evidence = asyncio.run(collect_evidence(app, "c1", replies, [], every=True))
+    assert evidence.problem is None
+    # At the turn that linked it, not the later backtick mention.
+    assert [(f.path, f.turn, f.named_in_passing) for f in evidence.files] == [
+        ("out.zarr", 2, False)
+    ]
+
+
+def test_an_earlier_unlisted_file_is_labeled_presented():
+    entries = [
+        {"path": "final.zarr", "kind": "zarr", "is_dir": True, "provenance_detail": PROVENANCE}
+    ]
+    app = client(lambda request: httpx.Response(200, json=entries))
+    replies = [ReplyFiles(1, ["early.zarr"]), ReplyFiles(2, ["final.zarr"])]
+    evidence = asyncio.run(collect_evidence(app, "c1", replies, [], every=True))
+    assert evidence.problem is None
+    assert [(f.path, f.note, f.named_in_passing) for f in evidence.files] == [
+        ("early.zarr", "it is not in the chat's files", False),
+        ("final.zarr", None, False),
+    ]
 
 
 def test_the_same_path_named_by_a_link_in_another_reply_still_blocks():
@@ -726,6 +765,7 @@ def test_a_docker_transport_error_pulling_the_runner_image_stops_the_start(error
     "step, start_error, message",
     [
         ("volume", RunnerStartError, "Runner container could not start"),
+        ("volume-setup", RunnerStartError, "Runner container could not start"),
         ("runner-create", RunnerStartError, "Runner container could not start"),
         ("put-archive", RunnerStartError, "Runner container could not start"),
         ("runner-start", RunnerStartError, "Runner container could not start"),
@@ -741,9 +781,13 @@ def test_a_docker_transport_error_starting_a_container_stops_the_start(
         put_archive_error=error if step == "put-archive" else None,
         start_error=error if step == "runner-start" else None,
     )
+    volume_setup = FakeContainer(
+        [], name="volume-setup", put_archive_error=error if step == "volume-setup" else None
+    )
     daemon = FakeDocker(
         FakeContainer(["running"]),
         runner=runner,
+        volume_setup=volume_setup,
         volume_error=error if step == "volume" else None,
         create_error=error if step == "runner-create" else None,
         run_error=error if step == "app-run" else None,
@@ -780,6 +824,8 @@ def test_repository_of_image_references():
 
 # Judge
 
+PLAY_START = datetime(2026, 10, 22, 9, 30, tzinfo=UTC)
+
 
 def quality_reply(score):
     return litellm.ModelResponse(
@@ -801,6 +847,7 @@ def test_answer_quality_rejects_non_integer_scores(score):
             complete=lambda role, session, **kwargs: quality_reply(score),
             model="m",
             session_id="c1",
+            started=PLAY_START,
             opening="o",
             criteria=[],
             transcript="t",
@@ -818,6 +865,7 @@ def test_quality_transcript_uses_neutral_labels():
         complete=complete,
         model="m",
         session_id="c1",
+        started=PLAY_START,
         opening="o",
         criteria=[],
         transcript=neutral_transcript([("rain?", "20 mm")]),
@@ -895,6 +943,7 @@ def test_final_judge_and_quality_rating_send_8192_output_tokens(monkeypatch):
         complete=gateway.traced_completion,
         model="m",
         session_id="c1",
+        started=PLAY_START,
         opening="o",
         criteria=[],
         transcript="t",
@@ -1607,9 +1656,11 @@ class SharedDaemon:
         self.volumes = Volumes()
 
     def removed(self, instance: AppInstance) -> list[bool]:
-        """Whether the run's emulator source, app, runner and volume were removed."""
+        """Whether the run's emulator source, volume setup, app, runner and
+        volume were removed."""
         return [
             self.containers_by_name[instance.emulator_source_name].removed,
+            self.containers_by_name[instance.volume_setup_name].removed,
             self.containers_by_name[instance.name].removed,
             self.containers_by_name[instance.runner_name].removed,
             self.volumes_by_name[instance.volume_name].removed,
@@ -1638,17 +1689,18 @@ def test_concurrent_runs_on_one_daemon_do_not_interfere():
         with second:
             run_ids = {labels["weather-skills-eval.run"] for labels in daemon.labels.values()}
             assert run_ids == {first.run_id, second.run_id}
-            # Each run's emulator source, app, runner and volume.
-            assert len(daemon.labels) == 8
+            # Each run's emulator source, volume setup, app, runner and volume.
+            assert len(daemon.labels) == 10
             # Each run's app is configured with its own runner and token.
             first_env, second_env = first.app_env, second.app_env
             assert first.runner_name in first_env["SKILL_K8S_APISERVER"]
             assert second.runner_name in second_env["SKILL_K8S_APISERVER"]
             assert first_env["SKILL_K8S_BIND_TOKEN"] != second_env["SKILL_K8S_BIND_TOKEN"]
-        assert daemon.removed(second) == [True, True, True, True]
-        # The emulator source goes once the emulator is read.
-        assert daemon.removed(first) == [True, False, False, False]
-    assert daemon.removed(first) == [True, True, True, True]
+        assert daemon.removed(second) == [True] * 5
+        # The emulator source goes once the emulator is read, the volume
+        # setup once the artifacts folder is created.
+        assert daemon.removed(first) == [True, True, False, False, False]
+    assert daemon.removed(first) == [True] * 5
 
 
 def test_sigterm_during_a_run_removes_its_containers_and_volume():
@@ -1659,4 +1711,4 @@ def test_sigterm_during_a_run_removes_its_containers_and_volume():
         with instance:
             cli._terminate(15, None)
 
-    assert daemon.removed(instance) == [True, True, True, True]
+    assert daemon.removed(instance) == [True] * 5

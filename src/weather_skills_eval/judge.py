@@ -11,8 +11,12 @@ verdict is that reason and no judge model is called. Otherwise the judge
 rules on the task's criteria plus ``PROVENANCE_CRITERION``, from the visible
 transcript and one message of harness evidence: each presented file's path,
 kind, the turn that presented it and provenance (the listing's
-``provenance_detail``) as JSON, and each image. A task that expects no file
-is judged on the transcript and its criteria alone.
+``provenance_detail``) as JSON, and each image. A file no reply names other
+than in backticks is labeled as named in passing and not presented, and the
+provenance criterion does not cover it, unless it is of a kind the task
+needs and no file of that kind was presented outright. A task that expects no file is
+judged on the transcript and its criteria alone. The judge's scenario
+description, and the answer-quality prompt, state when the play started.
 
 The judge never ends a play: the simulated user or the turn cap does.
 """
@@ -21,6 +25,7 @@ import asyncio
 import base64
 import json
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 
 from scenario import AgentInput, JudgeAgent, JudgmentRequest, ScenarioResult
 from scenario.scenario_state import ScenarioState
@@ -30,15 +35,26 @@ from .llm import JUDGE, Complete, ModelReplyError, reply_json
 
 PROVENANCE_CRITERION = (
     "Each presented file's provenance (data source, region, period, aggregation, units) "
-    "matches the user's request and what was agreed in the chat"
+    "matches the user's request and what was agreed in the chat; a file named in passing "
+    "and not presented is not held to this"
 )
 
 EVIDENCE_HEADER = (
     "Harness evidence, not part of the conversation: every file the assistant presented "
-    "during the conversation, in order, each once at the latest turn that presented it, "
-    "with the weather_skills_history provenance the app read from it: per branch, the "
+    "or named in passing during the conversation, in order, each once at the turn given with "
+    "it, with the weather_skills_history provenance the app read from it: per branch, the "
     "skills that produced it in order, with their arguments."
 )
+
+
+def started_line(started: datetime) -> str:
+    """The play's start in UTC, for the judge and the answer-quality rater: they
+    see only the visible conversation, never the app's system prompt, so
+    without it a request relative to today cannot be checked."""
+    return (
+        "Harness context, not said by the user: the conversation started on "
+        f"{started:%Y-%m-%d} at {started:%H:%M} UTC."
+    )
 
 
 def evidence_message(evidence: Evidence) -> dict:
@@ -47,7 +63,11 @@ def evidence_message(evidence: Evidence) -> dict:
     note of its own problem."""
     parts: list[dict] = [{"type": "text", "text": EVIDENCE_HEADER}]
     for file in evidence.files:
-        text = f"File: {file.path} ({file.kind}), presented on turn {file.turn}"
+        if file.named_in_passing:
+            how = f"named in passing on turn {file.turn} and not presented"
+        else:
+            how = f"presented on turn {file.turn}"
+        text = f"File: {file.path} ({file.kind}), {how}"
         if file.kind == "image" and not file.shown_as_image:
             text += " (not shown as an image)"
         if file.note:
@@ -152,6 +172,8 @@ QUALITY_PROMPT = """You rate how well a weather assistant answered a user, from 
 5: complete, correct and clear; 4: good with small gaps; 3: usable but incomplete or \
 unclear; 2: mostly unhelpful; 1: no answer or wrong.
 
+{started}
+
 The user's request:
 {opening}
 
@@ -170,6 +192,7 @@ def rate_answer(
     complete: Complete,
     model: str,
     session_id: str | None,
+    started: datetime,
     opening: str,
     criteria: list[str],
     transcript: str,
@@ -182,6 +205,7 @@ def rate_answer(
             {
                 "role": "user",
                 "content": QUALITY_PROMPT.format(
+                    started=started_line(started),
                     opening=opening,
                     criteria="\n".join(f"- {c}" for c in criteria) or "(the user's request)",
                     transcript=transcript,

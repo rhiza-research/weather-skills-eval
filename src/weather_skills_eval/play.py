@@ -23,6 +23,7 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 import scenario
 from scenario import AgentAdapter, AgentInput, AgentRole, ScenarioResult
@@ -30,7 +31,7 @@ from scenario.scenario_state import ScenarioState
 
 from .app_client import AppClient, Conversation, visible_text
 from .checks import Evidence, ReplyFiles, collect_evidence, reply_files
-from .judge import GoalJudge, rate_answer
+from .judge import GoalJudge, rate_answer, started_line
 from .llm import Complete
 from .scoring import PlayFacts, Score, TraceMetrics, TraceRead, build_scores, trace_metrics
 from .simulated_user import SimulatedUser
@@ -109,6 +110,10 @@ class PlayResult:
         }
 
 
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
 @dataclass
 class PlayDeps:
     app: AppClient
@@ -124,9 +129,12 @@ class PlayDeps:
     poll_interval: float
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+    # The UTC date and time, told to the judge and the rater as the play's start.
+    now: Callable[[], datetime] = _utc_now
 
 
 async def play(task: Task, deps: PlayDeps) -> PlayResult:
+    started = deps.now()
     conversation = Conversation(
         deps.app,
         model=deps.model,
@@ -222,9 +230,11 @@ async def play(task: Task, deps: PlayDeps) -> PlayResult:
     try:
         result = await scenario.arun(
             name=task.id,
+            # Scenario's judge shows the description in its verdict prompt.
             description=(
                 f"A user asks a weather assistant: {task.opening_message}\n\n"
-                f"What the user knows:\n{task.metadata.facts}"
+                f"What the user knows:\n{task.metadata.facts}\n\n"
+                f"{started_line(started)}"
             ),
             agents=[agent, user],
             script=[scenario.proceed(on_turn=before_turn)],
@@ -281,6 +291,7 @@ async def play(task: Task, deps: PlayDeps) -> PlayResult:
                 complete=deps.complete,
                 model=deps.judge_model,
                 session_id=conversation.chat_id,
+                started=started,
                 opening=task.opening_message,
                 criteria=list(task.expected.judge_criteria),
                 transcript=neutral_transcript(agent.exchanges),

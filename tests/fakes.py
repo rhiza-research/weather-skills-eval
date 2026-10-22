@@ -442,13 +442,16 @@ class FakeDocker:
     the pulled app and runner images. ``events``
     records each container and volume created or removed, in order;
     ``source`` is the container created from the app image to read the
-    emulator."""
+    emulator; ``volume_setup`` is the container that creates the artifacts
+    folder on the volume, and ``setup_calls`` the arguments it was created
+    with."""
 
     def __init__(
         self,
         container: FakeContainer,
         *,
         runner: FakeContainer | None = None,
+        volume_setup: FakeContainer | None = None,
         pull_error: Exception | None = None,
         runner_pull_error: Exception | None = None,
         local: SimpleNamespace | None | object = NO_LOOKUP,
@@ -466,9 +469,11 @@ class FakeDocker:
     ):
         self.container = container
         self.runner = runner or FakeContainer(["running"], name="runner")
+        self.volume_setup = volume_setup or FakeContainer([], name="volume-setup")
         self.source: FakeSourceContainer | None = None
         self.run_calls: list[dict] = []
         self.create_calls: list[dict] = []
+        self.setup_calls: list[dict] = []
         self.pulled: list[str] = []
         self.looked_up: list[str] = []
         self.list_filters: list[dict] = []
@@ -544,6 +549,11 @@ class FakeDocker:
                     outer.created[kwargs["name"]] = outer.source
                     outer.events.append(f"create {kwargs['name']}")
                     return outer.source
+                if "-volume-setup-" in kwargs["name"]:
+                    outer.setup_calls.append({"image": image_id, **kwargs})
+                    outer.created[kwargs["name"]] = outer.volume_setup
+                    outer.events.append(f"create {kwargs['name']}")
+                    return outer.volume_setup
                 outer.create_calls.append({"image": image_id, **kwargs})
                 if create_error:
                     raise create_error

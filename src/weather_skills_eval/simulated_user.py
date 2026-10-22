@@ -3,10 +3,12 @@
 It opens with the task's opening message. On every later turn it reads the
 assistant's last reply and what a real user sees of the latest reply that
 presents files (each file's path and kind, and each image), classifies the
-reply, checks the result against what it asked for, and answers from the
-facts sheet. It reveals the next hidden step not yet revealed or done when
-the assistant is stuck, or has presented a result or moved on past where that
-step belongs without doing it. It ends the play when it is done or gives up.
+reply, checks the result, and any plan the assistant proposes, against what
+it asked for, and answers from the facts sheet, only what the assistant
+asked unless a result lacks or contradicts a fact. It reveals the next
+hidden step not yet revealed or done when the assistant is stuck, or has
+presented a result or moved on past where that step belongs without doing
+it. It ends the play when it is done or gives up.
 """
 
 import asyncio
@@ -32,6 +34,9 @@ Facts you know. Answer the assistant's questions from these facts only. If a que
 not covered by them, say you do not know or have no preference:
 {facts}
 
+Answer only what the assistant asked. Raise another fact only when a result lacks it or \
+contradicts it.
+
 Hidden steps. You know these. The next hidden step is the first one below that you have \
 not revealed and that is not done. A step the conversation or the files you were shown \
 already show as done counts as used: skip it and consider the next one. Mention the next \
@@ -47,7 +52,9 @@ When the assistant has presented files, you also get them after the conversation
 file's path and kind, and each image. Compare what you received, the answer's text and any \
 files, with what you asked for and your facts (place, variable, period, aggregation, \
 units, layout). When something does not match or a requested part is missing, say so \
-plainly and ask for the fix, the way a busy person would.
+plainly and ask for the fix, the way a busy person would. When the assistant proposes a \
+plan, check it against what you asked for and your facts before agreeing, the same way you \
+check results.
 
 You are done when the assistant has presented everything you asked for, as you asked. \
 Before you are done or give up, ask for anything still wrong or missing, unless you already \

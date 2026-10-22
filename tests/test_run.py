@@ -9,6 +9,7 @@ import tarfile
 import textwrap
 import threading
 from collections import Counter
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -116,6 +117,9 @@ def task(
     return item
 
 
+PLAY_START = datetime(2026, 10, 22, 9, 30, 15, tzinfo=UTC)
+
+
 def progress(message="go on", classification="progress", hint=False):
     return {
         "classification": classification,
@@ -175,7 +179,11 @@ class Harness:
                 "clock": self.clock,
                 "sleep": self.clock.sleep_sync,
             },
-            play_options={"clock": self.clock, "sleep": self.clock.sleep},
+            play_options={
+                "clock": self.clock,
+                "sleep": self.clock.sleep,
+                "now": lambda: PLAY_START,
+            },
         )
 
     def scores(self, index=0):
@@ -376,6 +384,30 @@ def test_every_turn_requests_a_streaming_completion(tmp_path):
     assert "turn" in completions[1]
 
 
+STARTED = (
+    "Harness context, not said by the user: the conversation started on 2026-10-22 at 09:30 UTC."
+)
+
+
+def test_the_judge_and_the_rater_are_told_when_the_play_started(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.run()
+
+    # In the scenario description of the verdict's system prompt, after the facts.
+    [verdict] = harness.models.verdict_calls()
+    system = verdict["messages"][0]["content"]
+    assert f"Period: next week.\n\n{STARTED}\n</scenario>" in system
+    # Not as something the user said: the transcript does not hold it.
+    assert STARTED not in verdict["messages"][1]["content"]
+    [quality] = [c[2] for c in harness.models.calls if c[0] == "judge" and not c[2].get("tools")]
+    # Before the user's request.
+    prompt = quality["messages"][0]["content"]
+    assert f"{STARTED}\n\nThe user's request:\nrain forecast kenya" in prompt
+    # The simulated user is not told.
+    assert STARTED not in json.dumps(harness.models.user_calls())
+
+
 # The presented result and its provenance
 
 
@@ -502,12 +534,109 @@ def test_a_zarr_named_only_in_backticks_reaches_the_goal(tmp_path):
     harness.run()
 
     assert harness.output()["outcome"] == "goal_reached"
+    # The only file of a kind the task needs counts as presented.
     assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == [
         "File: kenya_rain.zarr (zarr), presented on turn 2"
     ]
     assert evidence_files(harness.models.user_calls()[-1]["messages"]) == [
         "File: kenya_rain.zarr (zarr)"
     ]
+
+
+def test_backtick_files_of_a_needed_kind_none_presented_outright_are_all_presented(tmp_path):
+    items = [task("t1", "rain data kenya", deliverables=["zarr"])]
+    harness = Harness(
+        tmp_path,
+        items,
+        map_reply(
+            presenting="Saved `weekly.zarr` and `daily.zarr`.",
+            files={},
+            artifacts=[zarr_entry("weekly.zarr"), zarr_entry("daily.zarr")],
+        ),
+    )
+    harness.run()
+
+    assert harness.output()["outcome"] == "goal_reached"
+    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == [
+        "File: weekly.zarr (zarr), presented on turn 2",
+        "File: daily.zarr (zarr), presented on turn 2",
+    ]
+
+
+def test_a_backtick_file_beside_another_of_its_needed_kind_stays_named_in_passing(tmp_path):
+    items = [task("t1", "rain data kenya", deliverables=["zarr"])]
+    harness = Harness(
+        tmp_path,
+        items,
+        map_reply(
+            presenting="Download it: [data](out.zarr). It was made from `era5_kenya.zarr`.",
+            files={},
+            artifacts=[zarr_entry("out.zarr"), zarr_entry("era5_kenya.zarr")],
+        ),
+    )
+    harness.run()
+
+    assert harness.output()["outcome"] == "goal_reached"
+    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == [
+        "File: out.zarr (zarr), presented on turn 2",
+        "File: era5_kenya.zarr (zarr), named in passing on turn 2 and not presented",
+    ]
+
+
+def test_a_later_backtick_mention_keeps_the_turn_that_presented_the_file(tmp_path):
+    items = [task("t1", "rain data kenya", deliverables=["zarr"])]
+
+    def reply(opening, number, text):
+        if number == 1:
+            return Reply("Which data source should I use?")
+        if number == 2:
+            return Reply("Download it: [data](out.zarr)", artifacts=[zarr_entry("out.zarr")])
+        return Reply("DONE: `out.zarr` holds the weekly totals.")
+
+    harness = Harness(
+        tmp_path, items, reply, user_replies={"rain data kenya": [progress("era5"), progress("ok")]}
+    )
+    harness.run()
+
+    assert harness.output()["outcome"] == "goal_reached"
+    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == [
+        "File: out.zarr (zarr), presented on turn 2"
+    ]
+
+
+def test_a_backtick_file_is_labeled_and_left_out_of_the_provenance_criterion(tmp_path):
+    items = [task("t1", "rain map kenya", deliverables=["image"])]
+    harness = Harness(
+        tmp_path,
+        items,
+        map_reply(
+            presenting=display_image("maps/rain.png") + "The data is in `kenya_rain.zarr`.",
+            artifacts=[image_entry("maps/rain.png"), zarr_entry("kenya_rain.zarr")],
+        ),
+    )
+    harness.run()
+
+    assert harness.output()["outcome"] == "goal_reached"
+    verdict = harness.models.verdict_calls()[0]
+    assert evidence_files(verdict["messages"]) == [
+        "File: maps/rain.png (image), presented on turn 2",
+        "File: kenya_rain.zarr (zarr), named in passing on turn 2 and not presented",
+    ]
+    # Its provenance still reaches the judge, as data.
+    texts = [p["text"] for p in judge_parts(harness) if p["type"] == "text"]
+    assert "Provenance:" in texts[2]
+    assert texts[0] == (
+        "Harness evidence, not part of the conversation: every file the assistant presented "
+        "or named in passing during the conversation, in order, each once at the turn given "
+        "with it, with the weather_skills_history provenance the app read from it: per branch, "
+        "the skills that produced it in order, with their arguments."
+    )
+    # The fixed criterion covers only the presented files.
+    assert (
+        "Each presented file's provenance (data source, region, period, aggregation, units) "
+        "matches the user's request and what was agreed in the chat; a file named in passing "
+        "and not presented is not held to this"
+    ) in json.dumps(verdict["tools"])
 
 
 def test_backtick_text_that_is_not_a_listed_path_presents_nothing(tmp_path):
@@ -2448,10 +2577,13 @@ def test_run_starts_the_runner_and_its_volume_before_the_app(tmp_path):
     assert source.read == list(APP_EMULATOR_PATHS)
     assert not source.started
     assert source.removed
+    setup_name = f"weather-skills-eval-volume-setup-{run_id}"
     assert docker_.events == [
         f"create {source_name}",
         f"remove {source_name}",
         f"volume {volume_name}",
+        f"create {setup_name}",
+        f"remove {setup_name}",
         f"create {runner_name}",
         f"run {app['name']}",
         f"remove {app['name']}",
@@ -2462,14 +2594,40 @@ def test_run_starts_the_runner_and_its_volume_before_the_app(tmp_path):
         "weather-skills-eval": "data",
         "weather-skills-eval.run": run_id,
     }
-    # The runner: the runner image, the emulator, the run's volume at /data.
+    # The artifacts folder is created on the volume first, from a container of
+    # the app image with the whole volume at the app's data directory, so the
+    # volume's first mount fills it from the app image; never started.
+    [setup] = docker_.setup_calls
+    assert setup == {
+        "image": "sha256:image",
+        "name": setup_name,
+        "labels": {"weather-skills-eval": "volume-setup", "weather-skills-eval.run": run_id},
+        "volumes": {volume_name: {"bind": "/app/backend/data", "mode": "rw"}},
+    }
+    [(setup_path, setup_data)] = docker_.volume_setup.archives
+    assert setup_path == "/app/backend/data"
+    with tarfile.open(fileobj=io.BytesIO(setup_data)) as tar:
+        assert [(m.name, m.isdir()) for m in tar.getmembers()] == [("artifacts", True)]
+    assert not docker_.volume_setup.started
+    assert docker_.volume_setup.removed
+    # The runner: the runner image, the emulator, and only the volume's
+    # artifacts folder, at the path the emulator reads.
     assert create["image"] == "sha256:runner"
     assert create["name"] == runner_name
     assert create["user"] == "0"
     assert create["command"] == ["python3", "-u", "/opt/sandbox/emulator/emulator.py"]
     assert create["network"] == "weather-skills-eval"
     assert create["labels"] == {"weather-skills-eval": "runner", "weather-skills-eval.run": run_id}
-    assert create["volumes"] == {volume_name: {"bind": "/data", "mode": "rw"}}
+    assert "volumes" not in create
+    assert create["mounts"] == [
+        {
+            "Target": "/data/artifacts",
+            "Source": volume_name,
+            "Type": "volume",
+            "ReadOnly": False,
+            "VolumeOptions": {"Subpath": "artifacts"},
+        }
+    ]
     assert create["restart_policy"] == {"Name": "on-failure"}
     token = create["environment"]["SKILL_K8S_BIND_TOKEN"]
     assert len(token) >= 32
@@ -2637,6 +2795,21 @@ def test_runner_start_failure_stops_the_run_and_removes_what_it_created(tmp_path
         assert container.removed, name
     for volume in harness.docker.volumes_created.values():
         assert volume.removed
+    assert harness.gateway.experiments == []
+
+
+def test_an_artifacts_folder_that_cannot_be_created_stops_the_run_before_the_runner(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    setup = FakeContainer([], put_archive_result=False)
+    harness = Harness(tmp_path, items, reply_done_on(1), volume_setup=setup)
+
+    with pytest.raises(RunnerStartError, match="artifacts folder could not be created"):
+        harness.run()
+
+    assert setup.removed
+    assert harness.docker.create_calls == []
+    assert harness.docker.run_calls == []
+    assert harness.docker.volume().removed
     assert harness.gateway.experiments == []
 
 
