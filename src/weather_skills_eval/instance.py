@@ -72,8 +72,14 @@ class AppStartError(Exception):
 class RunnerStartError(AppStartError):
     """The app image has no sandbox emulator, the runner image could not be
     pulled, or the runner container could not start, exited or disappeared
-    before the app was ready, or was gone or not running again in time before
-    a task. Carries the runner logs when there are any."""
+    before the app was ready, was gone or not running again in time before a
+    task or after the last task, or was not the same running runner after a
+    task (``restartable`` says whether Docker restarts it). Carries the runner
+    logs when there are any."""
+
+    # True when Docker restarts the runner by itself: it restarted, is
+    # restarting, or exited with a non-zero code.
+    restartable = False
 
 
 def _health_ok(url: str) -> bool:
@@ -324,17 +330,25 @@ class AppInstance:
         """Return the runner's restart count once it is running on two
         consecutive polls with the same restart count, so a runner Docker keeps
         restarting is not taken for a running one. Polls at the poll interval up
-        to the start timeout; ``RunnerStartError`` (with its logs) when it is
-        not running steadily by then or exited with code 0, which Docker does
-        not restart, and at once when it is gone."""
+        to the start timeout, and at least twice, so a start timeout shorter
+        than the poll interval does not fail a running runner;
+        ``RunnerStartError`` (with its logs) when it is not running steadily by
+        then, and at once when it exited with code 0 or is dead, which Docker
+        does not restart, or is gone."""
         deadline = self._clock() + self._start_timeout
         running_with = None  # (restart count,) at the last poll that found it running
         waiting_logged = False
+        polls = 0
         while True:
             status, restarts, exit_code = self._runner_state(when)
+            polls += 1
             if status == "exited" and exit_code == 0:
                 raise self._runner_error(
                     f"Runner container exited with code 0 {when}; Docker does not restart it."
+                )
+            if status == "dead":
+                raise self._runner_error(
+                    f"Runner container is dead {when}; Docker does not restart it."
                 )
             if status == "running" and running_with == (restarts,):
                 return restarts
@@ -347,7 +361,7 @@ class AppInstance:
                 )
                 waiting_logged = True
             running_with = (restarts,) if status == "running" else None
-            if self._clock() >= deadline:
+            if polls >= 2 and self._clock() >= deadline:
                 raise self._runner_error(
                     f"Runner container was not running steadily {when} after "
                     f"{self._start_timeout:g} s: it is {status}, restarted {restarts} times."
@@ -356,13 +370,20 @@ class AppInstance:
 
     def check_runner_unchanged(self, when: str, restarts: object) -> None:
         """Raise ``RunnerStartError`` (with its logs) unless the runner is
-        running and has not restarted since it had ``restarts`` restarts."""
-        status, now, _ = self._runner_state(when)
+        running and has not restarted since it had ``restarts`` restarts. The
+        error is ``restartable`` when the runner is running again, restarting,
+        or exited with a non-zero code; not when it exited with code 0, is
+        dead or in any other state, or is gone or cannot be read."""
+        status, now, exit_code = self._runner_state(when)
         if status != "running" or now != restarts:
-            raise self._runner_error(
+            error = self._runner_error(
                 f"Runner container stopped {when}: it is {status}, "
                 f"restarted {now} times, {restarts} before."
             )
+            error.restartable = status in ("running", "restarting") or (
+                status == "exited" and exit_code != 0
+            )
+            raise error
 
     def check_runner(self, when: str = "before the app was ready") -> None:
         """Raise ``RunnerStartError`` when the runner container has exited or

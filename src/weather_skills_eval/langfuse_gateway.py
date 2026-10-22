@@ -18,14 +18,16 @@ reads the app's traces from the project its own keys belong to.
 - Deleting a run (``LangfuseRuns``): Langfuse has no call that deletes an
   experiment; it goes away once its traces are deleted. A run's traces are
   each item's trace plus every trace in the session of the item output's
-  ``chat_id``.
+  ``chat_id``, or, for an item whose output has none, in the sessions of its
+  trace's observations: the item trace carries the chat when the play
+  returned and the runner check after it failed.
 """
 
 import asyncio
 import json
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import httpx
@@ -49,6 +51,9 @@ APP_COST_ROLLUP = "app-cost-rollup"
 EXPERIMENT_ITEM_FIELDS = "core,io"
 # The experiments API's maximum page size.
 EXPERIMENT_PAGE_SIZE = 100
+# Langfuse takes at most 1,000 trace ids per delete request:
+# https://langfuse.com/faq/all/deprecated-api-migration.md
+DELETE_BATCH_SIZE = 1000
 # The experiments API needs a lower bound on start time; the epoch finds an
 # experiment of any age.
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -67,6 +72,15 @@ class RunTraces:
     experiment_name: str
     items: int
     trace_ids: list[str]
+    # The items' own traces, also in ``trace_ids``.
+    item_trace_ids: list[str] = field(default_factory=list, compare=False)
+
+    def deletion_order(self) -> list[str]:
+        """``trace_ids`` with the item traces last: while one is left, the
+        experiment is still listed, so a delete stopped part way can be run
+        again."""
+        items = set(self.item_trace_ids)
+        return [t for t in self.trace_ids if t not in items] + sorted(items)
 
 
 def _all_pages(read: Callable[[str | None], object]) -> list:
@@ -470,8 +484,25 @@ class LangfuseRuns:
                 cursor=cursor,
             )
         )
-        trace_ids = {item.trace_id for item in items if item.trace_id}
-        for chat_id in sorted({c for c in (_chat_id(item.output) for item in items) if c}):
+        item_trace_ids = {item.trace_id for item in items if item.trace_id}
+        trace_ids = set(item_trace_ids)
+        chats = {c for c in (_chat_id(item.output) for item in items) if c}
+        for item in items:
+            if not item.trace_id or _chat_id(item.output):
+                continue
+            # No chat id in the output: when the play returned and the runner
+            # check after it failed, the item trace carries the chat as its
+            # session id. A play that raised linked nothing.
+            observations = _all_pages(
+                lambda cursor, trace_id=item.trace_id: api.observations.get_many(
+                    fields="core,basic",
+                    limit=PAGE_SIZE,
+                    cursor=cursor,
+                    trace_id=trace_id,
+                )
+            )
+            chats.update(o.session_id for o in observations if o.session_id)
+        for chat_id in sorted(chats):
             # The session holds the app's, the simulated user's, the judge's
             # and the item's traces.
             session = _all_pages(
@@ -483,7 +514,19 @@ class LangfuseRuns:
                 )
             )
             trace_ids.update(o.trace_id for o in session if o.trace_id)
-        return RunTraces(experiment.name, len(items), sorted(trace_ids))
+        return RunTraces(experiment.name, len(items), sorted(trace_ids), sorted(item_trace_ids))
 
-    def delete_traces(self, trace_ids: list[str]) -> None:
-        self.client.api.trace.delete_multiple(trace_ids=trace_ids)
+    def delete_traces(self, run: RunTraces) -> None:
+        """Sends the run's ids in ``deletion_order``, ``DELETE_BATCH_SIZE`` per
+        request, the other traces' batches first and then the item traces'
+        batches; no request holds both. An error stops the delete; batches
+        already sent stay deleted, and the failing one may be partly deleted.
+        A partly deleted batch of other traces deletes no item trace, so
+        after any interruption the run is still found and a new delete
+        finishes it."""
+        items = set(run.item_trace_ids)
+        order = run.deletion_order()
+        for group in ([t for t in order if t not in items], [t for t in order if t in items]):
+            for start in range(0, len(group), DELETE_BATCH_SIZE):
+                batch = group[start : start + DELETE_BATCH_SIZE]
+                self.client.api.trace.delete_multiple(trace_ids=batch)

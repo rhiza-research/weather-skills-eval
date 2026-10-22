@@ -12,8 +12,13 @@ Order of a run:
    model, tools, skill pack commits).
 5. Run the experiment: each item's task waits for the runner to be running
    (Docker restarts one that died), plays the task and returns its scores,
-   which the evaluator records on the item. A runner that is gone, or not
-   running by the start timeout, stops the run.
+   which the evaluator records on the item. A runner that Docker restarted,
+   is restarting, or exited with a non-zero code after the play leaves that
+   task unscored, with the runner error on its item, and the run goes on;
+   when no task waited for the runner after the latest such loss, it is
+   waited for once after the last task. A runner that is gone, exited with
+   code 0, is dead, or is not running steadily by the start timeout stops
+   the run.
 6. Remove the containers and the volume and flush Langfuse, whatever happened.
 """
 
@@ -47,6 +52,8 @@ class RunSummary:
     items: int
     goals_reached: int
     metadata: dict
+    # Ids of the tasks not scored because the runner restarted during their play.
+    runner_lost: list[str]
 
 
 def base_model(entry: dict, catalog_id: str, connections: list[dict]) -> str:
@@ -228,10 +235,17 @@ def _run(
         # it is raised after the experiment whether or not run_experiment
         # raised it from the task.
         runner_failure: list[RunnerStartError] = []
+        # Each task the runner stopped or restarted during; the run goes on.
+        runner_lost: list[str] = []
+        # How many of the losses in runner_lost a wait that started after
+        # them found the runner running steadily again.
+        runner_back_after = 0
 
         async def task_fn(*, item, **kwargs):
+            nonlocal runner_back_after
             if runner_failure:
                 raise runner_failure[0]
+            lost_before_wait = len(runner_lost)
             try:
                 restarts = await asyncio.to_thread(
                     instance.wait_for_runner, f"before task {item.id}"
@@ -239,6 +253,10 @@ def _run(
             except RunnerStartError as exc:
                 runner_failure.append(exc)
                 raise
+            runner_back_after = max(runner_back_after, lost_before_wait)
+            # Another task may have stopped the run while this one waited.
+            if runner_failure:
+                raise runner_failure[0]
             app = new_app()
             try:
                 result = await play(
@@ -259,17 +277,24 @@ def _run(
                 )
             finally:
                 await app.aclose()
+            # Before the runner check, so the item trace carries the chat as its
+            # session even when the check fails, and delete finds the chat.
+            if result.chat_id:
+                gateway.link_item_to_chat(result.chat_id)
             # A runner that stopped or restarted during the play would score the
-            # task as an agent failure; it stops the run instead.
+            # task as an agent failure. The error goes on the item instead, with
+            # no scores. A runner Docker restarts leaves the run going, and a
+            # later wait decides whether it goes on; any other state stops it.
             try:
                 await asyncio.to_thread(
                     instance.check_runner_unchanged, f"during task {item.id}", restarts
                 )
             except RunnerStartError as exc:
-                runner_failure.append(exc)
+                if exc.restartable:
+                    runner_lost.append(item.id)
+                else:
+                    runner_failure.append(exc)
                 raise
-            if result.chat_id:
-                gateway.link_item_to_chat(result.chat_id)
             # Absent when the trace scores are missing; then nothing is recorded.
             app_cost = next((s.value for s in result.scores if s.name == COST_SCORE), None)
             if app_cost is not None:
@@ -292,6 +317,9 @@ def _run(
             raise
         if runner_failure:
             raise runner_failure[0]
+        # No wait started after the latest loss found the runner back.
+        if len(runner_lost) > runner_back_after:
+            instance.wait_for_runner("after the last task")
 
     outputs = [r.output or {} for r in result.item_results]
     return RunSummary(
@@ -301,6 +329,7 @@ def _run(
         items=len(result.item_results),
         goals_reached=sum(1 for o in outputs if o.get("goal_reached")),
         metadata=metadata,
+        runner_lost=runner_lost,
     )
 
 

@@ -29,7 +29,7 @@ from scenario import AgentAdapter, AgentInput, AgentRole, ScenarioResult
 from weather_skills_eval import cli
 from weather_skills_eval import instance as instance_module
 from weather_skills_eval.app_client import AppClient, ChatError
-from weather_skills_eval.checks import Evidence, ReplyFiles, collect_evidence
+from weather_skills_eval.checks import Evidence, ReplyFiles, collect_evidence, reply_files
 from weather_skills_eval.config import ConfigError, load_config, parse_config
 from weather_skills_eval.instance import (
     AppInstance,
@@ -40,7 +40,7 @@ from weather_skills_eval.instance import (
 from weather_skills_eval.judge import GoalJudge, rate_answer
 from weather_skills_eval.langfuse_gateway import LangfuseGateway, LangfuseRuns
 from weather_skills_eval.play import neutral_transcript
-from weather_skills_eval.runner import DatasetError, base_model
+from weather_skills_eval.runner import DatasetError, RunSummary, base_model
 from weather_skills_eval.settings import SettingsError, load_settings
 from weather_skills_eval.simulated_user import SimulatedUser
 from weather_skills_eval.tasks import TaskError, parse_task
@@ -345,8 +345,54 @@ def test_an_unlisted_candidate_is_neither_presented_nor_missing():
         assert evidence.problem is None
         assert evidence.unlisted == []
         assert [(f.path, f.turn) for f in evidence.files] == [("maps/rain.png", 1)]
-    # A missing candidate never makes the listing be read again.
-    assert waits == []
+    # The latest naming reply's candidates are not listed: the listing is read
+    # once more in each call, in case it lags.
+    assert waits == [1, 1]
+
+
+def test_the_final_read_waits_for_a_backtick_file_the_listing_lags():
+    rain = {"path": "maps/rain.png", "kind": "image", "provenance_detail": PROVENANCE}
+    store = {"path": "k.zarr", "kind": "zarr", "is_dir": True, "provenance_detail": PROVENANCE}
+    listings = []
+
+    def handler(request):
+        if request.url.path.endswith("/artifacts"):
+            listings.append(request)
+            # The store reaches the listing on its second read.
+            return httpx.Response(200, json=[rain] if len(listings) == 1 else [rain, store])
+        return httpx.Response(200, content=b"png")
+
+    waits = []
+
+    async def wait():
+        waits.append(1)
+
+    replies = [
+        ReplyFiles(1, ["maps/rain.png"]),
+        ReplyFiles(2, ["k.zarr"], frozenset({"k.zarr"})),
+    ]
+    evidence = asyncio.run(
+        collect_evidence(client(handler), "c1", replies, ["zarr"], retries=1, wait=wait)
+    )
+
+    # The latest reply's store, not the earlier map.
+    assert evidence.problem is None
+    assert [(f.path, f.turn) for f in evidence.files] == [("k.zarr", 2)]
+    assert len(listings) == 2
+    assert waits == [1]
+
+
+@pytest.mark.parametrize(
+    "content, paths",
+    [
+        ("```foo``` is a span; the data is in `out.zarr`.", ["out.zarr"]),
+        ("```py\n[data](out.zarr) and `k.zarr`\n```\nNothing else.", []),
+        ("~~~\n![map](maps/rain.png)\n~~~\nSee [data](out.zarr).", ["out.zarr"]),
+    ],
+    ids=["inline-triple-backticks", "link-in-backtick-fence", "link-in-tilde-fence"],
+)
+def test_fenced_code_presents_nothing_and_an_inline_span_opens_no_fence(content, paths):
+    assert reply_files(content, 1).paths == paths
 
 
 PROVENANCE = {"branches": [{"label": None, "steps": [], "crumbs": []}]}
@@ -435,6 +481,8 @@ def test_only_unlisted_candidates_is_no_result_presented():
     evidence = asyncio.run(collect_evidence(app, "c1", replies, ["zarr"], every=True))
     assert evidence.problem == "No result presented: no reply presented a file"
     assert evidence.unlisted == []
+    # A later listing may have it, so the evidence is read again.
+    assert evidence.unlisted_candidates == ["rain.zarr"]
 
 
 def test_a_failed_extra_listing_falls_back_to_the_earlier_listing():
@@ -764,6 +812,37 @@ def test_cli_exit_codes_and_messages(monkeypatch, capsys, error, code, message):
 
 
 @pytest.mark.parametrize(
+    "runner_lost, lost_line",
+    [
+        ([], None),
+        (["t2"], "1 task not scored because the sandbox runner restarted during it: t2"),
+        (
+            ["t1", "t3"],
+            "2 tasks not scored because the sandbox runner restarted during them: t1, t3",
+        ),
+    ],
+    ids=["none-lost", "one-lost", "two-lost"],
+)
+def test_cli_summary_names_tasks_lost_to_a_runner_restart(
+    monkeypatch, capsys, runner_lost, lost_line
+):
+    summary = RunSummary(
+        experiment_name="cfg",
+        run_name="cfg - run",
+        experiment_url=None,
+        items=3,
+        goals_reached=1,
+        metadata={},
+        runner_lost=runner_lost,
+    )
+    monkeypatch.setattr(cli, "run", lambda *args, **kwargs: summary)
+    assert cli.main(["run", "configs/example.yaml"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[:2] == ["Experiment cfg, run cfg - run", "Goal reached on 1 of 3 tasks"]
+    assert lines[2:] == ([lost_line] if lost_line else [])
+
+
+@pytest.mark.parametrize(
     "name, value", [("EVAL_MAX_TURNS", "0"), ("EVAL_MODEL_MAX_TOKENS", "lots")]
 )
 def test_cli_with_a_bad_turn_cap_or_token_limit_exits_2(monkeypatch, capsys, name, value):
@@ -897,7 +976,8 @@ def test_cli_delete_deletes_every_trace_of_the_run_on_yes(monkeypatch, capsys):
 
     assert delete_with(api, "e1") == 0
 
-    assert api.deleted == ["app-a", "item-1", "item-2", "judge-1", "user-1"]
+    # The item traces go last.
+    assert api.deleted == ["app-a", "judge-1", "user-1", "item-1", "item-2"]
     assert capsys.readouterr().out == (
         f"Experiment cfg: 2 items, 5 traces\n{PROMPT}Deleted experiment cfg: 2 items, 5 traces\n"
     )
@@ -910,7 +990,8 @@ def test_cli_delete_with_yes_flag_deletes_without_asking(monkeypatch, capsys):
 
     assert delete_with(api, "--yes", "e1") == 0
 
-    assert api.deleted == ["app-a", "item-1", "item-2", "judge-1", "user-1"]
+    # The item traces go last.
+    assert api.deleted == ["app-a", "judge-1", "user-1", "item-1", "item-2"]
     assert capsys.readouterr().out == (
         "Experiment cfg: 2 items, 5 traces\nDeleted experiment cfg: 2 items, 5 traces\n"
     )
@@ -954,6 +1035,48 @@ def test_cli_delete_with_a_langfuse_error_exits_5(capsys):
 
     assert api.deleted == []
     assert "Delete stopped, Langfuse returned an error" in capsys.readouterr().err
+
+
+def test_cli_delete_with_a_langfuse_error_on_a_later_batch_exits_5(capsys):
+    chat = [f"app-{n:04d}" for n in range(1500)]
+    api = run_api(
+        sessions={"chat-1": chat},
+        delete_errors={2: LangfuseApiError(status_code=503, body="unavailable")},
+    )
+
+    assert delete_with(api, "--yes", "e1") == 5
+
+    # The first batch stays deleted; the item traces, sent last, are left.
+    assert api.deleted == chat[:1000]
+    error = capsys.readouterr().err
+    assert "Delete stopped, Langfuse returned an error" in error
+    assert "run delete again to delete the rest" in error
+    # So a second delete on the same project still finds the run and deletes the rest.
+    assert delete_with(api, "--yes", "e1") == 0
+    assert api.deleted == [*chat, "item-1", "item-2"]
+    assert capsys.readouterr().out.endswith("Deleted experiment cfg: 2 items, 502 traces\n")
+    assert delete_with(api, "--yes", "e1") == 2
+
+
+def test_cli_delete_with_another_error_while_deleting_says_to_run_it_again(capsys):
+    # The second request, of the item traces, fails after the first deleted the rest.
+    api = run_api(delete_errors={2: httpx.ConnectError("refused")})
+
+    assert delete_with(api, "--yes", "e1") == 1
+
+    assert api.deleted == ["app-a", "judge-1", "user-1"]
+    assert capsys.readouterr().err == (
+        "Delete failed: ConnectError: refused; run delete again to delete the rest\n"
+    )
+
+
+def test_cli_delete_with_another_error_before_deleting_gives_no_hint(capsys):
+    api = run_api(error=httpx.ConnectError("refused"))
+
+    assert delete_with(api, "--yes", "e1") == 1
+
+    assert api.methods() == {"experiments.list"}
+    assert capsys.readouterr().err == "Delete failed: ConnectError: refused\n"
 
 
 def test_cli_delete_with_any_other_error_exits_1(capsys):

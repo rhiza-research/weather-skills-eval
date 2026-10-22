@@ -271,7 +271,8 @@ class FakeContainer:
     and ``api-error`` makes it raise APIError. An entry may also be a
     (status, restart count, exit code) tuple, which sets ``attrs``.
     ``archives`` holds each (path, tar bytes) given to ``put_archive``;
-    ``put_archive_error`` and ``start_error`` fail those calls."""
+    ``put_archive_error`` and ``start_error`` fail those calls, and
+    ``put_archive_result`` is what ``put_archive`` returns."""
 
     def __init__(
         self,
@@ -281,6 +282,7 @@ class FakeContainer:
         remove_error: Exception | None = None,
         put_archive_error: Exception | None = None,
         start_error: Exception | None = None,
+        put_archive_result: bool = True,
     ):
         self._statuses = statuses
         self.status = "created"
@@ -289,6 +291,7 @@ class FakeContainer:
         self.remove_error = remove_error
         self.put_archive_error = put_archive_error
         self.start_error = start_error
+        self.put_archive_result = put_archive_result
         self.removed = False
         self.started = False
         self.reloads = 0
@@ -300,7 +303,7 @@ class FakeContainer:
         if self.put_archive_error:
             raise self.put_archive_error
         self.archives.append((path, data))
-        return True
+        return self.put_archive_result
 
     def start(self) -> None:
         if self.start_error:
@@ -854,9 +857,14 @@ class FakeRunApi:
 
     ``experiments`` maps an experiment id to its name; ``items`` maps it to
     its items as (trace_id, output); ``sessions`` maps a chat id to the trace
-    ids of its observations. Pages hold ``page_size`` entries, so a delete must
-    follow the cursor. ``error`` is raised by every call. ``calls`` records
-    (method, kwargs) of each call.
+    ids of its observations; ``traces`` maps a trace id to the session ids of
+    its observations (None for one without). Pages hold ``page_size``
+    entries, so a delete must follow the cursor. ``error`` is raised by every
+    call; ``delete_errors`` maps the number of a ``delete_multiple`` call,
+    from 1, to the error it raises, deleting nothing. A deleted trace leaves
+    the items and sessions, and an experiment whose item traces are all
+    deleted is no longer found. ``calls`` records (method, kwargs) of each
+    call.
     """
 
     START = datetime(2026, 10, 20, 9, 0, tzinfo=UTC)
@@ -866,14 +874,18 @@ class FakeRunApi:
         experiments: dict[str, str] | None = None,
         items: dict[str, list[tuple[str, object]]] | None = None,
         sessions: dict[str, list[str]] | None = None,
+        traces: dict[str, list[str | None]] | None = None,
         page_size: int = 2,
         error: Exception | None = None,
+        delete_errors: dict[int, Exception] | None = None,
     ):
         self._experiments = experiments or {}
         self._items = items or {}
         self._sessions = sessions or {}
+        self._traces = traces or {}
         self._page_size = page_size
         self._error = error
+        self._delete_errors = delete_errors or {}
         self.calls: list[tuple[str, dict]] = []
         self.deleted: list[str] = []
         fake = self
@@ -906,6 +918,13 @@ class FakeRunApi:
 
         def get_many(**kwargs):
             record("observations.get_many", kwargs)
+            if "trace_id" in kwargs:
+                assert "basic" in kwargs["fields"].split(",")
+                trace = [
+                    SimpleNamespace(id=f"t{n}", trace_id=kwargs["trace_id"], session_id=session_id)
+                    for n, session_id in enumerate(fake._traces.get(kwargs["trace_id"], []))
+                ]
+                return _page(trace, fake._page_size, kwargs.get("cursor"))
             session = [
                 SimpleNamespace(id=f"o{n}", trace_id=trace_id)
                 for n, trace_id in enumerate(fake._sessions.get(kwargs["session_id"], []))
@@ -914,7 +933,18 @@ class FakeRunApi:
 
         def delete_multiple(**kwargs):
             record("trace.delete_multiple", kwargs)
+            number = sum(1 for method, _ in fake.calls if method == "trace.delete_multiple")
+            if number in fake._delete_errors:
+                raise fake._delete_errors[number]
             fake.deleted.extend(kwargs["trace_ids"])
+            gone = set(kwargs["trace_ids"])
+            for experiment_id, items in list(fake._items.items()):
+                left = [item for item in items if item[0] not in gone]
+                fake._items[experiment_id] = left
+                if items and not left:
+                    fake._experiments.pop(experiment_id, None)
+            for chat_id, trace_ids in fake._sessions.items():
+                fake._sessions[chat_id] = [t for t in trace_ids if t not in gone]
             return SimpleNamespace(message="deleted")
 
         self.api = SimpleNamespace(

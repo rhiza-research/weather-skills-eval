@@ -1,13 +1,16 @@
 """The I/O and edge-case matrix, end to end through ``runner.run`` with a fake app,
 fake Docker, fake Langfuse and fake harness models."""
 
+import asyncio
 import base64
 import io
 import json
 import tarfile
 import textwrap
+import threading
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 
 import docker.errors
 import httpx
@@ -41,7 +44,7 @@ from fakes import (
 from weather_skills_eval import play as play_module
 from weather_skills_eval.app_client import ChatError
 from weather_skills_eval.config import RUNNER_ENV, ConfigError
-from weather_skills_eval.instance import AppStartError, RunnerStartError
+from weather_skills_eval.instance import AppInstance, AppStartError, RunnerStartError
 from weather_skills_eval.langfuse_gateway import TraceReadError
 from weather_skills_eval.llm import ModelReplyError
 from weather_skills_eval.runner import DatasetError, run
@@ -252,6 +255,7 @@ def test_run_plays_every_task_into_one_experiment_and_removes_the_container(tmp_
     assert metadata["dataset_skill_packs"] == ""
     assert all(isinstance(v, str) for v in metadata.values())
     assert summary.items == 3 and summary.goals_reached == 3
+    assert summary.runner_lost == []
     assert harness.gateway.linked == ["chat-1", "chat-2", "chat-3"]
     # Each item's rollup carries its own chat's app traces.
     assert [ids for _, ids in harness.gateway.app_costs] == [
@@ -1233,6 +1237,33 @@ def test_an_unlisted_path_is_looked_up_again_on_the_next_turn(tmp_path):
         "text",
         "text",
         "image_url",
+    ]
+    assert harness.output()["outcome"] == "goal_reached"
+
+
+def test_a_backtick_file_the_listing_lags_is_shown_on_the_next_turn(tmp_path):
+    items = [task("t1", "rain data kenya", deliverables=["zarr"])]
+
+    def reply(opening, number, text):
+        if number == 1:
+            return Reply("Which data source should I use?")
+        if number == 2:
+            # The listing does not hold the store yet.
+            return Reply("The data is saved as `k.zarr`.")
+        return Reply("DONE: it is ready now.", artifacts=[zarr_entry("k.zarr")])
+
+    harness = Harness(
+        tmp_path,
+        items,
+        reply,
+        user_replies={"rain data kenya": [progress("era5"), progress("where is it?")]},
+    )
+    harness.run()
+
+    assert [evidence_files(c["messages"]) for c in harness.models.user_calls()] == [
+        [],
+        [],
+        ["File: k.zarr (zarr)"],
     ]
     assert harness.output()["outcome"] == "goal_reached"
 
@@ -2554,6 +2585,22 @@ def test_runner_start_failure_stops_the_run_and_removes_what_it_created(tmp_path
     assert harness.gateway.experiments == []
 
 
+def test_emulator_files_that_put_archive_does_not_copy_stop_the_run(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    runner = FakeContainer([], put_archive_result=False)
+    harness = Harness(tmp_path, items, reply_done_on(1), runner=runner)
+
+    with pytest.raises(RunnerStartError, match="emulator files could not be copied"):
+        harness.run()
+
+    assert not runner.started
+    assert harness.docker.run_calls == []
+    for name, container in harness.docker.created.items():
+        assert container.removed, name
+    assert harness.docker.volume().removed
+    assert harness.gateway.experiments == []
+
+
 def test_runner_that_exits_while_the_app_starts_stops_the_run_with_its_logs(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     runner = FakeContainer(["exited"], logs=b"missing /usr/local/bin/sandbox_runtime.py")
@@ -2647,7 +2694,8 @@ def test_runner_lost_mid_run_stops_the_run(tmp_path, statuses, message):
 
 def keep_task_errors(harness, tasks_raised, then_raise=None):
     """Make the experiment record a task's runner error on its item and go on,
-    then raise ``then_raise`` when given."""
+    leaving that item out of its results as the Langfuse SDK does, then raise
+    ``then_raise`` when given."""
     record = harness.gateway.run_experiment
 
     def run_experiment(*, task, **kwargs):
@@ -2656,9 +2704,12 @@ def keep_task_errors(harness, tasks_raised, then_raise=None):
                 return await task(item=item, **task_kwargs)
             except RunnerStartError as exc:
                 tasks_raised.append((item.id, exc))
-                return {}
+                # A task never returns None; it marks the item to leave out.
+                return None
 
         result = record(task=keeping, **kwargs)
+        # The experiment's items are the same list.
+        result.item_results[:] = [r for r in result.item_results if r.output is not None]
         if then_raise:
             raise then_raise
         return result
@@ -2745,25 +2796,204 @@ def test_runner_that_exits_with_code_0_stops_the_run_at_once(tmp_path):
     assert len(harness.app.chats) == 1
 
 
-@pytest.mark.parametrize(
-    "after_t1",
-    [("running", 1, 0), "restarting", "exited"],
-    ids=["restarted", "restarting", "exited"],
-)
-def test_runner_that_dies_during_a_task_stops_the_run(tmp_path, after_t1):
-    # Running at /health and on both polls before t1; not the same runner after it.
-    runner = FakeContainer(["running"] * 3 + [after_t1], logs=b"emulator crashed")
+def test_a_dead_runner_stops_the_run_at_once(tmp_path):
+    # Docker never restarts a dead container.
+    runner = FakeContainer([*THROUGH_T1, "dead"], logs=b"emulator removal failed")
     harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
 
-    with pytest.raises(RunnerStartError, match="emulator crashed") as error:
-        harness.run()
+    with pytest.raises(RunnerStartError, match="emulator removal failed") as error:
+        harness.run(**SHORT_WAIT)
 
-    assert "stopped during task t1" in str(error.value)
-    # The task is not scored.
-    assert harness.gateway.experiments == []
+    assert "is dead before task t2" in str(error.value)
+    assert runner.reloads == 5
+    assert len(harness.app.chats) == 1
+    assert runner.removed
+
+
+def test_a_start_timeout_shorter_than_the_poll_interval_plays_the_task(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    runner = harness.docker.runner
+    reload = runner.reload
+
+    def slow_reload():
+        # Each read of the runner takes longer than the start timeout.
+        reload()
+        harness.clock.now += 2
+
+    runner.reload = slow_reload
+
+    summary = harness.run(EVAL_APP_START_TIMEOUT_SECONDS="1", EVAL_POLL_INTERVAL_SECONDS="5")
+
+    assert summary.goals_reached == 1
+    # /health, two polls before t1 and one check after it.
+    assert runner.reloads == 4
+
+
+# Running at /health and on both polls before t1.
+BEFORE_T1 = ["running"] * 3
+RESTARTED = ("running", 1, 0)
+
+
+@pytest.mark.parametrize(
+    "after_t1",
+    [RESTARTED, "restarting", "exited"],
+    ids=["restarted", "restarting", "exited"],
+)
+def test_runner_that_restarts_during_a_task_costs_only_that_task(tmp_path, after_t1):
+    # Not the same runner after t1; running steadily with one restart before t2.
+    runner = FakeContainer([*BEFORE_T1, after_t1, RESTARTED], logs=b"emulator crashed")
+    harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
+    tasks_raised = []
+    keep_task_errors(harness, tasks_raised)
+
+    summary = harness.run()
+
+    # t1 carries the runner error and no scores, and its item trace is linked
+    # to its chat, so delete finds the chat's traces.
+    [(item_id, error)] = tasks_raised
+    assert item_id == "t1"
+    assert "stopped during task t1" in str(error)
+    assert "emulator crashed" in str(error)
+    assert error.restartable
+    # t2 and t3 are played on the restarted runner and scored; t1 is left out.
+    assert [r.item.id for r in harness.gateway.experiments[0]["items"]] == ["t2", "t3"]
+    assert harness.scores(0)["goal_reached"] == 1.0
+    assert harness.scores(1)["goal_reached"] == 1.0
+    assert harness.gateway.linked == ["chat-1", "chat-2", "chat-3"]
+    assert [ids for _, ids in harness.gateway.app_costs] == [
+        ["chat-2-trace-0"],
+        ["chat-3-trace-0"],
+    ]
+    assert summary.items == 2 and summary.goals_reached == 2
+    assert summary.runner_lost == ["t1"]
+    # /health, then two polls and one check per task; t2's wait found the
+    # runner back, so it is not waited for after the last task.
+    assert runner.reloads == 10
+    assert runner.removed
+    assert harness.container.removed
+    assert harness.docker.volume().removed
+
+
+def test_runner_that_restarts_during_a_task_and_never_comes_back_stops_the_run(tmp_path):
+    runner = FakeContainer([*BEFORE_T1, "exited"], logs=b"emulator crashed")
+    harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
+    tasks_raised = []
+    keep_task_errors(harness, tasks_raised)
+
+    with pytest.raises(RunnerStartError, match="emulator crashed") as error:
+        harness.run(**SHORT_WAIT)
+
+    assert "was not running steadily before task t2 after 30 s: it is exited" in str(error.value)
+    # t1 is not scored; t2 and t3 are not played.
+    assert [item_id for item_id, _ in tasks_raised] == ["t1", "t2", "t3"]
+    assert "stopped during task t1" in str(tasks_raised[0][1])
+    assert tasks_raised[1][1] is error.value is tasks_raised[2][1]
+    assert harness.gateway.linked == ["chat-1"]
     assert len(harness.app.chats) == 1
     assert harness.container.removed
     assert harness.docker.volume().removed
+
+
+@pytest.mark.parametrize(
+    "after_t1, message",
+    [
+        (("exited", 0, 0), "stopped during task t1: it is exited"),
+        ("dead", "stopped during task t1: it is dead"),
+        ("gone", "disappeared during task t1"),
+        ("api-error", "could not be read during task t1"),
+    ],
+    ids=["exited-0", "dead", "gone", "reload-error"],
+)
+def test_runner_found_stopped_for_good_after_a_task_stops_the_run_at_once(
+    tmp_path, after_t1, message
+):
+    runner = FakeContainer([*BEFORE_T1, after_t1], logs=b"emulator stopped")
+    harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
+    tasks_raised = []
+    keep_task_errors(harness, tasks_raised)
+
+    with pytest.raises(RunnerStartError, match=message) as error:
+        harness.run(**SHORT_WAIT)
+
+    assert not error.value.restartable
+    # t2 and t3 raise the same error without waiting for the runner.
+    assert [item_id for item_id, _ in tasks_raised] == ["t1", "t2", "t3"]
+    assert all(exc is error.value for _, exc in tasks_raised)
+    # /health, two polls before t1, one check after it.
+    assert runner.reloads == 4
+    assert harness.gateway.linked == ["chat-1"]
+    assert len(harness.app.chats) == 1
+    assert harness.container.removed
+    assert harness.docker.volume().removed
+
+
+def test_runner_restarted_during_the_last_task_is_waited_for_after_it(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    runner = FakeContainer([*BEFORE_T1, RESTARTED])
+    harness = Harness(tmp_path, items, reply_done_on(1), runner=runner)
+    tasks_raised = []
+    keep_task_errors(harness, tasks_raised)
+
+    summary = harness.run()
+
+    assert [item_id for item_id, _ in tasks_raised] == ["t1"]
+    assert summary.items == 0 and summary.runner_lost == ["t1"]
+    # /health, two polls before t1, one check after it, two polls after the last task.
+    assert runner.reloads == 6
+
+
+def test_runner_lost_on_the_last_task_that_never_comes_back_stops_the_run(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    runner = FakeContainer([*BEFORE_T1, "exited"], logs=b"emulator crashed")
+    harness = Harness(tmp_path, items, reply_done_on(1), runner=runner)
+    keep_task_errors(harness, [])
+
+    with pytest.raises(RunnerStartError, match="emulator crashed") as error:
+        harness.run(**SHORT_WAIT)
+
+    assert "not running steadily after the last task after 30 s" in str(error.value)
+    assert harness.container.removed
+    assert harness.docker.volume().removed
+
+
+def test_a_task_waiting_when_another_stops_the_run_is_not_played(tmp_path, monkeypatch):
+    # Concurrent tasks: t2 is still waiting for the runner when the check after
+    # t1 finds it exited with code 0.
+    runner = FakeContainer(["running", ("exited", 0, 0)], logs=b"emulator stopped")
+    harness = Harness(tmp_path, THREE_TASKS[:2], reply_done_on(1), runner=runner)
+    t1_done = threading.Event()
+
+    def wait_for_runner(self, when):
+        if when == "before task t2":
+            assert t1_done.wait(10)
+        return 0
+
+    monkeypatch.setattr(AppInstance, "wait_for_runner", wait_for_runner)
+    outcomes = []
+
+    def run_experiment(*, dataset, task, **kwargs):
+        first, second = dataset.items
+
+        async def t1():
+            try:
+                return await task(item=first)
+            finally:
+                t1_done.set()
+
+        async def both():
+            return await asyncio.gather(t1(), task(item=second), return_exceptions=True)
+
+        outcomes.extend(asyncio.run(both()))
+        return SimpleNamespace(run_name="r", experiment_url=None, item_results=[])
+
+    harness.gateway.run_experiment = run_experiment
+
+    with pytest.raises(RunnerStartError, match="stopped during task t1") as error:
+        harness.run()
+
+    assert outcomes == [error.value, error.value]
+    assert len(harness.app.chats) == 1
 
 
 def test_failed_run_removes_the_app_runner_and_volume(tmp_path):

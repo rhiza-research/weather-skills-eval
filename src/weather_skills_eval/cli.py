@@ -2,15 +2,19 @@
 
 Exit codes:
 
-- 0: the run finished and the experiment was recorded.
+- 0: the run finished and the experiment was recorded, also when tasks
+  were not scored because the sandbox runner restarted during them; the
+  summary gives their number.
 - 1: the run failed for any other reason.
 - 2: the run did not start: a harness setting, the configuration file, the
   dataset or a dataset item is invalid, the dataset is missing or empty, or
   the dataset needs a skill pack the configuration does not turn on.
 - 3: the app or the sandbox runner did not start (an app image without the
   sandbox emulator, image pull, image not on the Docker host, container
-  start, or /health), the runner was gone or not running again by the start
-  timeout before a task, or Docker failed.
+  start, or /health), the runner was not running steadily by the start
+  timeout before a task, or after the last task when no task waited for it
+  after it was lost, the runner was found exited with code 0, dead,
+  disappeared or unreadable before or after a task, or Docker failed.
 - 4: the app failed while the harness read its catalog model, tools and
   skill packs, or reported no base model for the catalog model.
 - 5: Langfuse returned an error.
@@ -108,9 +112,15 @@ def _confirmed() -> bool:
     return answer.strip() == "yes"
 
 
+def _rerun(deleting: bool) -> str:
+    """The hint for a failure after deleting started."""
+    return "; run delete again to delete the rest" if deleting else ""
+
+
 def delete(experiment_id: str, *, yes: bool, runs_factory=LangfuseRuns) -> int:
     """Prints the run's counts, then deletes its traces on ``yes`` (or with
     ``--yes``); any other answer deletes nothing."""
+    deleting = False
     try:
         runs = runs_factory()
         found = runs.run_traces(experiment_id)
@@ -122,13 +132,16 @@ def delete(experiment_id: str, *, yes: bool, runs_factory=LangfuseRuns) -> int:
         if not (yes or _confirmed()):
             print("Nothing deleted")
             return 0
-        runs.delete_traces(found.trace_ids)
+        deleting = True
+        runs.delete_traces(found)
     except ExperimentNotFound:
         return _fail(EXIT_NOT_STARTED, f"Nothing deleted: no experiment has id {experiment_id}")
     except LangfuseApiError as exc:
-        return _fail(EXIT_LANGFUSE, f"Delete stopped, Langfuse returned an error: {exc}")
+        return _fail(
+            EXIT_LANGFUSE, f"Delete stopped, Langfuse returned an error: {exc}{_rerun(deleting)}"
+        )
     except Exception as exc:
-        return _fail(EXIT_FAILED, f"Delete failed: {type(exc).__name__}: {exc}")
+        return _fail(EXIT_FAILED, f"Delete failed: {type(exc).__name__}: {exc}{_rerun(deleting)}")
 
     print(f"Deleted experiment {found.experiment_name}: {counts}")
     return 0
@@ -182,6 +195,13 @@ def main(
 
     print(f"Experiment {summary.experiment_name}, run {summary.run_name}")
     print(f"Goal reached on {summary.goals_reached} of {summary.items} tasks")
+    if summary.runner_lost:
+        lost = len(summary.runner_lost)
+        print(
+            f"{lost} {'task' if lost == 1 else 'tasks'} not scored because the sandbox "
+            f"runner restarted during {'it' if lost == 1 else 'them'}: "
+            f"{', '.join(summary.runner_lost)}"
+        )
     if summary.experiment_url:
         print(summary.experiment_url)
     return 0

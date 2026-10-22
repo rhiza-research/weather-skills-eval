@@ -34,8 +34,13 @@ _LINK = re.compile(r"""!?\[[^\]]*\]\(\s*<?([^)\s>]+)>?(?:\s+(?:"[^"]*"|'[^']*'))
 _SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 # Text in single backticks, not part of a longer run of backticks.
 _CODE = re.compile(r"(?<!`)`([^`\n]+)`(?!`)")
-# A fenced code block, to its closing fence or the end of the text.
-_FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,}).*?(?:^[ \t]*\1|\Z)", re.MULTILINE | re.DOTALL)
+# A fenced code block, to its closing fence or the end of the text. A
+# backtick fence's info string has no backtick, so a line starting with an
+# inline span such as ```x``` opens no block.
+_FENCE = re.compile(
+    r"^[ \t]*(?:(`{3,})[^`\n]*$.*?(?:^[ \t]*\1|\Z)|(~{3,}).*?(?:^[ \t]*\2|\Z))",
+    re.MULTILINE | re.DOTALL,
+)
 # The app's display_image result for an .html page it shows the user.
 _PAGE_SHOWN = re.compile(r"Showing `[^`]*` to the user as an interactive page\.")
 
@@ -92,14 +97,17 @@ def _link_path(target: str) -> str | None:
 
 
 def _text_paths(text: str) -> list[tuple[str, bool]]:
-    """Link targets, and backtick candidates (True), in the order they appear."""
-    found = [(m.start(), _link_path(m.group(1)), False) for m in _LINK.finditer(text)]
+    """Link targets, and backtick candidates (True), in the order they appear,
+    outside fenced code blocks."""
     fences = [m.span() for m in _FENCE.finditer(text)]
-    found += [
-        (m.start(), _path(m.group(1)), True)
-        for m in _CODE.finditer(text)
-        if not any(start <= m.start() < end for start, end in fences)
+
+    def fenced(match) -> bool:
+        return any(start <= match.start() < end for start, end in fences)
+
+    found = [
+        (m.start(), _link_path(m.group(1)), False) for m in _LINK.finditer(text) if not fenced(m)
     ]
+    found += [(m.start(), _path(m.group(1)), True) for m in _CODE.finditer(text) if not fenced(m)]
     return [(path, candidate) for _, path, candidate in sorted(found) if path]
 
 
@@ -220,6 +228,9 @@ class Evidence:
     unlisted: list[str] = field(default_factory=list)
     # The listing or a download failed: a later read may succeed.
     read_failed: bool = False
+    # Backtick paths in the latest reply naming files that the listing lacks;
+    # a later listing may have them.
+    unlisted_candidates: list[str] = field(default_factory=list)
 
 
 def _has_provenance(entry: dict) -> bool:
@@ -276,7 +287,8 @@ async def collect_evidence(
     carries it, or cannot be downloaded, makes the result one that cannot be
     judged; any other file keeps the problem as its ``note``. The deliverable kinds are checked
     against every presented file. The listing is read up to ``retries`` more
-    times when it fails or lacks a path of the latest presenting reply (the
+    times when it fails, lacks a path of the latest presenting reply, or
+    lacks a backtick path of the latest reply that names any file (the
     listing may lag), and each download is tried ``retries`` more times when
     it fails, after ``wait``. When an extra listing fails, the last listing
     that succeeded is used. An image in ``known_images``, by path and the
@@ -284,6 +296,7 @@ async def collect_evidence(
     if chat_id is None or not any(reply.paths for reply in replies):
         return Evidence(problem=NOTHING_PRESENTED)
     wait = wait or _no_wait
+    naming = next(reply for reply in reversed(replies) if reply.paths)
     attempts = 0
     entries: dict[str, dict] | None = None
     # The error of an extra listing that failed after one succeeded.
@@ -309,15 +322,20 @@ async def collect_evidence(
             e["path"]: e for e in listed if isinstance(e, dict) and isinstance(e.get("path"), str)
         }
         _, _, blocks = _resolve(replies, entries, every)
-        lagging = [p for p in blocks if p not in entries]
+        # A backtick path of the latest naming reply may not be listed yet;
+        # without it, the result would fall back to an earlier reply's files.
+        lagging = [p for p in blocks if p not in entries] + [
+            p for p in naming.candidates if p not in entries
+        ]
         if lagging and attempts < retries:
             attempts += 1
             await wait()
             continue
         break
+    unlisted_candidates = [p for p in naming.paths if p in naming.candidates and p not in entries]
     presented, turns, blocks = _resolve(replies, entries, every)
     if not presented:
-        return Evidence(problem=NOTHING_PRESENTED)
+        return Evidence(problem=NOTHING_PRESENTED, unlisted_candidates=unlisted_candidates)
     kinds = {p: entries[p].get("kind") for p in presented if p in entries}
     files, missing, unproven = [], [], []
     unreadable, read_failed = None, False
@@ -381,6 +399,7 @@ async def collect_evidence(
             problem=problem,
             unlisted=missing,
             read_failed=read_failed,
+            unlisted_candidates=unlisted_candidates,
         )
     shown = ", ".join(f"{p} ({kinds.get(p, 'unknown')})" for p in presented)
     for kind in dict.fromkeys(deliverables):
@@ -389,11 +408,18 @@ async def collect_evidence(
                 files=files,
                 problem=f"No presented file is {_article(kind)} {kind}; presented: {shown}",
                 read_failed=read_failed,
+                unlisted_candidates=unlisted_candidates,
             )
     if unproven:
         return Evidence(
             files=files,
             problem=f"Presented files have no provenance: {unproven}",
             read_failed=read_failed,
+            unlisted_candidates=unlisted_candidates,
         )
-    return Evidence(files=files, problem=unreadable, read_failed=read_failed)
+    return Evidence(
+        files=files,
+        problem=unreadable,
+        read_failed=read_failed,
+        unlisted_candidates=unlisted_candidates,
+    )

@@ -164,8 +164,11 @@ async def play(task: Task, deps: PlayDeps) -> PlayResult:
         # Dropped when the listing or a download failed, or a path is not
         # listed yet: the listing and the failed downloads are read again on
         # the next turn, and the images already downloaded for the same
-        # presentation are reused by path and turn.
-        collected = None if found.read_failed or found.unlisted else (len(agent.replies), found)
+        # presentation are reused by path and turn. While a backtick path in
+        # the latest reply naming files is unlisted, the evidence is read
+        # again each turn, at the cost of one listing per turn.
+        stale = found.read_failed or found.unlisted or found.unlisted_candidates
+        collected = None if stale else (len(agent.replies), found)
         return found
 
     user = SimulatedUser(
