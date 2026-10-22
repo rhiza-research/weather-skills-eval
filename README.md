@@ -21,17 +21,21 @@ docker compose run --rm -T -e APP_IMAGE=<image> -e RUNNER_IMAGE=<image> [-e EVAL
 
 The configs set `pull: false`, so run `docker pull <APP_IMAGE>` first when running by hand.
 
-`APP_IMAGE`, `RUNNER_IMAGE` and `EVAL_CONCURRENCY` are chosen per run with `-e`. An empty or absent `EVAL_CONCURRENCY` means the harness's default.
+`APP_IMAGE`, `RUNNER_IMAGE` and `EVAL_CONCURRENCY` are chosen per run with `-e`, as is `EVAL_BATCH`, optional. An empty or absent `EVAL_CONCURRENCY` means the harness's default.
 
 `uv run scripts/run-eval.py` does the same for the configs you pick:
 
 1. It lists `configs/*.yaml` other than `example.yaml` as a checklist.
 2. It asks for `APP_IMAGE`, `RUNNER_IMAGE` and `EVAL_CONCURRENCY`, each prefilled from the shell, else from `.env`, else from its default: `ghcr.io/rhiza-research/weather-skills-chat:prod`, `ghcr.io/rhiza-research/weather-skills-sandbox-runner:prod`, and blank for the concurrency.
-3. It asks "Pull the app image?", default yes.
-4. It builds the eval image once with `HARNESS_COMMIT` set to `git rev-parse HEAD`, then, on yes, runs `docker pull <APP_IMAGE>`. A failed build or pull exits with its exit code.
-5. It runs each picked config in turn with the values passed as `-e`, prints each config's exit code, and exits 1 if any failed.
+3. It asks for the number of repetitions, a whole number of at least 1, default 1.
+4. It asks "Pull the app image?", default yes.
+5. It builds the eval image once with `HARNESS_COMMIT` set to `git rev-parse HEAD`, then, on yes, runs `docker pull <APP_IMAGE>`. A failed build or pull exits with its exit code.
+6. It prints the batch id, the UTC time it reached this step (`Batch 2026-10-22T20:07:57Z`).
+7. It runs the picked configs in rounds, each config once per round, as many rounds as the repetitions, with the values and `EVAL_BATCH=<batch id>` passed as `-e`. It prints each run's exit code (`<config> run <round>: exit <code>`) and exits 1 if any failed.
 
-Ctrl-C prints the exit codes of the configs that finished and exits 130.
+Ctrl-C prints the exit codes of the runs that finished and exits 130.
+
+Each run records the batch id in its experiment's metadata as `batch`, so filtering Langfuse experiments on `metadata.batch` shows the runs of one invocation.
 
 - `run -` reads the configuration from stdin, so it works with a remote Docker context, where a bind mount from this machine would not reach the daemon. A configuration read from stdin must set `name`. `run <path>` reads a file inside the container instead.
 - `HARNESS_COMMIT` is baked into the image and recorded in each experiment's metadata; without it the metadata says `unrecorded`.
@@ -211,7 +215,7 @@ Trace-based scores (model calls, cost, tokens, tools, cache misses) are read fro
 
 The experiment's per-item cost in Langfuse is the app's cost: the item's trace holds one generation named `app-cost-rollup` whose cost is the item's `cost_to_goal_usd`, with no model and no token counts. It is recorded whenever that score is, and leaves out the simulated user and judge. The rollup repeats the app's cost: a cost total over the chat's session, or across the `sdk-experiment` environment (where Langfuse records the item traces) and the app's, counts it twice unless generations named `app-cost-rollup` are left out.
 
-The experiment's metadata holds the resolved configuration: the configuration's `name` as `config_name`, image with its digest and image id and whether it was pulled, the runner image as `runner_image` with `runner_image_digest` and `runner_image_id`, the app's environment variable names, installed skill packs with their commits, the tool ids the chats used, the chat model as `model` and `catalog_model`, the simulated user and judge models, the turn cap `EVAL_MAX_TURNS` as `max_turns`, the harness commit, and the dataset with its version (`dataset_version`, always `latest`: the harness reads the dataset without a version, so the run played the dataset as it was when the run read it), item count and the skill packs it needs (`dataset_skill_packs`, comma-separated, empty when none). `catalog_model` is the configured catalog id; `model` is the base model the app reports for it, without the `prefix_id` of the connection the app serves it from: like the app, the harness takes the last connection in `OPENAI_API_CONFIGS` that is enabled and whose `model_ids` allow the model (`open-router-.anthropic/claude-haiku-5.5` becomes `anthropic/claude-haiku-5.5`). A connection without `enable` is enabled, and one with no or empty `model_ids` allows every model. When no connection is taken, `model` is the base model the app reports, with surrounding whitespace removed. `model` is also the experiment's description.
+The experiment's metadata holds the resolved configuration: the configuration's `name` as `config_name`, image with its digest and image id and whether it was pulled, the runner image as `runner_image` with `runner_image_digest` and `runner_image_id`, the app's environment variable names, installed skill packs with their commits, the tool ids the chats used, the chat model as `model` and `catalog_model`, the simulated user and judge models, the turn cap `EVAL_MAX_TURNS` as `max_turns`, the harness commit, `EVAL_BATCH` as `batch` (empty when unset), and the dataset with its version (`dataset_version`, always `latest`: the harness reads the dataset without a version, so the run played the dataset as it was when the run read it), item count and the skill packs it needs (`dataset_skill_packs`, comma-separated, empty when none). `catalog_model` is the configured catalog id; `model` is the base model the app reports for it, without the `prefix_id` of the connection the app serves it from: like the app, the harness takes the last connection in `OPENAI_API_CONFIGS` that is enabled and whose `model_ids` allow the model (`open-router-.anthropic/claude-haiku-5.5` becomes `anthropic/claude-haiku-5.5`). A connection without `enable` is enabled, and one with no or empty `model_ids` allows every model. When no connection is taken, `model` is the base model the app reports, with surrounding whitespace removed. `model` is also the experiment's description.
 
 After reading the base model and before the plays, the harness sends one short request for it to OpenRouter with its own `OPENROUTER_API_KEY` (not the app's key), retried as `EVAL_MODEL_RETRIES` says, and names the experiment after the model named in the reply, recorded in the metadata as `served_model`; the base model must therefore be an OpenRouter model id. A floating alias such as `~anthropic/claude-opus-latest` resolves this way to the model it points to, such as `anthropic/claude-opus-5.5`, as it was when the run started. When that request fails, or its reply names no model or only the alias, the run stops before the experiment is created (exit 1). The models that served each play's calls are in each item's `provider_models`.
 

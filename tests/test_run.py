@@ -262,6 +262,8 @@ def test_run_plays_every_task_into_one_experiment_and_removes_the_container(tmp_
     assert experiment["description"] == "anthropic/claude-haiku-5.5"
     assert harness.output()["provider_models"] == ["provider/model-a", "provider/model-b"]
     assert metadata["harness_commit"] == "unrecorded"
+    # Without EVAL_BATCH the run belongs to no batch.
+    assert metadata["batch"] == ""
     assert metadata["dataset"] == "weather-tasks"
     assert metadata["dataset_version"] == "latest"
     assert metadata["dataset_items"] == "3"
@@ -284,6 +286,15 @@ def test_run_plays_every_task_into_one_experiment_and_removes_the_container(tmp_
     # The container carries its run id, and no other container is listed or touched.
     assert call["labels"]["weather-skills-eval.run"] in call["name"]
     assert harness.docker.list_filters == []
+
+
+def test_the_batch_is_recorded_in_the_experiment_metadata(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+
+    harness.run(EVAL_BATCH=" 2026-10-22T20:07:57Z ")
+
+    assert harness.gateway.experiments[0]["metadata"]["batch"] == "2026-10-22T20:07:57Z"
 
 
 def test_config_read_from_stdin(tmp_path):

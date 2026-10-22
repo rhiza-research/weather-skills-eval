@@ -328,6 +328,14 @@ def test_max_turns_defaults_to_20():
         load_settings(settings_env(EVAL_MAX_TURNS="0"))
 
 
+def test_batch_is_read_stripped_and_empty_when_unset():
+    assert load_settings(settings_env()).batch == ""
+    assert load_settings(settings_env(EVAL_BATCH="  ")).batch == ""
+    assert load_settings(settings_env(EVAL_BATCH=" 2026-10-22T20:07:57Z ")).batch == (
+        "2026-10-22T20:07:57Z"
+    )
+
+
 def test_task_deliverables_are_image_or_zarr():
     task = parse_task(item(expected_output={"deliverables": ["image", "zarr"]}))
     assert task.expected.deliverables == ["image", "zarr"]

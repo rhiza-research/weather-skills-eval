@@ -4,12 +4,14 @@
 # dependencies = ["python-dotenv>=1.2.4", "questionary>=2.1.1"]
 # ///
 """Runs the eval for the configs picked from a checklist, with the app image,
-runner image and concurrency chosen for the run."""
+runner image, concurrency and repetitions chosen for the run. Every run it
+starts records the same batch id."""
 
 import os
 import subprocess
 import sys
 import types
+from datetime import UTC, datetime
 from pathlib import Path
 
 import questionary
@@ -40,6 +42,18 @@ def env_args(values):
     return [arg for name, value in values.items() for arg in ("-e", f"{name}={value}")]
 
 
+def new_batch():
+    """The current UTC time, taken once before the runs and recorded by each as ``batch``."""
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def repetitions_valid(text):
+    """True for a whole number of at least 1, else the message questionary shows."""
+    text = text.strip()
+    # isdecimal, not isdigit: int() rejects digits such as "²" that isdigit accepts.
+    return (text.isdecimal() and int(text) >= 1) or "A whole number, at least 1"
+
+
 def run_eval(results):
     configs = sorted(p.name for p in (ROOT / "configs").glob("*.yaml") if p.name != "example.yaml")
     picked = questionary.checkbox("Configs to run:", choices=configs).unsafe_ask()
@@ -49,6 +63,11 @@ def run_eval(results):
         name: questionary.text(f"{name}:", default=value).unsafe_ask().strip()
         for name, value in prefilled(os.environ, ROOT / ".env").items()
     }
+    repetitions = int(
+        questionary.text("Repetitions:", default="1", validate=repetitions_valid)
+        .unsafe_ask()
+        .strip()
+    )
     pull = questionary.confirm("Pull the app image?", default=True).unsafe_ask()
 
     commit = subprocess.run(
@@ -66,18 +85,33 @@ def run_eval(results):
         if pulled.returncode != 0:
             return pulled.returncode
 
-    command = ["docker", "compose", "run", "--rm", "-T", *env_args(values), "eval", "run", "-"]
-    for name in picked:
-        with open(ROOT / "configs" / name, "rb") as config:
-            process = subprocess.Popen(command, cwd=ROOT, stdin=config)
-            try:
-                returncode = process.wait()
-            except KeyboardInterrupt:
-                # Ctrl-C reaches docker compose too; let it remove the run's containers.
-                process.wait()
-                raise
-        results.append((name, returncode))
-        print(f"{name}: exit {returncode}", flush=True)
+    batch = new_batch()
+    print(f"Batch {batch}", flush=True)
+    command = [
+        "docker",
+        "compose",
+        "run",
+        "--rm",
+        "-T",
+        *env_args({**values, "EVAL_BATCH": batch}),
+        "eval",
+        "run",
+        "-",
+    ]
+    # In rounds, each picked config once per round.
+    for repetition in range(1, repetitions + 1):
+        for name in picked:
+            with open(ROOT / "configs" / name, "rb") as config:
+                process = subprocess.Popen(command, cwd=ROOT, stdin=config)
+                try:
+                    returncode = process.wait()
+                except KeyboardInterrupt:
+                    # Ctrl-C reaches docker compose too; let it remove the run's containers.
+                    process.wait()
+                    raise
+            label = f"{name} run {repetition}"
+            results.append((label, returncode))
+            print(f"{label}: exit {returncode}", flush=True)
     return 1 if any(returncode != 0 for _, returncode in results) else 0
 
 
@@ -120,6 +154,12 @@ def test_every_value_is_passed_with_dash_e():
     ]
 
 
+def test_repetitions_must_be_a_whole_number_of_at_least_1():
+    assert repetitions_valid(" 3 ") is True
+    for text in ("0", "", "1.5", "-1", "two", "²"):
+        assert repetitions_valid(text) == "A whole number, at least 1"
+
+
 class _Answer:
     def __init__(self, value):
         self.value = value
@@ -136,8 +176,16 @@ def test_a_full_run(tmp_path, monkeypatch, capsys):
     for name in DEFAULTS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(questionary, "checkbox", lambda message, choices: _Answer(choices))
-    monkeypatch.setattr(questionary, "text", lambda message, default: _Answer(f" {default} "))
+
+    def text(message, default, **kwargs):
+        if message == "Repetitions:":
+            assert kwargs["validate"] is repetitions_valid
+            return _Answer(" 2 ")
+        return _Answer(f" {default} ")
+
+    monkeypatch.setattr(questionary, "text", text)
     monkeypatch.setattr(questionary, "confirm", lambda message, default: _Answer(default))
+    monkeypatch.setitem(globals(), "new_batch", lambda: "2026-10-22T20:00:00Z")
     calls = []
 
     def run(command, **kwargs):
@@ -158,13 +206,21 @@ def test_a_full_run(tmp_path, monkeypatch, capsys):
     assert build == ["docker", "compose", "build", "eval"]
     assert build_kwargs["env"]["HARNESS_COMMIT"] == "abc"
     assert pull == ["docker", "pull", DEFAULTS["APP_IMAGE"]]
-    # The prefilled answers, with their spaces trimmed.
-    command = ["docker", "compose", "run", "--rm", "-T", *env_args(DEFAULTS), "eval", "run", "-"]
+    # The prefilled answers, with their spaces trimmed, and the batch id.
+    values = {**DEFAULTS, "EVAL_BATCH": "2026-10-22T20:00:00Z"}
+    command = ["docker", "compose", "run", "--rm", "-T", *env_args(values), "eval", "run", "-"]
+    # Two rounds of every picked config.
     assert runs == [
         (command, {"cwd": tmp_path, "stdin": b"name: a\n"}),
         (command, {"cwd": tmp_path, "stdin": b"name: b\n"}),
+        (command, {"cwd": tmp_path, "stdin": b"name: a\n"}),
+        (command, {"cwd": tmp_path, "stdin": b"name: b\n"}),
     ]
-    assert capsys.readouterr().out == "a.yaml: exit 2\nb.yaml: exit 0\n"
+    assert capsys.readouterr().out == (
+        "Batch 2026-10-22T20:00:00Z\n"
+        "a.yaml run 1: exit 2\nb.yaml run 1: exit 0\n"
+        "a.yaml run 2: exit 2\nb.yaml run 2: exit 0\n"
+    )
 
 
 if __name__ == "__main__":

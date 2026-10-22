@@ -25,6 +25,7 @@ class Settings:
     model_max_tokens: int
     max_turns: int
     harness_commit: str
+    batch: str
 
 
 # Read by the Langfuse SDK and LiteLLM themselves; checked here so a run fails
@@ -94,4 +95,6 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         max_turns=_whole(environ, "EVAL_MAX_TURNS", 20, minimum=1),
         # Set at image build time from the harness checkout; see compose.yaml.
         harness_commit=environ.get("EVAL_HARNESS_COMMIT", "").strip(),
+        # Groups the runs one scripts/run-eval.py invocation starts.
+        batch=environ.get("EVAL_BATCH", "").strip(),
     )

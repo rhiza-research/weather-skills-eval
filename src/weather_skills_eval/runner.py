@@ -228,6 +228,7 @@ def _run(
             "judge_model": settings.judge_model,
             "max_turns": str(settings.max_turns),
             "harness_commit": settings.harness_commit or "unrecorded",
+            "batch": settings.batch,
             "dataset": config.dataset,
             "dataset_version": dataset_version.isoformat() if dataset_version else "latest",
             "dataset_items": str(len(tasks)),
