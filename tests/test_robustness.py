@@ -93,6 +93,12 @@ def test_literal_secret_inside_a_mapping_stops_the_run():
     assert error.value.field == "env.CATALOG_MODELS[0].params.api_key"
 
 
+def test_null_secret_inside_a_mapping_is_accepted():
+    # A connection without auth, such as a tool server, can have a null key.
+    result = parse({"TOOL_SERVER_CONNECTIONS": [{"url": "http://tools", "key": None}]})
+    assert json.loads(result.env["TOOL_SERVER_CONNECTIONS"])[0]["key"] is None
+
+
 def test_token_counts_and_tokenizer_names_are_not_secrets():
     result = parse(
         {
