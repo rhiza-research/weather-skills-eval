@@ -235,9 +235,8 @@ def env_example_names() -> list[str]:
 @pytest.mark.parametrize(
     "path", sorted((REPO / "configs").glob("*.yaml")), ids=lambda path: path.name
 )
-def test_every_config_loads_with_the_env_example_variables(path):
-    assert "RUNNER_IMAGE" in env_example_names()
-    environ = {name: "value" for name in env_example_names()}
+def test_every_config_loads_with_the_env_example_and_per_run_variables(path):
+    environ = {name: "value" for name in (*env_example_names(), "APP_IMAGE", "RUNNER_IMAGE")}
     config = load_config(path, environ)
     assert config.image == "value"
     assert config.runner_image == "value"

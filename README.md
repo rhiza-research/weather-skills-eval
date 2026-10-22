@@ -16,8 +16,22 @@ Everything runs in Docker.
 cp .env.example .env        # fill in the harness settings and the values your config references
 cp configs/example.yaml configs/<name>.yaml   # replace every TODO
 HARNESS_COMMIT=$(git rev-parse HEAD) docker compose build eval
-docker compose run --rm -T eval run - < configs/<name>.yaml
+docker compose run --rm -T -e APP_IMAGE=<image> -e RUNNER_IMAGE=<image> [-e EVAL_CONCURRENCY=<n>] eval run - < configs/<name>.yaml
 ```
+
+The configs set `pull: false`, so run `docker pull <APP_IMAGE>` first when running by hand.
+
+`APP_IMAGE`, `RUNNER_IMAGE` and `EVAL_CONCURRENCY` are chosen per run with `-e`. An empty or absent `EVAL_CONCURRENCY` means the harness's default.
+
+`uv run scripts/run-eval.py` does the same for the configs you pick:
+
+1. It lists `configs/*.yaml` other than `example.yaml` as a checklist.
+2. It asks for `APP_IMAGE`, `RUNNER_IMAGE` and `EVAL_CONCURRENCY`, each prefilled from the shell, else from `.env`, else from its default: `ghcr.io/rhiza-research/weather-skills-chat:prod`, `ghcr.io/rhiza-research/weather-skills-sandbox-runner:prod`, and blank for the concurrency.
+3. It asks "Pull the app image?", default yes.
+4. It builds the eval image once with `HARNESS_COMMIT` set to `git rev-parse HEAD`, then, on yes, runs `docker pull <APP_IMAGE>`. A failed build or pull exits with its exit code.
+5. It runs each picked config in turn with the values passed as `-e`, prints each config's exit code, and exits 1 if any failed.
+
+Ctrl-C prints the exit codes of the configs that finished and exits 130.
 
 - `run -` reads the configuration from stdin, so it works with a remote Docker context, where a bind mount from this machine would not reach the daemon. A configuration read from stdin must set `name`. `run <path>` reads a file inside the container instead.
 - `HARNESS_COMMIT` is baked into the image and recorded in each experiment's metadata; without it the metadata says `unrecorded`.
@@ -101,7 +115,7 @@ Rules:
 
 ## Harness settings
 
-`.env.example` lists them. The simulated user and judge models are harness settings so that they stay fixed across the runs being compared. `EVAL_SIMULATED_USER_MODEL` must accept image input: the simulated user is shown the presented images. `EVAL_JUDGE_MODEL` must accept image input when a task has an `image` deliverable: the judge's verdict call holds the presented images (see [Judging](#judging)). Each of their calls is a Langfuse trace with user id `simulated-user` or `judge`, session id = the chat id, in the environment set by `LANGFUSE_TRACING_ENVIRONMENT`, which must not be `production`.
+`.env.example` lists them. `EVAL_CONCURRENCY` is chosen per run (see [Running](#running)). The simulated user and judge models are harness settings so that they stay fixed across the runs being compared. `EVAL_SIMULATED_USER_MODEL` must accept image input: the simulated user is shown the presented images. `EVAL_JUDGE_MODEL` must accept image input when a task has an `image` deliverable: the judge's verdict call holds the presented images (see [Judging](#judging)). Each of their calls is a Langfuse trace with user id `simulated-user` or `judge`, session id = the chat id, in the environment set by `LANGFUSE_TRACING_ENVIRONMENT`, which must not be `production`.
 
 Every simulated-user and judge call, including the answer-quality rating, sends `max_tokens` = `EVAL_MODEL_MAX_TOKENS` (a whole number, at least 1, default 8192) unless the call sets its own `max_tokens` or `max_completion_tokens`; a call that sets `max_completion_tokens` and no `max_tokens` is sent without `max_tokens`. Without a limit, OpenRouter reserves the model's whole output window against the account balance and refuses calls with HTTP 402 when the balance is low. A simulated-user or judge reply cut off at that limit stops the play as `error`, naming the limit; a cut-off answer-quality rating does not stop the play, and `answer_quality` is recorded as not rated.
 
@@ -207,6 +221,12 @@ Tests and lint, in a container without network access:
 
 ```sh
 docker compose run --rm --build test
+```
+
+The tests of `scripts/run-eval.py` are in the script and run on the host:
+
+```sh
+uv run --isolated --no-project --with-requirements scripts/run-eval.py --with pytest pytest scripts/run-eval.py
 ```
 
 Install the pre-commit hooks:
