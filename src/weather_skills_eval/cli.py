@@ -7,17 +7,20 @@ Exit codes:
   summary gives their number.
 - 1: the run failed for any other reason.
 - 2: the run did not start: a harness setting, the configuration file, the
-  dataset or a dataset item is invalid, the dataset is missing or empty, or
+  dataset or a dataset item is invalid, the dataset is missing, empty or
+  could not be read from Langfuse (any error, a Langfuse error included), or
   the dataset needs a skill pack the configuration does not turn on.
 - 3: the app or the sandbox runner did not start (an app image without the
-  sandbox emulator, image pull, image not on the Docker host, container
-  start, or /health), the runner was not running steadily by the start
+  sandbox emulator, image pull, a pulled image with no digest for its
+  repository, image not on the Docker host, container start, or /health), the runner was not running steadily by the start
   timeout before a task, or after the last task when no task waited for it
   after it was lost, the runner was found exited with code 0, dead,
   disappeared or unreadable before or after a task, or Docker failed.
 - 4: the app failed while the harness read its catalog model, tools and
-  skill packs, or reported no base model for the catalog model.
-- 5: Langfuse returned an error.
+  skill packs, or reported no base model for the catalog model, or, after
+  the dataset was read, a network error (an httpx error, such as a
+  connection error or timeout) reaching the app or Langfuse stopped the run.
+- 5: Langfuse returned an error response after the dataset was read.
 - 143: the harness was stopped with SIGTERM; the app and runner containers
   and the volume were removed.
 

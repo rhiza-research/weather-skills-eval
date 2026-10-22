@@ -11,7 +11,8 @@ app answer, so the time to answer does not include it.
 
 Outcomes: ``goal_reached`` (the user is done and the judge passed);
 ``chat_error`` (the app returned an error, or a reply the harness cannot
-read); ``error`` (anything else stopped the play, such as a harness model
+read, a request to the app failed without a response, or the reply was not
+done within ``EVAL_TURN_TIMEOUT_SECONDS``); ``error`` (anything else stopped the play, such as a harness model
 reply that cannot be used); ``user_done`` (the user is done, and the judge
 failed or no result could be judged); ``user_gave_up``; ``turn_cap`` (the
 play sent as many user messages as the cap allows, and the user was neither
