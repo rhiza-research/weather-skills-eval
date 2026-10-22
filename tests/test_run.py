@@ -2034,6 +2034,61 @@ def test_pull_false_records_the_local_image_repo_digest(tmp_path):
     assert metadata["image_id"] == "sha256:local"
 
 
+APP_IMAGE_LINE = "image: ghcr.io/rhiza-research/weather-skills-chat:test"
+
+
+def test_pull_false_records_the_pinned_digest(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    pinned = f"{APP_REPOSITORY}@sha256:second"
+    local = local_image([f"{APP_REPOSITORY}@sha256:first", pinned])
+    harness = Harness(tmp_path, items, reply_done_on(1), local=local)
+    config = CONFIG.replace(APP_IMAGE_LINE, f"image: {pinned}") + "pull: false\n"
+    harness.config_path.write_text(config)
+
+    harness.run()
+
+    assert harness.docker.looked_up == [pinned]
+    metadata = harness.gateway.experiments[0]["metadata"]
+    assert metadata["image_digest"] == pinned
+
+
+@pytest.mark.parametrize(
+    "digests",
+    [
+        [f"{APP_REPOSITORY}@sha256:first", f"{APP_REPOSITORY}@sha256:second"],
+        # The pinned digest is not listed verbatim; another of the repository is.
+        [f"{APP_REPOSITORY}@sha256:first"],
+    ],
+    ids=["listed-second", "not-listed-verbatim"],
+)
+def test_a_pulled_image_records_the_pinned_digest(tmp_path, digests):
+    items = [task("t1", "rain forecast kenya")]
+    pinned = f"{APP_REPOSITORY}@sha256:second"
+    harness = Harness(tmp_path, items, reply_done_on(1), image_digests=digests)
+    harness.config_path.write_text(CONFIG.replace(APP_IMAGE_LINE, f"image: {pinned}"))
+
+    harness.run()
+
+    assert harness.docker.pulled == [pinned, RUNNER_IMAGE]
+    metadata = harness.gateway.experiments[0]["metadata"]
+    assert metadata["image_digest"] == pinned
+
+
+def test_a_pinned_runner_image_records_the_pinned_digest(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    pinned = f"{RUNNER_REPOSITORY}@sha256:second"
+    digests = [f"{RUNNER_REPOSITORY}@sha256:first", pinned]
+    harness = Harness(tmp_path, items, reply_done_on(1), runner_digests=digests)
+    harness.config_path.write_text(CONFIG.replace(RUNNER_IMAGE, pinned))
+
+    harness.run()
+
+    assert harness.docker.pulled == ["ghcr.io/rhiza-research/weather-skills-chat:test", pinned]
+    metadata = harness.gateway.experiments[0]["metadata"]
+    assert metadata["runner_image"] == pinned
+    assert metadata["runner_image_digest"] == pinned
+
+
 def test_pull_false_with_missing_image_stops_the_run(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1), local=None)

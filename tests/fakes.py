@@ -430,7 +430,9 @@ class FakeDocker:
     is read from (by default both emulator files), ``archive_error``
     fails ``get_archive`` on it and ``archive_stream`` makes the stream it
     returns; ``volume_error`` fails ``volumes.create``;
-    ``leftovers`` are labeled containers from an earlier run. ``events``
+    ``leftovers`` are labeled containers from an earlier run.
+    ``image_digests`` and ``runner_digests`` replace the ``RepoDigests`` of
+    the pulled app and runner images. ``events``
     records each container and volume created or removed, in order;
     ``source`` is the container created from the app image to read the
     emulator."""
@@ -452,6 +454,8 @@ class FakeDocker:
         volume_error: Exception | None = None,
         volume_remove_error: Exception | None = None,
         leftovers: list[FakeContainer] | None = None,
+        image_digests: list[str] | None = None,
+        runner_digests: list[str] | None = None,
     ):
         self.container = container
         self.runner = runner or FakeContainer(["running"], name="runner")
@@ -468,14 +472,21 @@ class FakeDocker:
         image = SimpleNamespace(
             id="sha256:image",
             attrs={
-                "RepoDigests": [
+                "RepoDigests": image_digests
+                if image_digests is not None
+                else [
                     "ghcr.io/other/mirror@sha256:111",
                     f"{APP_REPOSITORY}@sha256:abc",
                 ]
             },
         )
         runner_image = SimpleNamespace(
-            id="sha256:runner", attrs={"RepoDigests": [f"{RUNNER_REPOSITORY}@sha256:run"]}
+            id="sha256:runner",
+            attrs={
+                "RepoDigests": runner_digests
+                if runner_digests is not None
+                else [f"{RUNNER_REPOSITORY}@sha256:run"]
+            },
         )
         outer = self
 

@@ -259,6 +259,11 @@ class AppInstance:
 
     @staticmethod
     def _repo_digest(ref: str, image) -> str | None:
+        """A digest reference itself, since it names exactly the image Docker
+        resolved, even when ``RepoDigests`` spells it another way; else the
+        image's first digest for the reference's repository."""
+        if "@" in ref:
+            return ref
         repository = repository_of(ref)
         for digest in image.attrs.get("RepoDigests") or []:
             if digest.split("@", 1)[0] == repository:
@@ -266,7 +271,8 @@ class AppInstance:
         return None
 
     def _image(self, ref: str, error: type[AppStartError], what: str, pull: bool):
-        """The image to start, and its digest for its repository."""
+        """The image to start, and its digest: the one a digest reference
+        pins, else its first digest for its repository."""
         if not pull:
             # An image built on the host has no repo digest until it is pushed.
             image = self._local(ref, error, what)
