@@ -29,7 +29,7 @@ from scenario import AgentAdapter, AgentInput, AgentRole, ScenarioResult
 from weather_skills_eval import cli
 from weather_skills_eval import instance as instance_module
 from weather_skills_eval.app_client import AppClient, ChatError
-from weather_skills_eval.checks import Evidence, collect_evidence
+from weather_skills_eval.checks import Evidence, ReplyFiles, collect_evidence
 from weather_skills_eval.config import ConfigError, load_config, parse_config
 from weather_skills_eval.instance import (
     AppInstance,
@@ -296,9 +296,145 @@ def test_create_chat_without_id_is_a_chat_error():
 
 def test_artifact_listing_error_is_reported():
     app = client(lambda request: httpx.Response(500, json={"detail": "disk"}))
-    evidence = asyncio.run(collect_evidence(app, "c1", ["maps/rain.png"], ["image"]))
+    evidence = asyncio.run(collect_evidence(app, "c1", presenting("maps/rain.png"), ["image"]))
     assert "could not be listed" in evidence.problem
     assert evidence.files == []
+
+
+def presenting(*paths: str, candidates: frozenset[str] = frozenset()) -> list[ReplyFiles]:
+    """One reply, the reply to turn 1, that names ``paths``."""
+    return [ReplyFiles(1, list(paths), candidates)]
+
+
+def test_a_failed_listing_never_reports_a_candidate_as_unlisted():
+    app = client(lambda request: httpx.Response(500, json={"detail": "disk"}))
+    replies = presenting("maps/rain.png", "kenya.zarr", candidates=frozenset({"kenya.zarr"}))
+    evidence = asyncio.run(collect_evidence(app, "c1", replies, ["zarr"]))
+    assert evidence.unlisted == ["maps/rain.png"]
+    assert evidence.read_failed
+
+
+def test_an_unlisted_candidate_is_neither_presented_nor_missing():
+    entry = {
+        "path": "maps/rain.png",
+        "kind": "image",
+        "provenance_detail": {"branches": [{"label": None, "steps": [], "crumbs": []}]},
+    }
+
+    def handler(request):
+        if request.url.path.endswith("/artifacts"):
+            return httpx.Response(200, json=[entry])
+        return httpx.Response(200, content=b"png")
+
+    waits = []
+
+    async def wait():
+        waits.append(1)
+
+    replies = [
+        ReplyFiles(1, ["maps/rain.png"]),
+        # A later reply that names only paths the listing does not hold presents nothing.
+        ReplyFiles(2, ["missing.zarr", "precip"], frozenset({"missing.zarr", "precip"})),
+    ]
+    for every in (False, True):
+        evidence = asyncio.run(
+            collect_evidence(
+                client(handler), "c1", replies, ["image"], every=every, retries=1, wait=wait
+            )
+        )
+        assert evidence.problem is None
+        assert evidence.unlisted == []
+        assert [(f.path, f.turn) for f in evidence.files] == [("maps/rain.png", 1)]
+    # A missing candidate never makes the listing be read again.
+    assert waits == []
+
+
+PROVENANCE = {"branches": [{"label": None, "steps": [], "crumbs": []}]}
+
+
+def test_a_path_named_only_in_backticks_never_blocks_the_judge():
+    entries = [
+        {"path": "out.zarr", "kind": "zarr", "is_dir": True, "provenance_detail": PROVENANCE},
+        # Named in passing: an input store without provenance, and a map that cannot be read.
+        {"path": "era5_kenya.zarr", "kind": "zarr", "is_dir": True},
+        {"path": "maps/input.png", "kind": "image", "provenance_detail": PROVENANCE},
+    ]
+
+    def handler(request):
+        if request.url.path.endswith("/artifacts"):
+            return httpx.Response(200, json=entries)
+        return httpx.Response(404, json={"detail": "Not found"})
+
+    replies = presenting(
+        "out.zarr",
+        "era5_kenya.zarr",
+        "maps/input.png",
+        candidates=frozenset({"era5_kenya.zarr", "maps/input.png"}),
+    )
+    evidence = asyncio.run(collect_evidence(client(handler), "c1", replies, ["zarr"]))
+    assert evidence.problem is None
+    notes = {f.path: f.note for f in evidence.files}
+    assert notes["out.zarr"] is None
+    assert notes["era5_kenya.zarr"] == "it has no provenance"
+    assert notes["maps/input.png"].startswith("it could not be read:")
+
+
+def test_the_same_path_named_by_a_link_in_another_reply_still_blocks():
+    entries = [{"path": "out.zarr", "kind": "zarr", "is_dir": True}]
+    app = client(lambda request: httpx.Response(200, json=entries))
+    replies = [
+        ReplyFiles(1, ["out.zarr"]),
+        ReplyFiles(2, ["out.zarr"], frozenset({"out.zarr"})),
+    ]
+    evidence = asyncio.run(collect_evidence(app, "c1", replies, ["zarr"], every=True))
+    assert evidence.problem == "Presented files have no provenance: ['out.zarr']"
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"path": "maps", "kind": "directory", "is_dir": True},
+        {"path": "maps", "kind": "file", "is_dir": True},
+    ],
+    ids=["directory-kind", "is-dir"],
+)
+def test_a_listed_folder_named_in_backticks_presents_nothing(entry):
+    app = client(lambda request: httpx.Response(200, json=[entry]))
+    evidence = asyncio.run(
+        collect_evidence(app, "c1", presenting("maps", candidates=frozenset({"maps"})), [])
+    )
+    assert evidence.problem == "No result presented: no reply presented a file"
+
+
+def test_only_kinds_the_app_reads_provenance_from_need_it():
+    entries = [
+        {"path": "maps/rain.jpg", "kind": "image"},
+        {"path": "notes.txt", "kind": "file"},
+    ]
+
+    def handler(request):
+        if request.url.path.endswith("/artifacts"):
+            return httpx.Response(200, json=entries)
+        return httpx.Response(200, content=b"jpg")
+
+    evidence = asyncio.run(
+        collect_evidence(client(handler), "c1", presenting("maps/rain.jpg", "notes.txt"), [])
+    )
+    assert evidence.problem is None
+    assert [f.note for f in evidence.files] == ["it has no provenance"] * 2
+    for path, kind in (("maps/rain.png", "image"), ("map.html", "html"), ("o.zarr", "zarr")):
+        listing = [{"path": path, "kind": kind}]
+        app = client(lambda request, listing=listing: httpx.Response(200, json=listing))
+        evidence = asyncio.run(collect_evidence(app, "c1", presenting(path), []))
+        assert evidence.problem == f"Presented files have no provenance: ['{path}']"
+
+
+def test_only_unlisted_candidates_is_no_result_presented():
+    app = client(lambda request: httpx.Response(200, json=[{"path": "out/rain.zarr"}]))
+    replies = presenting("rain.zarr", candidates=frozenset({"rain.zarr"}))
+    evidence = asyncio.run(collect_evidence(app, "c1", replies, ["zarr"], every=True))
+    assert evidence.problem == "No result presented: no reply presented a file"
+    assert evidence.unlisted == []
 
 
 def test_a_failed_extra_listing_falls_back_to_the_earlier_listing():
@@ -326,7 +462,7 @@ def test_a_failed_extra_listing_falls_back_to_the_earlier_listing():
         collect_evidence(
             client(handler),
             "c1",
-            ["maps/rain.png", "maps/gone.png"],
+            presenting("maps/rain.png", "maps/gone.png"),
             ["image"],
             retries=1,
             wait=wait,
@@ -349,7 +485,7 @@ def test_a_failed_extra_listing_falls_back_to_the_earlier_listing():
 def test_presented_file_missing_from_the_listing_is_named():
     entries = [{"path": None, "kind": "image"}, {"kind": "image"}, "junk"]
     app = client(lambda request: httpx.Response(200, json=entries))
-    evidence = asyncio.run(collect_evidence(app, "c1", ["maps/rain.png"], ["image"]))
+    evidence = asyncio.run(collect_evidence(app, "c1", presenting("maps/rain.png"), ["image"]))
     assert evidence.problem == "Presented files are not in the chat's files: ['maps/rain.png']"
 
 
@@ -359,7 +495,7 @@ def test_provenance_detail_must_be_an_object(detail):
     if detail is not None:
         entry["provenance_detail"] = detail
     app = client(lambda request: httpx.Response(200, json=[entry]))
-    evidence = asyncio.run(collect_evidence(app, "c1", ["out.zarr"], ["zarr"]))
+    evidence = asyncio.run(collect_evidence(app, "c1", presenting("out.zarr"), ["zarr"]))
     assert evidence.problem == "Presented files have no provenance: ['out.zarr']"
 
 

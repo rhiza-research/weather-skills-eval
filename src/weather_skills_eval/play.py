@@ -28,7 +28,7 @@ from scenario import AgentAdapter, AgentInput, AgentRole, ScenarioResult
 from scenario.scenario_state import ScenarioState
 
 from .app_client import AppClient, Conversation, visible_text
-from .checks import Evidence, collect_evidence, presented_paths
+from .checks import Evidence, ReplyFiles, collect_evidence, reply_files
 from .judge import GoalJudge, rate_answer
 from .llm import Complete
 from .scoring import PlayFacts, Score, TraceMetrics, TraceRead, build_scores, trace_metrics
@@ -41,9 +41,8 @@ ChatObservations = Callable[[str, int], Awaitable[TraceRead]]
 class AppAgent(AgentAdapter):
     """The agent under test: the app, reached over HTTP. Keeps the exchanges
     that got a reply, so the conversation survives a play that errors, and
-    the files presented by the latest reply that presents any, the number of
-    replies that presented files, and every path presented during the play
-    with the turn that last presented it, in that order."""
+    the files each reply names, in order. Which of them a reply presents is
+    known only once the chat's file listing is read (see ``checks``)."""
 
     role = AgentRole.AGENT
     name = "weather-skills-chat"
@@ -51,21 +50,14 @@ class AppAgent(AgentAdapter):
     def __init__(self, conversation: Conversation):
         self._conversation = conversation
         self.exchanges: list[tuple[str, str]] = []
-        self.presented: list[str] = []
-        self.presentations = 0
-        self.presented_on: dict[str, int] = {}
+        self.replies: list[ReplyFiles] = []
 
     async def call(self, input: AgentInput):
         text = input.last_new_user_message_str()
         answer = await self._conversation.send(text)
-        presented = presented_paths(answer.content)
-        if presented:
-            self.presented = presented
-            self.presentations += 1
-            for path in presented:
-                # Moved to the end: the latest presentation of a path wins.
-                self.presented_on.pop(path, None)
-                self.presented_on[path] = len(self.exchanges) + 1
+        files = reply_files(answer.content, len(self.exchanges) + 1)
+        if files.paths:
+            self.replies.append(files)
         reply = visible_text(answer.content) or "(the reply has no text)"
         self.exchanges.append((text, reply))
         return reply
@@ -150,32 +142,30 @@ async def play(task: Task, deps: PlayDeps) -> PlayResult:
     agent = AppAgent(conversation)
     max_turns = task.max_turns(deps.max_turns)
 
-    # The user's evidence, the latest presenting reply's files, as
-    # (presentations, evidence): collected again only after a reply presents
+    # The user's evidence, the latest presenting reply's files, as (replies
+    # that name files, evidence): collected again only after a reply names
     # files, so each presented image is downloaded once per presenting reply.
     collected: tuple[int, Evidence] | None = None
-    # (presentations, images by path) downloaded for that presentation.
-    downloaded: tuple[int, dict[str, bytes]] = (0, {})
+    # Images downloaded for the user, by path and the turn that presented them.
+    downloaded: dict[tuple[str, int], bytes] = {}
 
     async def evidence() -> Evidence:
-        nonlocal collected, downloaded
-        if collected is not None and collected[0] == agent.presentations:
+        nonlocal collected
+        if collected is not None and collected[0] == len(agent.replies):
             return collected[1]
-        if downloaded[0] != agent.presentations:
-            downloaded = (agent.presentations, {})
         found = await collect_evidence(
             deps.app,
             conversation.chat_id,
-            agent.presented,
+            list(agent.replies),
             list(task.expected.deliverables),
-            known_images=downloaded[1],
+            known_images=downloaded,
         )
-        downloaded[1].update({f.path: f.image for f in found.files if f.image is not None})
+        downloaded.update({(f.path, f.turn): f.image for f in found.files if f.image is not None})
         # Dropped when the listing or a download failed, or a path is not
         # listed yet: the listing and the failed downloads are read again on
-        # the next turn, and the images already downloaded for this
-        # presentation are reused by path.
-        collected = None if found.read_failed or found.unlisted else (agent.presentations, found)
+        # the next turn, and the images already downloaded for the same
+        # presentation are reused by path and turn.
+        collected = None if found.read_failed or found.unlisted else (len(agent.replies), found)
         return found
 
     user = SimulatedUser(
@@ -190,10 +180,9 @@ async def play(task: Task, deps: PlayDeps) -> PlayResult:
         return collect_evidence(
             deps.app,
             conversation.chat_id,
-            list(agent.presented_on),
+            list(agent.replies),
             list(task.expected.deliverables),
-            turns=dict(agent.presented_on),
-            blocking=list(agent.presented),
+            every=True,
             # A failed listing or download is tried once more, after the poll
             # interval, before it counts.
             retries=1,

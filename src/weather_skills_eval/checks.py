@@ -1,14 +1,19 @@
 """The result a task expects: the files the assistant presents, with their provenance.
 
-A reply presents a file by a successful ``display_image`` call (its
-``path``), a successful ``send_email`` call (its ``attachments``), or a
-relative markdown image or link target in its text. The simulated user is
-shown the files of the latest reply that presents any; the judge rules on
-every file presented during the play, one per path. Each one's kind and
-provenance come from its entry in the chat's file listing: the app reads the
-``weather_skills_history`` chain of PNG images and zarr stores into
-``provenance_detail``. Only presented images are downloaded; other files of
-the chat are never fetched.
+A reply presents a file by a successful ``display_image`` call of an image
+or an .html page (its ``path``), a successful ``send_email`` call (its
+``attachments``), a relative markdown image or link target in its text, or
+text in single backticks in its text, outside fenced code blocks, that is
+exactly the path of a listed entry other than a folder; backtick text that
+is not such a path presents nothing. Text inside tool-call and reasoning
+blocks presents nothing. A path named only in backticks never blocks the
+judge: its problems are notes. The simulated user is shown the files of the
+latest reply that presents any; the judge rules on every file presented
+during the play, one per path. Each one's kind and provenance come from its
+entry in the chat's file listing: the app reads the
+``weather_skills_history`` chain of PNG images, .html pages and zarr stores
+into ``provenance_detail``, so only those need provenance. Only presented
+images are downloaded; other files of the chat are never fetched.
 """
 
 import html
@@ -27,6 +32,12 @@ _ATTR = re.compile(r'(\w+)="([^"]*)"')
 # A markdown image or link target, without its optional title.
 _LINK = re.compile(r"""!?\[[^\]]*\]\(\s*<?([^)\s>]+)>?(?:\s+(?:"[^"]*"|'[^']*'))?\s*\)""")
 _SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+# Text in single backticks, not part of a longer run of backticks.
+_CODE = re.compile(r"(?<!`)`([^`\n]+)`(?!`)")
+# A fenced code block, to its closing fence or the end of the text.
+_FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,}).*?(?:^[ \t]*\1|\Z)", re.MULTILINE | re.DOTALL)
+# The app's display_image result for an .html page it shows the user.
+_PAGE_SHOWN = re.compile(r"Showing `[^`]*` to the user as an interactive page\.")
 
 
 def _decode(raw: str | None):
@@ -59,8 +70,10 @@ def _tool_paths(attrs: dict[str, str]) -> list[str]:
     result = _decode(attrs.get("result"))
     if not isinstance(arguments, dict):
         return []
-    # display_image returns [note, image data URL]; the app stores the note list.
-    if name == "display_image" and isinstance(result, list):
+    # display_image returns [note, image data URL] for an image, and the app
+    # stores the note list; for an .html page it returns one text.
+    page_shown = isinstance(result, str) and _PAGE_SHOWN.match(result)
+    if name == "display_image" and (isinstance(result, list) or page_shown):
         return [p for p in [_path(arguments.get("path"))] if p]
     if name == "send_email" and isinstance(result, str) and result.startswith("Email sent to"):
         attachments = arguments.get("attachments")
@@ -72,27 +85,85 @@ def _tool_paths(attrs: dict[str, str]) -> list[str]:
     return []
 
 
-def _link_paths(text: str) -> list[str]:
-    paths = []
-    for target in _LINK.findall(text):
-        if _SCHEME.match(target) or target.startswith(("/", "#")):
-            continue
-        path = _path(unquote(re.split(r"[?#]", target, maxsplit=1)[0]))
-        if path:
-            paths.append(path)
-    return paths
+def _link_path(target: str) -> str | None:
+    if _SCHEME.match(target) or target.startswith(("/", "#")):
+        return None
+    return _path(unquote(re.split(r"[?#]", target, maxsplit=1)[0]))
 
 
-def presented_paths(content: str) -> list[str]:
-    """The chat paths one stored assistant reply presents, in order, each once."""
-    found: list[str] = []
+def _text_paths(text: str) -> list[tuple[str, bool]]:
+    """Link targets, and backtick candidates (True), in the order they appear."""
+    found = [(m.start(), _link_path(m.group(1)), False) for m in _LINK.finditer(text)]
+    fences = [m.span() for m in _FENCE.finditer(text)]
+    found += [
+        (m.start(), _path(m.group(1)), True)
+        for m in _CODE.finditer(text)
+        if not any(start <= m.start() < end for start, end in fences)
+    ]
+    return [(path, candidate) for _, path, candidate in sorted(found) if path]
+
+
+@dataclass(frozen=True)
+class ReplyFiles:
+    """The chat paths one stored assistant reply names, in order, each once.
+    A path in ``candidates`` was named only in backticks: it is presented
+    only when the chat's file listing has an entry with exactly that path."""
+
+    turn: int
+    paths: list[str]
+    candidates: frozenset[str] = frozenset()
+
+    def presented(self, listed) -> list[str]:
+        return [p for p in self.paths if p not in self.candidates or p in listed]
+
+
+def reply_files(content: str, turn: int) -> ReplyFiles:
+    """What one stored assistant reply, the reply to ``turn``, names as files."""
+    text = content or ""
+    named: list[tuple[str, bool]] = []
     position = 0
-    for match in _DETAILS.finditer(content or ""):
-        found += _link_paths(content[position : match.start()])
-        found += _tool_paths(dict(_ATTR.findall(match.group(1))))
+    for match in _DETAILS.finditer(text):
+        named += _text_paths(text[position : match.start()])
+        named += [(p, False) for p in _tool_paths(dict(_ATTR.findall(match.group(1))))]
         position = match.end()
-    found += _link_paths((content or "")[position:])
-    return list(dict.fromkeys(found))
+    named += _text_paths(text[position:])
+    definite = {path for path, candidate in named if not candidate}
+    paths = list(dict.fromkeys(path for path, _ in named))
+    return ReplyFiles(turn, paths, frozenset(p for p in paths if p not in definite))
+
+
+def _is_folder(entry: dict) -> bool:
+    # The app lists a zarr store, a folder too, with the kind "zarr".
+    return entry.get("kind") == "directory" or (
+        entry.get("is_dir") is True and entry.get("kind") != "zarr"
+    )
+
+
+def _resolve(
+    replies: list[ReplyFiles], entries: dict[str, dict], every: bool
+) -> tuple[list[str], dict[str, int], set[str]]:
+    """The presented paths in order, the turn that last presented each, and
+    the blocking ones: the files of the latest reply that presents any,
+    except paths no reply names other than in backticks. With ``every``,
+    the paths are every presented path, each at its latest presentation;
+    without, only that reply's."""
+    listed = {path for path, entry in entries.items() if not _is_folder(entry)}
+    definite = {p for reply in replies for p in reply.paths if p not in reply.candidates}
+    latest: list[str] = []
+    turns: dict[str, int] = {}
+    for reply in replies:
+        found = reply.presented(listed)
+        if not found:
+            continue
+        latest = found
+        for path in found:
+            # Moved to the end: the latest presentation of a path wins.
+            turns.pop(path, None)
+            turns[path] = reply.turn
+    blocks = set(latest) & definite
+    if every:
+        return list(turns), turns, blocks
+    return latest, {p: turns[p] for p in latest}, blocks
 
 
 # The image types the harness models are shown as images, by file suffix;
@@ -114,7 +185,7 @@ class PresentedFile:
     # None when the listing entry has none.
     provenance: dict | None
     image: bytes | None = None
-    # The turn whose reply presented the file, when the caller gives it.
+    # The turn whose reply last presented the file.
     turn: int | None = None
     # A problem with a file that does not block the judge, given to it instead.
     note: str | None = None
@@ -145,7 +216,7 @@ class Evidence:
     files: list[PresentedFile] = field(default_factory=list)
     problem: str | None = None
     # Blocking presented paths not found in the chat's file listing, or every
-    # presented path when the listing failed.
+    # presented path not named only in backticks when the listing failed.
     unlisted: list[str] = field(default_factory=list)
     # The listing or a download failed: a later read may succeed.
     read_failed: bool = False
@@ -156,6 +227,13 @@ def _has_provenance(entry: dict) -> bool:
     detail = entry.get("provenance_detail")
     branches = detail.get("branches") if isinstance(detail, dict) else None
     return isinstance(branches, list) and len(branches) > 0
+
+
+def _needs_provenance(entry: dict, path: str) -> bool:
+    """The app reads provenance only from PNG images, .html pages and zarr stores."""
+    kind = entry.get("kind")
+    png = kind == "image" and PurePosixPath(path).suffix.lower() == ".png"
+    return png or kind in ("html", "zarr")
 
 
 async def _no_wait() -> None:
@@ -176,31 +254,36 @@ async def _with_retries(read, retries: int, wait: Callable[[], Awaitable[None]])
             await wait()
 
 
+NOTHING_PRESENTED = "No result presented: no reply presented a file"
+
+
 async def collect_evidence(
     app: AppClient,
     chat_id: str | None,
-    presented: list[str],
+    replies: list[ReplyFiles],
     deliverables: list[str],
-    turns: dict[str, int] | None = None,
-    blocking: list[str] | None = None,
+    *,
+    every: bool = False,
     retries: int = 0,
-    known_images: dict[str, bytes] | None = None,
+    known_images: dict[tuple[str, int], bytes] | None = None,
     wait: Callable[[], Awaitable[None]] | None = None,
 ) -> Evidence:
-    """``turns`` gives the turn that presented each path. A file that is not
-    listed, has no provenance or cannot be downloaded makes the result one
-    that cannot be judged when its path is in ``blocking`` (every presented
-    path when None); any other file keeps the problem as its ``note``. The
-    deliverable kinds are checked against every presented file. The listing
-    is read up to ``retries`` more times when it fails or lacks a blocking
-    path (the listing may lag), and each download is tried ``retries`` more
-    times when it fails, after ``wait``. When an extra listing fails, the
-    last listing that succeeded is used. An image in ``known_images`` is not
-    downloaded."""
-    if chat_id is None or not presented:
-        return Evidence(problem="No result presented: no reply presented a file")
+    """The files of the latest reply that presents any or, with ``every``,
+    every presented path at the turn that last presented it. Backtick
+    candidates are resolved against the listing read here. A file of the
+    latest presenting reply that some reply names other than only in
+    backticks, and that is not listed, has no provenance although its kind
+    carries it, or cannot be downloaded, makes the result one that cannot be
+    judged; any other file keeps the problem as its ``note``. The deliverable kinds are checked
+    against every presented file. The listing is read up to ``retries`` more
+    times when it fails or lacks a path of the latest presenting reply (the
+    listing may lag), and each download is tried ``retries`` more times when
+    it fails, after ``wait``. When an extra listing fails, the last listing
+    that succeeded is used. An image in ``known_images``, by path and the
+    turn that presented it, is not downloaded."""
+    if chat_id is None or not any(reply.paths for reply in replies):
+        return Evidence(problem=NOTHING_PRESENTED)
     wait = wait or _no_wait
-    blocks = set(presented if blocking is None else blocking)
     attempts = 0
     entries: dict[str, dict] | None = None
     # The error of an extra listing that failed after one succeeded.
@@ -216,25 +299,30 @@ async def collect_evidence(
             if entries is not None:
                 relisting_error = str(exc)
                 break
+            # Without a listing no candidate counts as presented.
             return Evidence(
                 problem=f"The chat's files could not be listed: {exc}",
-                unlisted=list(presented),
+                unlisted=_resolve(replies, {}, every)[0],
                 read_failed=True,
             )
         entries = {
             e["path"]: e for e in listed if isinstance(e, dict) and isinstance(e.get("path"), str)
         }
-        lagging = [p for p in presented if p in blocks and p not in entries]
+        _, _, blocks = _resolve(replies, entries, every)
+        lagging = [p for p in blocks if p not in entries]
         if lagging and attempts < retries:
             attempts += 1
             await wait()
             continue
         break
+    presented, turns, blocks = _resolve(replies, entries, every)
+    if not presented:
+        return Evidence(problem=NOTHING_PRESENTED)
     kinds = {p: entries[p].get("kind") for p in presented if p in entries}
     files, missing, unproven = [], [], []
     unreadable, read_failed = None, False
     for path in presented:
-        turn = (turns or {}).get(path)
+        turn = turns[path]
         entry = entries.get(path)
         if entry is None:
             if path in blocks:
@@ -253,8 +341,8 @@ async def collect_evidence(
         notes = []
         image, download_failed = None, False
         listed_file = PresentedFile(path=path, kind=kinds[path], provenance=None)
-        if listed_file.shown_as_image and path in (known_images or {}):
-            image = known_images[path]
+        if listed_file.shown_as_image and (path, turn) in (known_images or {}):
+            image = known_images[(path, turn)]
         elif listed_file.shown_as_image:
             try:
                 image = await _with_retries(
@@ -268,7 +356,7 @@ async def collect_evidence(
                     notes.append(f"it could not be read: {exc}")
         provenance = entry["provenance_detail"] if _has_provenance(entry) else None
         if provenance is None:
-            if path in blocks:
+            if path in blocks and _needs_provenance(entry, path):
                 unproven.append(path)
             else:
                 notes.append("it has no provenance")

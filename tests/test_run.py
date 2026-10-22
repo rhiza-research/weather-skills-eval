@@ -28,7 +28,9 @@ from fakes import (
     app_observations,
     broadcast_observations,
     display_image,
+    display_page,
     emulator_file,
+    html_entry,
     image_bytes,
     image_entry,
     local_image,
@@ -482,6 +484,125 @@ def test_emailed_attachment_is_presented(tmp_path):
     assert "maps/rain.png (image)" in json.dumps(judge_parts(harness))
 
 
+def test_a_zarr_named_only_in_backticks_reaches_the_goal(tmp_path):
+    items = [task("t1", "rain data kenya", deliverables=["zarr"])]
+    harness = Harness(
+        tmp_path,
+        items,
+        map_reply(
+            presenting="The data is saved as `kenya_rain.zarr`.",
+            files={},
+            artifacts=[zarr_entry("kenya_rain.zarr")],
+        ),
+    )
+    harness.run()
+
+    assert harness.output()["outcome"] == "goal_reached"
+    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == [
+        "File: kenya_rain.zarr (zarr), presented on turn 2"
+    ]
+    assert evidence_files(harness.models.user_calls()[-1]["messages"]) == [
+        "File: kenya_rain.zarr (zarr)"
+    ]
+
+
+def test_backtick_text_that_is_not_a_listed_path_presents_nothing(tmp_path):
+    items = [task("t1", "rain data kenya", deliverables=["zarr"])]
+
+    def reply(opening, number, text):
+        if number == 1:
+            return Reply("Which data source should I use?")
+        if number == 2:
+            return Reply(
+                "Download it: [data](out.zarr). The variable is `precip`; `missing.zarr` failed.",
+                artifacts=[zarr_entry("out.zarr")],
+            )
+        return Reply("DONE: the variable in it is `precip`.")
+
+    harness = Harness(
+        tmp_path, items, reply, user_replies={"rain data kenya": [progress("era5"), progress("ok")]}
+    )
+    harness.run()
+
+    assert harness.output()["outcome"] == "goal_reached"
+    # A later reply naming only unlisted text does not replace the presented files.
+    assert [evidence_files(c["messages"]) for c in harness.models.user_calls()] == [
+        [],
+        ["File: out.zarr (zarr)"],
+        ["File: out.zarr (zarr)"],
+    ]
+    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == [
+        "File: out.zarr (zarr), presented on turn 2"
+    ]
+
+
+@pytest.mark.parametrize(
+    "presenting",
+    [
+        "DONE: saved `rain.zarr`.",
+        "DONE: saved it.\n" + tool_call("list_artifacts", {}, "- `out/rain.zarr/` (zarr)"),
+    ],
+    ids=["basename-only", "inside-a-tool-block"],
+)
+def test_backticks_that_do_not_name_a_listed_path_in_the_reply_text_skip_the_judge(
+    tmp_path, presenting
+):
+    items = [task("t1", "rain data kenya", turn_limit=2, deliverables=["zarr"])]
+    harness = Harness(
+        tmp_path,
+        items,
+        map_reply(presenting=presenting, files={}, artifacts=[zarr_entry("out/rain.zarr")]),
+    )
+    harness.run()
+
+    output = harness.output()
+    assert output["outcome"] == "user_done"
+    assert output["reasoning"].endswith(
+        "(final check failed: No result presented: no reply presented a file)"
+    )
+    assert harness.models.verdict_calls() == []
+    assert evidence_files(harness.models.user_calls()[-1]["messages"]) == []
+
+
+def test_a_displayed_html_page_is_presented_but_is_not_an_image(tmp_path):
+    items = [task("t1", "rain map kenya", turn_limit=2, deliverables=["image"])]
+    harness = Harness(
+        tmp_path,
+        items,
+        map_reply(
+            presenting=display_page("map.html"), files={}, artifacts=[html_entry("map.html")]
+        ),
+    )
+    harness.run()
+
+    reasoning = harness.output()["reasoning"]
+    assert "No presented file is an image; presented: map.html (html)" in reasoning
+    assert harness.models.verdict_calls() == []
+    assert evidence_files(harness.models.user_calls()[-1]["messages"]) == ["File: map.html (html)"]
+    # A page is never downloaded.
+    assert {r[0] for r in harness.app.file_requests} == {"/artifacts"}
+
+
+def test_a_displayed_html_page_and_a_zarr_reach_the_judge(tmp_path):
+    items = [task("t1", "rain data kenya", deliverables=["zarr"])]
+    harness = Harness(
+        tmp_path,
+        items,
+        map_reply(
+            presenting=display_page("map.html") + "Data: [data](out.zarr)",
+            files={},
+            artifacts=[html_entry("map.html"), zarr_entry("out.zarr")],
+        ),
+    )
+    harness.run()
+
+    assert harness.output()["outcome"] == "goal_reached"
+    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == [
+        "File: map.html (html), presented on turn 2",
+        "File: out.zarr (zarr), presented on turn 2",
+    ]
+
+
 def evidence_files(messages: list[dict]) -> list[str]:
     """The ``File:`` lines of the harness evidence in a model call's messages."""
     evidence = [m for m in messages if isinstance(m.get("content"), list)]
@@ -578,8 +699,14 @@ def test_a_path_presented_twice_reaches_the_judge_once_with_its_latest_image(tmp
     assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == [
         "File: maps/rain.png (image), presented on turn 3"
     ]
+    in_mm = f"data:image/png;base64,{base64.b64encode(b'map in mm').decode()}"
     images = [p["image_url"]["url"] for p in judge_parts(harness) if p["type"] == "image_url"]
-    assert images == [f"data:image/png;base64,{base64.b64encode(b'map in mm').decode()}"]
+    assert images == [in_mm]
+    # The user saw the replotted map too: downloaded for each presentation, then by the judge.
+    user_parts = harness.models.user_calls()[-1]["messages"][-2]["content"]
+    assert [p["image_url"]["url"] for p in user_parts if p["type"] == "image_url"] == [in_mm]
+    downloads = [r for r in harness.app.file_requests if r[0] != "/artifacts"]
+    assert downloads == [("/artifacts/content", "maps/rain.png")] * 3
 
 
 def daily_then_weekly(opening, number, text):

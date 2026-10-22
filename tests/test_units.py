@@ -1,8 +1,8 @@
 import pytest
-from fakes import display_image, tool_call
+from fakes import display_image, display_page, tool_call
 
 from weather_skills_eval.app_client import highest_skill_versions, version_key, visible_text
-from weather_skills_eval.checks import presented_paths
+from weather_skills_eval.checks import ReplyFiles, reply_files
 from weather_skills_eval.config import ConfigError, pack_name, parse_config
 from weather_skills_eval.scoring import split_usage, trace_metrics
 from weather_skills_eval.settings import SettingsError, load_settings
@@ -301,6 +301,11 @@ def test_task_rejects_artifact_checks():
         parse_task(item(expected_output={"artifact_checks": [{"path": "*.png"}]}))
 
 
+def presented_paths(content: str) -> list[str]:
+    """The paths a reply presents whatever the chat's file listing holds."""
+    return reply_files(content, 1).presented(())
+
+
 def test_presented_paths_come_from_successful_tool_calls_and_relative_links():
     content = "".join(
         [
@@ -354,6 +359,65 @@ def test_emailed_attachments_that_are_not_paths_are_ignored(attachments, paths):
         "Email sent to a@example.invalid with reply-to `a@example.invalid`.",
     )
     assert presented_paths(content) == paths
+
+
+def test_a_successful_html_display_presents_its_path_and_a_failed_one_nothing():
+    content = "".join(
+        [
+            display_page("plots/sst.html"),
+            tool_call("display_image", {"path": "nope.html"}, "File not found: `nope.html`"),
+            tool_call(
+                "display_image",
+                {"path": "data.csv"},
+                "Unsupported type. Use a .png, .jpg, .jpeg, .gif, or .webp image, or an .html "
+                "page (got `.csv`).",
+            ),
+        ]
+    )
+    assert presented_paths(content) == ["plots/sst.html"]
+
+
+def test_backtick_text_outside_tool_blocks_is_a_candidate_in_order():
+    content = (
+        "Saved `kenya.zarr` from [the map](maps/rain.png) with variable `precip`.\n"
+        + tool_call("list_artifacts", {}, "- `listed.zarr` (zarr)")
+        + '<details type="reasoning" done="true">\n`draft.zarr`\n</details>\n'
+        + "Also `./out/rain.zarr/`, ``double.zarr``, ```fence.zarr``` and `maps/rain.png`."
+    )
+    files = reply_files(content, 3)
+    assert files == ReplyFiles(
+        3,
+        ["kenya.zarr", "maps/rain.png", "precip", "out/rain.zarr"],
+        frozenset({"kenya.zarr", "precip", "out/rain.zarr"}),
+    )
+
+
+def test_backticks_inside_a_fenced_code_block_are_not_candidates():
+    content = (
+        "Saved `kenya.zarr`:\n"
+        "```python\n"
+        "ds = xr.open_zarr('x')  # see `inside.zarr`\n"
+        "print(`also_inside.zarr`)\n"
+        "```\n"
+        "~~~\n`tilde.zarr`\n~~~\n"
+        "Then `after.zarr`.\n"
+        "```\n`unclosed.zarr`\n"
+    )
+    assert reply_files(content, 1).paths == ["kenya.zarr", "after.zarr"]
+
+
+@pytest.mark.parametrize(
+    "listed, presented",
+    [
+        ({"kenya.zarr"}, ["kenya.zarr", "maps/rain.png"]),
+        ({"out/kenya.zarr", "missing.zarr"}, ["maps/rain.png"]),
+        (set(), ["maps/rain.png"]),
+    ],
+    ids=["listed", "basename-only", "not-listed"],
+)
+def test_a_candidate_is_presented_only_when_listed_with_exactly_that_path(listed, presented):
+    files = reply_files("Here: `kenya.zarr` and `precip`.\n" + display_image("maps/rain.png"), 1)
+    assert files.presented(listed) == presented
 
 
 def test_split_usage_moves_cache_counts_out_of_input():

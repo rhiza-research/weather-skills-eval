@@ -108,6 +108,21 @@ def display_image(path: str) -> str:
     return tool_call("display_image", {"path": path}, [f"Showing `{path}`."])
 
 
+def display_page(path: str) -> str:
+    """A successful display_image call of an .html page; the app returns one text."""
+    return tool_call(
+        "display_image",
+        {"path": path},
+        f"Showing `{path}` to the user as an interactive page. You cannot see it; to look "
+        "at a figure yourself, also save it as a PNG and use read_artifact.",
+    )
+
+
+def html_entry(path: str) -> dict:
+    """An .html page listing entry, with the provenance of ``chain()``."""
+    return _entry(path, "html", chain())
+
+
 def image_entry(
     path: str, fetcher: str = "arco-era5-fetch", provenance: bool = True, period: str = "weekly"
 ) -> dict:
