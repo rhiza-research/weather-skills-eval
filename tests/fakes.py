@@ -614,11 +614,14 @@ class FakeModels:
     simulated user gives in order, each a JSON object, a text sent as is,
     None for a reply without text, or an exception the call raises. Past
     those, the simulated user is done when the assistant's last message
-    contains ``DONE``, and asks it to go on otherwise. The judge passes every
+    contains ``DONE``, and asks it to go on otherwise. A judge passes every
     criterion when the messages it gets contain ``DONE`` and not
-    ``judge_fails_on``; with ``judge_without_verdict`` its verdict call
-    answers in text, without the finish_test call; the answer-quality call
-    raises ``quality_error`` and the verdict call ``verdict_error`` when given.
+    ``judge_fails_on``, and its model is not in ``failing_judges``; with
+    ``judge_without_verdict`` its verdict call answers in text, without the
+    finish_test call; the answer-quality call raises ``quality_error`` and the
+    verdict call ``verdict_error`` when given, for every judge model or, with
+    ``verdict_error_for``, only for that one. A judge rates the answer 4, or
+    its score in ``quality_scores``.
     """
 
     def __init__(
@@ -628,12 +631,18 @@ class FakeModels:
         judge_without_verdict: bool = False,
         quality_error: Exception | None = None,
         verdict_error: Exception | None = None,
+        verdict_error_for: str | None = None,
+        failing_judges: set[str] | None = None,
+        quality_scores: dict[str, int] | None = None,
     ):
         self.user_replies = {k: list(v) for k, v in (user_replies or {}).items()}
         self.judge_fails_on = judge_fails_on
         self.judge_without_verdict = judge_without_verdict
         self.quality_error = quality_error
         self.verdict_error = verdict_error
+        self.verdict_error_for = verdict_error_for
+        self.failing_judges = failing_judges or set()
+        self.quality_scores = quality_scores or {}
         self.calls: list[tuple[str, str | None, dict]] = []
 
     def verdict_calls(self) -> list[dict]:
@@ -672,8 +681,9 @@ class FakeModels:
                 )
             )
         assert role == "judge"
+        model = kwargs.get("model")
         tools = kwargs.get("tools")
-        if tools and self.verdict_error:
+        if tools and self.verdict_error and self.verdict_error_for in (None, model):
             raise self.verdict_error
         if tools and self.judge_without_verdict:
             return _response("I think it looks fine.")
@@ -681,8 +691,10 @@ class FakeModels:
             finish = next(t for t in tools if t["function"]["name"] == "finish_test")
             keys = finish["function"]["parameters"]["properties"]["criteria"]["properties"]
             conversation = json.dumps(messages)
-            passed = "DONE" in conversation and not (
-                self.judge_fails_on and self.judge_fails_on in conversation
+            passed = (
+                "DONE" in conversation
+                and not (self.judge_fails_on and self.judge_fails_on in conversation)
+                and model not in self.failing_judges
             )
             status = "passed" if passed else "failed"
             answers = {
@@ -698,7 +710,8 @@ class FakeModels:
             )
         if self.quality_error:
             raise self.quality_error
-        return _response(json.dumps({"score": 4, "reasoning": "clear answer"}))
+        score = self.quality_scores.get(model, 4)
+        return _response(json.dumps({"score": score, "reasoning": "clear answer"}))
 
 
 def app_observations(chat_id: str, turns: int) -> list[dict]:

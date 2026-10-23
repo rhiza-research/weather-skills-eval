@@ -24,19 +24,39 @@ Order of a run:
 """
 
 import asyncio
+import hashlib
+import importlib.metadata
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from .app_client import AppClient, ChatError, highest_skill_versions
 from .config import RunConfig, load_config
 from .instance import AppInstance, RunnerStartError
+from .judge import (
+    EVIDENCE_HEADER,
+    PROVENANCE_CRITERION,
+    QUALITY_PROMPT,
+    SCENARIO_DESCRIPTION,
+    STARTED_LINE,
+)
 from .langfuse_gateway import LangfuseGateway
 from .play import PlayDeps, play
 from .scoring import COST_SCORE
 from .settings import Settings, load_settings
+from .simulated_user import (
+    CONVERSATION_HEADER,
+    FILES_HEADER,
+    REPLY_REQUEST,
+    RETRY_REQUEST,
+)
+from .simulated_user import SYSTEM_PROMPT as SIMULATED_USER_PROMPT
 from .tasks import parse_tasks
+
+# Bumped by hand when how a play is graded changes in a way the prompt texts
+# in the comparability hash do not show.
+GRADING_VERSION = 1
 
 
 class DatasetError(Exception):
@@ -82,6 +102,66 @@ def base_model(entry: dict, catalog_id: str, connections: list[dict]) -> str:
         ):
             serving = connection
     return bare(serving.get("prefix_id"))
+
+
+def _canonical(value) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def comparability_hash(
+    *,
+    judge_models: Iterable[str],
+    simulated_user_model: str,
+    items: Iterable,
+    max_turns: int,
+    model_max_tokens: int,
+    turn_timeout: float,
+) -> str:
+    """The first 16 hex characters of the SHA-256 of what grades a run: two runs
+    with the same hash were graded the same way. What is under test (the agent's
+    model, the app and runner images, skill packs, the app's system prompt) is not
+    in it. ``items`` are the dataset items, each with id, input, expected_output
+    and metadata."""
+
+    def value_of(item, key):
+        return item.get(key) if isinstance(item, dict) else getattr(item, key, None)
+
+    dataset = sorted(
+        (
+            {key: value_of(item, key) for key in ("id", "input", "expected_output", "metadata")}
+            for item in items
+        ),
+        key=lambda item: str(item["id"]),
+    )
+    prompts = {
+        "judge": [SCENARIO_DESCRIPTION, STARTED_LINE, PROVENANCE_CRITERION, EVIDENCE_HEADER],
+        # Scenario's judge system prompt lives in this package.
+        "langwatch_scenario": importlib.metadata.version("langwatch-scenario"),
+        "simulated_user": [
+            SIMULATED_USER_PROMPT,
+            CONVERSATION_HEADER,
+            FILES_HEADER,
+            REPLY_REQUEST,
+            RETRY_REQUEST,
+        ],
+        "answer_quality": QUALITY_PROMPT,
+    }
+    graded = {
+        "judge_models": sorted(judge_models),
+        "simulated_user_model": simulated_user_model,
+        "dataset": dataset,
+        "grading": {
+            "version": GRADING_VERSION,
+            "prompts": hashlib.sha256(_canonical(prompts)).hexdigest(),
+        },
+        "settings": {
+            "max_turns": max_turns,
+            "model_max_tokens": model_max_tokens,
+            # A float, so 1800 and 1800.0 hash alike.
+            "turn_timeout": float(turn_timeout),
+        },
+    }
+    return hashlib.sha256(_canonical(graded)).hexdigest()[:16]
 
 
 async def _resolved(app: AppClient, config: RunConfig) -> tuple[list[str], list[dict], str]:
@@ -225,7 +305,15 @@ def _run(
             "skill_packs": json.dumps(packs),
             "tool_ids": ",".join(tool_ids),
             "simulated_user_model": settings.simulated_user_model,
-            "judge_model": settings.judge_model,
+            "judge_models": ",".join(sorted(settings.judge_models)),
+            "comparability_hash": comparability_hash(
+                judge_models=settings.judge_models,
+                simulated_user_model=settings.simulated_user_model,
+                items=dataset.items,
+                max_turns=settings.max_turns,
+                model_max_tokens=settings.model_max_tokens,
+                turn_timeout=settings.turn_timeout,
+            ),
             "max_turns": str(settings.max_turns),
             "harness_commit": settings.harness_commit or "unrecorded",
             "batch": settings.batch,
@@ -270,7 +358,7 @@ def _run(
                         model=config.model,
                         tool_ids=tool_ids,
                         simulated_user_model=settings.simulated_user_model,
-                        judge_model=settings.judge_model,
+                        judge_models=list(settings.judge_models),
                         max_turns=settings.max_turns,
                         complete=gateway.traced_completion,
                         chat_observations=gateway.chat_observations,

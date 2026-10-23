@@ -143,6 +143,11 @@ class Score:
     comment: str | None = None
 
 
+def judge_label(model: str) -> str:
+    """A judge model as named in its scores: without the ``openrouter/`` prefix."""
+    return model.removeprefix("openrouter/")
+
+
 @dataclass
 class PlayFacts:
     goal_reached: bool
@@ -151,8 +156,13 @@ class PlayFacts:
     clarifying_questions: int
     hints_used: int
     time_to_answer_seconds: float
-    answer_quality: int | None
-    answer_quality_reasoning: str = ""
+    # Per judge: (model, its answer-quality rating or None when not rated, its reasoning).
+    answer_quality: list[tuple[str, int | None, str]] = field(default_factory=list)
+    # Whether the judges that ruled gave the same verdict; None when the panel did
+    # not rule, fewer than two judges ruled, or no judge model was called.
+    judges_agree: bool | None = None
+    # Each judge's verdict, for the judges_agree comment.
+    judges_comment: str = ""
 
 
 def build_scores(
@@ -180,8 +190,21 @@ def build_scores(
             f"time the app spent on answered turns, pauses and failed turns excluded, {scope}",
         ),
     ]
-    if facts.answer_quality is not None:
-        scores.append(Score("answer_quality", facts.answer_quality, facts.answer_quality_reasoning))
+    if facts.judges_agree is not None:
+        agree = 1.0 if facts.judges_agree else 0.0
+        scores.append(Score("judges_agree", agree, facts.judges_comment))
+    rated = [(model, score, why) for model, score, why in facts.answer_quality if score is not None]
+    if rated:
+        unrated = [
+            f"not rated by {judge_label(m)}: {why}"
+            for m, score, why in facts.answer_quality
+            if score is None
+        ]
+        mean_of = f"mean of {len(rated)} of {len(facts.answer_quality)} judges"
+        comment = "; ".join([mean_of, *unrated])
+        mean = sum(score for _, score, _ in rated) / len(rated)
+        scores.append(Score("answer_quality", mean, comment))
+        scores += [Score(f"answer_quality:{judge_label(m)}", s, why) for m, s, why in rated]
     if metrics is None:
         return scores
     note = scope if traces_complete else f"{scope}; {partial_reason}"

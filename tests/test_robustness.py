@@ -236,7 +236,7 @@ def settings_env(**overrides):
         "OPENROUTER_API_KEY": "or",
         "LANGFUSE_TRACING_ENVIRONMENT": "eval",
         "EVAL_SIMULATED_USER_MODEL": "u",
-        "EVAL_JUDGE_MODEL": "j",
+        "EVAL_JUDGE_MODELS": "j",
         "EVAL_DOCKER_NETWORK": "n",
     }
     env.update(overrides)
@@ -1135,7 +1135,7 @@ def test_a_cancelled_final_judge_call_keeps_its_evidence_until_the_verdict_ends(
 @pytest.mark.parametrize(
     "error, code, message",
     [
-        (SettingsError("EVAL_JUDGE_MODEL is not set"), 2, "Run not started"),
+        (SettingsError("EVAL_JUDGE_MODELS is not set"), 2, "Run not started"),
         (ConfigError("image", "is missing"), 2, "Run not started"),
         (TaskError("dataset item t1: bad"), 2, "Run not started"),
         (DatasetError("Dataset d has no items"), 2, "Run not started"),
@@ -1449,7 +1449,7 @@ def answer(monkeypatch, text: str) -> None:
 
 def test_cli_delete_deletes_every_trace_of_the_run_on_yes(monkeypatch, capsys):
     # Only the Langfuse settings are needed, not the run's.
-    for name in ("OPENROUTER_API_KEY", "EVAL_SIMULATED_USER_MODEL", "EVAL_JUDGE_MODEL"):
+    for name in ("OPENROUTER_API_KEY", "EVAL_SIMULATED_USER_MODEL", "EVAL_JUDGE_MODELS"):
         monkeypatch.delenv(name, raising=False)
     answer(monkeypatch, "yes\n")
     api = run_api()

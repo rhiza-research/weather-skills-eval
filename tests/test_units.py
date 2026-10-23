@@ -1,9 +1,14 @@
+from types import SimpleNamespace
+
 import pytest
 from fakes import display_image, display_page, tool_call
 
+from weather_skills_eval import runner
 from weather_skills_eval.app_client import highest_skill_versions, version_key, visible_text
 from weather_skills_eval.checks import ReplyFiles, reply_files
 from weather_skills_eval.config import ConfigError, pack_name, parse_config
+from weather_skills_eval.judge import JudgeRuling, PanelRuling
+from weather_skills_eval.runner import comparability_hash
 from weather_skills_eval.scoring import split_usage, trace_metrics
 from weather_skills_eval.settings import SettingsError, load_settings
 from weather_skills_eval.simulated_user import SYSTEM_PROMPT
@@ -176,7 +181,7 @@ def settings_env(**overrides):
         "OPENROUTER_API_KEY": "or",
         "LANGFUSE_TRACING_ENVIRONMENT": "eval",
         "EVAL_SIMULATED_USER_MODEL": "u",
-        "EVAL_JUDGE_MODEL": "j",
+        "EVAL_JUDGE_MODELS": "j",
         "EVAL_DOCKER_NETWORK": "n",
     }
     env.update(overrides)
@@ -190,9 +195,191 @@ def test_settings_refuse_the_production_environment():
 
 def test_settings_name_the_missing_variable():
     env = settings_env()
-    del env["EVAL_JUDGE_MODEL"]
-    with pytest.raises(SettingsError, match="EVAL_JUDGE_MODEL"):
+    del env["EVAL_JUDGE_MODELS"]
+    with pytest.raises(SettingsError, match="EVAL_JUDGE_MODELS is not set"):
         load_settings(env)
+
+
+def test_judge_models_are_a_comma_separated_panel():
+    assert load_settings(settings_env()).judge_models == ("j",)
+    panel = " openrouter/b/two , openrouter/a/one"
+    settings = load_settings(settings_env(EVAL_JUDGE_MODELS=panel))
+    assert settings.judge_models == ("openrouter/b/two", "openrouter/a/one")
+
+
+@pytest.mark.parametrize(
+    "value, message",
+    [
+        ("", "is not set"),
+        ("  ", "is not set"),
+        ("a,,b", "has an empty model name"),
+        ("a,", "has an empty model name"),
+        ("a, a", "names a model more than once"),
+    ],
+    ids=repr,
+)
+def test_invalid_judge_models_name_the_variable(value, message):
+    with pytest.raises(SettingsError, match=f"EVAL_JUDGE_MODELS {message}"):
+        load_settings(settings_env(EVAL_JUDGE_MODELS=value))
+
+
+def test_the_old_judge_model_variable_is_not_read():
+    env = settings_env(EVAL_JUDGE_MODEL="j")
+    del env["EVAL_JUDGE_MODELS"]
+    with pytest.raises(SettingsError, match="EVAL_JUDGE_MODELS is not set"):
+        load_settings(env)
+
+
+HASH_ITEMS = [
+    {
+        "id": "t1",
+        "input": "rain next week",
+        "expected_output": {"judge_criteria": ["gives totals"]},
+        "metadata": {"facts": "Kenya"},
+    },
+    {
+        "id": "t2",
+        "input": "weekly rain map",
+        "expected_output": {"deliverables": ["image"]},
+        "metadata": {"facts": "Kenya", "hidden_steps": ["use weekly sums"]},
+    },
+]
+
+
+def graded(**overrides) -> str:
+    """The comparability hash of a run graded by two judges, changed by ``overrides``."""
+    inputs = {
+        "judge_models": ["openrouter/a/one", "openrouter/b/two"],
+        "simulated_user_model": "openrouter/u/user",
+        "items": HASH_ITEMS,
+        "max_turns": 20,
+        "model_max_tokens": 8192,
+        "turn_timeout": 1800.0,
+    }
+    inputs.update(overrides)
+    return comparability_hash(**inputs)
+
+
+def test_the_comparability_hash_is_16_hex_characters_and_stable():
+    first = graded()
+    assert len(first) == 16
+    assert int(first, 16) >= 0
+    assert graded() == first
+    # Neither the judges' nor the items' order changes it.
+    assert graded(judge_models=["openrouter/b/two", "openrouter/a/one"]) == first
+    assert graded(items=list(reversed(HASH_ITEMS))) == first
+    # Items read from Langfuse are objects, not dicts.
+    objects = [SimpleNamespace(**item) for item in HASH_ITEMS]
+    assert graded(items=objects) == first
+    # A whole-number timeout read as a float is the same setting.
+    assert graded(turn_timeout=1800) == first
+
+
+def first_item_with(**changes) -> list[dict]:
+    """HASH_ITEMS with ``changes`` made to the first item."""
+    return [{**HASH_ITEMS[0], **changes}, *HASH_ITEMS[1:]]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"judge_models": ["openrouter/a/one", "openrouter/c/three"]},
+        {"judge_models": ["openrouter/a/one"]},
+        {"simulated_user_model": "openrouter/u/other"},
+        {"items": first_item_with(input="rain next month")},
+        {"items": first_item_with(metadata={"facts": "Uganda"})},
+        {"items": first_item_with(expected_output={"judge_criteria": ["gives daily totals"]})},
+        {"items": HASH_ITEMS[:1]},
+        {"max_turns": 21},
+        {"model_max_tokens": 4096},
+        {"turn_timeout": 900.0},
+    ],
+    ids=[
+        "one-judge-changed",
+        "one-judge-dropped",
+        "user-model",
+        "item-input",
+        "item-metadata",
+        "item-expected-output",
+        "item-removed",
+        "max-turns",
+        "model-max-tokens",
+        "turn-timeout",
+    ],
+)
+def test_the_comparability_hash_changes_with_what_grades_a_run(overrides):
+    assert graded(**overrides) != graded()
+
+
+def test_the_comparability_hash_changes_with_the_grading_version_and_prompts(monkeypatch):
+    first = graded()
+    monkeypatch.setattr(runner, "GRADING_VERSION", runner.GRADING_VERSION + 1)
+    assert graded() != first
+    monkeypatch.undo()
+    for name in (
+        "SCENARIO_DESCRIPTION",
+        "STARTED_LINE",
+        "PROVENANCE_CRITERION",
+        "EVIDENCE_HEADER",
+        "QUALITY_PROMPT",
+        "SIMULATED_USER_PROMPT",
+        "CONVERSATION_HEADER",
+        "FILES_HEADER",
+        "REPLY_REQUEST",
+        "RETRY_REQUEST",
+    ):
+        monkeypatch.setattr(runner, name, getattr(runner, name) + " ")
+        assert graded() != first, name
+        monkeypatch.undo()
+    # Scenario's judge system prompt is in the installed langwatch-scenario.
+    installed = runner.importlib.metadata.version
+    monkeypatch.setattr(runner.importlib.metadata, "version", lambda name: installed(name) + ".x")
+    assert graded() != first
+    monkeypatch.undo()
+    assert graded() == first
+
+
+def ruling(model, passed, reasoning, model_called=True) -> JudgeRuling:
+    return JudgeRuling(f"openrouter/{model}", passed, reasoning, model_called)
+
+
+def test_the_judges_that_ruled_decide_and_an_errored_judge_is_left_out():
+    panel = PanelRuling(
+        [ruling("a", True, "ok"), ruling("b", None, "Timeout: x"), ruling("c", True, "ok")]
+    )
+    assert panel.error is None
+    assert panel.passed is True
+    assert panel.agree is True
+    assert panel.verdict == (
+        "openrouter/a passed: ok; openrouter/b errored: Timeout: x; openrouter/c passed: ok"
+    )
+    assert [j["state"] for j in panel.output()] == ["passed", "error", "passed"]
+    assert panel.output()[1]["passed"] is None
+    # One pass and one fail among the judges that ruled is a tie, which fails.
+    tied = PanelRuling([ruling("a", True, "ok"), ruling("b", None, "x"), ruling("c", False, "no")])
+    assert tied.passed is False
+    assert tied.agree is False
+
+
+def test_a_panel_where_no_judge_ruled_is_an_error():
+    panel = PanelRuling([ruling("a", None, "Timeout: x"), ruling("b", None, "Timeout: y")])
+    assert panel.error == "openrouter/a errored: Timeout: x; openrouter/b errored: Timeout: y"
+    assert panel.passed is False
+    assert panel.agree is None
+
+
+def test_judges_agree_needs_two_judges_that_ruled_and_a_model_call():
+    assert PanelRuling([ruling("a", True, "ok")]).agree is None
+    assert PanelRuling([ruling("a", True, "ok"), ruling("b", None, "x")]).agree is None
+    no_call = [ruling(m, False, "No result presented", model_called=False) for m in "ab"]
+    assert PanelRuling(no_call).agree is None
+
+
+def test_the_verdict_is_shared_only_for_the_same_verdict_and_reasoning():
+    same = PanelRuling([ruling("a", False, "too wet"), ruling("b", False, "too wet")])
+    assert same.verdict == "too wet"
+    split = PanelRuling([ruling("a", True, "too wet"), ruling("b", False, "too wet")])
+    assert split.verdict == "openrouter/a passed: too wet; openrouter/b failed: too wet"
 
 
 def item(**overrides):

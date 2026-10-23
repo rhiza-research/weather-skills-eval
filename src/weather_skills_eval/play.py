@@ -5,17 +5,19 @@ ends when the simulated user is done or gives up, or when the turn cap
 passes: the task's ``turn_limit``, else ``EVAL_MAX_TURNS``, given to Scenario
 as ``max_turns``. At the cap the simulated user reads the last reply once
 more, outside Scenario's run, so it can still be done or give up; nothing
-more is sent to the app. The judge then rules once on the final result. A pause scheduled before turn
+more is sent to the app. The judge panel then rules once on the final result: every
+judge on the same evidence, the majority of the judges that ruled deciding; a judge
+whose call failed is recorded as errored and left out. A pause scheduled before turn
 k runs at the start of that turn, before the user speaks; it is outside every
 app answer, so the time to answer does not include it.
 
-Outcomes: ``goal_reached`` (the user is done and the judge passed);
+Outcomes: ``goal_reached`` (the user is done and the panel passed);
 ``chat_error`` (the app returned an error, or a reply the harness cannot
 read, a request to the app failed without a response, or the reply was not
 done within ``EVAL_TURN_TIMEOUT_SECONDS``); ``error`` (anything else stopped the play, such as a harness model
-reply that cannot be used); ``user_done`` (the user is done, and the judge
-failed or no result could be judged); ``user_gave_up``; ``turn_cap`` (the
-play sent as many user messages as the cap allows, and the user was neither
+reply that cannot be used, or every judge call failed); ``user_done`` (the
+user is done, and the panel failed or no result could be judged);
+``user_gave_up``; ``turn_cap`` (the play sent as many user messages as the cap allows, and the user was neither
 done nor gave up); ``not_reached`` (the run ended for none of these reasons).
 """
 
@@ -31,9 +33,17 @@ from scenario.scenario_state import ScenarioState
 
 from .app_client import AppClient, Conversation, visible_text
 from .checks import Evidence, ReplyFiles, collect_evidence, reply_files
-from .judge import GoalJudge, rate_answer, started_line
+from .judge import GoalJudge, PanelRuling, rate_answer, rule_panel, scenario_description
 from .llm import Complete
-from .scoring import PlayFacts, Score, TraceMetrics, TraceRead, build_scores, trace_metrics
+from .scoring import (
+    PlayFacts,
+    Score,
+    TraceMetrics,
+    TraceRead,
+    build_scores,
+    judge_label,
+    trace_metrics,
+)
 from .simulated_user import SimulatedUser
 from .tasks import Task
 
@@ -92,6 +102,8 @@ class PlayResult:
     app_trace_ids: list[str] = field(default_factory=list)
     provider_models: list[str] = field(default_factory=list)
     paused_seconds: float = 0.0
+    # Each judge's model, state, verdict and reasoning; empty when the panel did not rule.
+    judges: list[dict] = field(default_factory=list)
 
     def output(self) -> dict:
         return {
@@ -100,6 +112,7 @@ class PlayResult:
             "goal_reached": self.goal_reached,
             "reasoning": self.reasoning,
             "error": self.error,
+            "judges": self.judges,
             "trace_scores": self.trace_scores,
             "app_trace_ids": self.app_trace_ids,
             "provider_models": self.provider_models,
@@ -120,7 +133,7 @@ class PlayDeps:
     model: str
     tool_ids: list[str]
     simulated_user_model: str
-    judge_model: str
+    judge_models: list[str]
     # EVAL_MAX_TURNS, for tasks without a turn_limit.
     max_turns: int
     complete: Complete
@@ -188,29 +201,41 @@ async def play(task: Task, deps: PlayDeps) -> PlayResult:
         collect_evidence=evidence,
     )
 
-    def every_presented_file() -> Awaitable[Evidence]:
-        return collect_evidence(
-            deps.app,
-            conversation.chat_id,
-            list(agent.replies),
-            list(task.expected.deliverables),
-            every=True,
-            # A failed listing or download is tried once more, after the poll
-            # interval, before it counts.
-            retries=1,
-            wait=lambda: deps.sleep(deps.poll_interval),
-        )
+    # The judges' evidence, read once after the play and shared by every judge.
+    final_evidence: asyncio.Future[Evidence] | None = None
 
-    judge = GoalJudge(
-        criteria=list(task.expected.judge_criteria),
-        deliverables=list(task.expected.deliverables),
-        model=deps.judge_model,
-        complete=deps.complete,
-        session_id=session_id,
-        collect_evidence=every_presented_file,
-    )
+    def every_presented_file() -> Awaitable[Evidence]:
+        nonlocal final_evidence
+        if final_evidence is None:
+            final_evidence = asyncio.ensure_future(
+                collect_evidence(
+                    deps.app,
+                    conversation.chat_id,
+                    list(agent.replies),
+                    list(task.expected.deliverables),
+                    every=True,
+                    # A failed listing or download is tried once more, after the poll
+                    # interval, before it counts.
+                    retries=1,
+                    wait=lambda: deps.sleep(deps.poll_interval),
+                )
+            )
+        return final_evidence
+
+    judges = [
+        GoalJudge(
+            criteria=list(task.expected.judge_criteria),
+            deliverables=list(task.expected.deliverables),
+            model=model,
+            complete=deps.complete,
+            session_id=session_id,
+            collect_evidence=every_presented_file,
+        )
+        for model in deps.judge_models
+    ]
+    panel: PanelRuling | None = None
     paused = 0.0
-    # The run's state, which the judge rules on once the run has ended.
+    # The run's state, which the judges rule on once the run has ended.
     final_state = None
 
     async def before_turn(state) -> None:
@@ -230,12 +255,7 @@ async def play(task: Task, deps: PlayDeps) -> PlayResult:
     try:
         result = await scenario.arun(
             name=task.id,
-            # Scenario's judge shows the description in its verdict prompt.
-            description=(
-                f"A user asks a weather assistant: {task.opening_message}\n\n"
-                f"What the user knows:\n{task.metadata.facts}\n\n"
-                f"{started_line(started)}"
-            ),
+            description=scenario_description(task.opening_message, task.metadata.facts, started),
             agents=[agent, user],
             script=[scenario.proceed(on_turn=before_turn)],
             max_turns=max_turns,
@@ -260,14 +280,20 @@ async def play(task: Task, deps: PlayDeps) -> PlayResult:
         reasoning = error
     if error is None:
         try:
-            passed = await judge.rule(final_state, at_turn_cap=at_turn_cap)
+            panel = await rule_panel(judges, final_state, at_turn_cap=at_turn_cap)
         except Exception as exc:
             error = f"The final judge call failed: {type(exc).__name__}: {exc}"
             reasoning = error
+        else:
+            if panel.error is not None:
+                error = f"No judge ruled: {panel.error}"
+                reasoning = error
+            passed = panel.passed
     goal_reached = error is None and user.done and passed
+    verdict = panel.verdict if panel is not None else ""
     if goal_reached:
         outcome = "goal_reached"
-        reasoning = judge.verdict or ""
+        reasoning = verdict
     elif error is not None:
         outcome = "chat_error" if conversation.error else "error"
     elif user.done:
@@ -280,16 +306,14 @@ async def play(task: Task, deps: PlayDeps) -> PlayResult:
         outcome = "not_reached"
     if outcome not in ("goal_reached", "chat_error", "error"):
         result_word = "passed" if passed else "failed"
-        reasoning = f"{reasoning} (final check {result_word}: {judge.verdict})"
+        reasoning = f"{reasoning} (final check {result_word}: {verdict})"
 
-    quality: int | None = None
-    quality_reasoning = ""
-    if agent.exchanges:
+    async def rate(model: str) -> tuple[str, int | None, str]:
         try:
-            quality, quality_reasoning = await asyncio.to_thread(
+            score, why = await asyncio.to_thread(
                 rate_answer,
                 complete=deps.complete,
-                model=deps.judge_model,
+                model=model,
                 session_id=conversation.chat_id,
                 started=started,
                 opening=task.opening_message,
@@ -297,7 +321,25 @@ async def play(task: Task, deps: PlayDeps) -> PlayResult:
                 transcript=neutral_transcript(agent.exchanges),
             )
         except Exception as exc:
-            quality_reasoning = f"answer quality not rated: {exc}"
+            return model, None, f"answer quality not rated: {exc}"
+        return model, score, why
+
+    # Every judge rates; none when no turn got a reply.
+    quality: list[tuple[str, int | None, str]] = []
+    if agent.exchanges:
+        quality = list(await asyncio.gather(*(rate(model) for model in deps.judge_models)))
+
+    # The agreement of the judges that ruled; None when fewer than two ruled or
+    # no judge model was called.
+    agree = panel.agree if panel is not None else None
+    judges_comment = ""
+    if panel is not None:
+        judges_comment = "; ".join(
+            f"{judge_label(r.model)} errored: {r.reasoning}"
+            if r.passed is None
+            else f"{judge_label(r.model)} {r.word}"
+            for r in panel.rulings
+        )
 
     facts = PlayFacts(
         goal_reached=goal_reached,
@@ -307,7 +349,8 @@ async def play(task: Task, deps: PlayDeps) -> PlayResult:
         hints_used=user.hints_used,
         time_to_answer_seconds=sum(conversation.answer_seconds),
         answer_quality=quality,
-        answer_quality_reasoning=quality_reasoning,
+        judges_agree=agree,
+        judges_comment=judges_comment,
     )
 
     metrics: TraceMetrics | None = None
@@ -347,4 +390,5 @@ async def play(task: Task, deps: PlayDeps) -> PlayResult:
         app_trace_ids=metrics.trace_ids if metrics else [],
         provider_models=metrics.provider_models if metrics else [],
         paused_seconds=paused,
+        judges=panel.output() if panel is not None else [],
     )

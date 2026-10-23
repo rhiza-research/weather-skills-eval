@@ -12,7 +12,8 @@ class SettingsError(Exception):
 @dataclass(frozen=True)
 class Settings:
     simulated_user_model: str
-    judge_model: str
+    # The judge panel, in the order EVAL_JUDGE_MODELS names it.
+    judge_models: tuple[str, ...]
     langfuse_environment: str
     docker_network: str
     app_start_timeout: float
@@ -38,6 +39,17 @@ def _required(environ: Mapping[str, str], name: str) -> str:
     if not value:
         raise SettingsError(f"{name} is not set")
     return value
+
+
+def _models(environ: Mapping[str, str], name: str) -> tuple[str, ...]:
+    """At least one comma-separated model name; none empty, none twice."""
+    raw = _required(environ, name)
+    models = tuple(model.strip() for model in raw.split(","))
+    if not all(models):
+        raise SettingsError(f"{name} has an empty model name: {raw!r}")
+    if len(set(models)) != len(models):
+        raise SettingsError(f"{name} names a model more than once: {raw!r}")
+    return models
 
 
 def _number(
@@ -81,7 +93,7 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         )
     return Settings(
         simulated_user_model=_required(environ, "EVAL_SIMULATED_USER_MODEL"),
-        judge_model=_required(environ, "EVAL_JUDGE_MODEL"),
+        judge_models=_models(environ, "EVAL_JUDGE_MODELS"),
         langfuse_environment=environment,
         docker_network=_required(environ, "EVAL_DOCKER_NETWORK"),
         app_start_timeout=_number(environ, "EVAL_APP_START_TIMEOUT_SECONDS", 600),

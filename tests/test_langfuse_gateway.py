@@ -858,7 +858,7 @@ def test_default_settings_cap_every_model_call_at_8192_output_tokens(monkeypatch
             "OPENROUTER_API_KEY": "or",
             "LANGFUSE_TRACING_ENVIRONMENT": "eval",
             "EVAL_SIMULATED_USER_MODEL": "u",
-            "EVAL_JUDGE_MODEL": "j",
+            "EVAL_JUDGE_MODELS": "j",
             "EVAL_DOCKER_NETWORK": "n",
         }
     )

@@ -1,4 +1,7 @@
-"""The judge: once the play has ended, Scenario's judge rules on the final result.
+"""The judge panel: once the play has ended, each judge model rules on the final result
+through Scenario's judge, on the same evidence, read once; the majority of the judges
+that ruled decides, and a tie fails. A judge whose call failed is recorded as errored
+and left out.
 
 When the task expects files, the result is every file the assistant
 presented during the play, one per path, at its latest presentation (see
@@ -25,6 +28,7 @@ import asyncio
 import base64
 import json
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
 
 from scenario import AgentInput, JudgeAgent, JudgmentRequest, ScenarioResult
@@ -47,14 +51,26 @@ EVIDENCE_HEADER = (
 )
 
 
+STARTED_LINE = (
+    "Harness context, not said by the user: the conversation started on "
+    "{started:%Y-%m-%d} at {started:%H:%M} UTC."
+)
+
+# Scenario's judge shows the description in its verdict prompt.
+SCENARIO_DESCRIPTION = (
+    "A user asks a weather assistant: {opening}\n\nWhat the user knows:\n{facts}\n\n{started}"
+)
+
+
 def started_line(started: datetime) -> str:
     """The play's start in UTC, for the judge and the answer-quality rater: they
     see only the visible conversation, never the app's system prompt, so
     without it a request relative to today cannot be checked."""
-    return (
-        "Harness context, not said by the user: the conversation started on "
-        f"{started:%Y-%m-%d} at {started:%H:%M} UTC."
-    )
+    return STARTED_LINE.format(started=started)
+
+
+def scenario_description(opening: str, facts: str, started: datetime) -> str:
+    return SCENARIO_DESCRIPTION.format(opening=opening, facts=facts, started=started_line(started))
 
 
 def evidence_message(evidence: Evidence) -> dict:
@@ -101,12 +117,15 @@ class GoalJudge(JudgeAgent):
         collect_evidence: Callable[[], Awaitable[Evidence]],
     ):
         super().__init__(criteria=criteria, model=model, include_traces=False)
+        self.judge_model = model
         self._deliverables = deliverables
         self._complete_fn = complete
         self._session_id = session_id
         self._collect_evidence = collect_evidence
         self._evidence: Evidence | None = None
         self.verdict: str | None = None
+        # False when the evidence decided the verdict without a model call.
+        self.model_called = False
 
     def _completion(self, **kwargs):
         if self._evidence is not None:
@@ -114,6 +133,8 @@ class GoalJudge(JudgeAgent):
             messages = list(kwargs["messages"])
             messages.insert(2, evidence_message(self._evidence))
             kwargs["messages"] = messages
+        # This judge's model, whatever Scenario passes.
+        kwargs["model"] = self.judge_model
         return self._complete_fn(JUDGE, self._session_id(), **kwargs)
 
     async def rule(self, state: ScenarioState, *, at_turn_cap: bool) -> bool:
@@ -152,6 +173,7 @@ class GoalJudge(JudgeAgent):
             scenario_state=state,
         )
         self._evidence = evidence
+        self.model_called = True
 
         async def verdict():
             # Cleared in the thread: a cancelled await leaves the call running.
@@ -165,6 +187,96 @@ class GoalJudge(JudgeAgent):
             raise ModelReplyError(f"The judge returned no verdict: {result!r}")
         self.verdict = result.reasoning or ("passed" if result.success else "no reasoning given")
         return bool(result.success)
+
+
+@dataclass
+class JudgeRuling:
+    model: str
+    # None when the judge's call failed; ``reasoning`` is then the error.
+    passed: bool | None
+    reasoning: str
+    # False when the evidence decided the verdict without a model call.
+    model_called: bool = True
+
+    @property
+    def state(self) -> str:
+        """``passed``, ``failed``, or ``error`` when the judge's call failed."""
+        if self.passed is None:
+            return "error"
+        return "passed" if self.passed else "failed"
+
+    @property
+    def word(self) -> str:
+        """The verdict as written in reasoning text and comments."""
+        return "errored" if self.passed is None else self.state
+
+
+@dataclass
+class PanelRuling:
+    rulings: list[JudgeRuling]
+
+    @property
+    def ruled(self) -> list[JudgeRuling]:
+        """The judges whose call did not fail."""
+        return [r for r in self.rulings if r.passed is not None]
+
+    @property
+    def error(self) -> str | None:
+        """Every judge's error, naming its model, when no judge ruled; else None."""
+        if self.ruled:
+            return None
+        return "; ".join(f"{r.model} errored: {r.reasoning}" for r in self.rulings)
+
+    @property
+    def passed(self) -> bool:
+        """More than half of the judges that ruled passed; a tie fails."""
+        ruled = self.ruled
+        return sum(1 for r in ruled if r.passed) * 2 > len(ruled)
+
+    @property
+    def agree(self) -> bool | None:
+        """Whether the judges that ruled gave the same verdict; None when fewer
+        than two ruled or no judge model was called."""
+        ruled = self.ruled
+        if len(ruled) < 2 or not any(r.model_called for r in ruled):
+            return None
+        return len({r.passed for r in ruled}) == 1
+
+    @property
+    def verdict(self) -> str:
+        """The shared reasoning when every judge gave the same verdict and the
+        same reasoning, else each judge's."""
+        if len({(r.passed, r.reasoning) for r in self.rulings}) == 1:
+            return self.rulings[0].reasoning
+        return "; ".join(f"{r.model} {r.word}: {r.reasoning}" for r in self.rulings)
+
+    def output(self) -> list[dict]:
+        return [
+            {"model": r.model, "state": r.state, "passed": r.passed, "reasoning": r.reasoning}
+            for r in self.rulings
+        ]
+
+
+async def rule_panel(
+    judges: list[GoalJudge], state: ScenarioState, *, at_turn_cap: bool
+) -> PanelRuling:
+    """Every judge rules at once; a failed call is recorded for its judge as
+    errored and the others still rule."""
+    results = await asyncio.gather(
+        *(judge.rule(state, at_turn_cap=at_turn_cap) for judge in judges), return_exceptions=True
+    )
+    rulings = []
+    for judge, result in zip(judges, results, strict=True):
+        if isinstance(result, BaseException) and not isinstance(result, Exception):
+            raise result
+        if isinstance(result, Exception):
+            error = f"{type(result).__name__}: {result}"
+            rulings.append(JudgeRuling(judge.judge_model, None, error))
+        else:
+            rulings.append(
+                JudgeRuling(judge.judge_model, result, judge.verdict or "", judge.model_called)
+            )
+    return PanelRuling(rulings)
 
 
 QUALITY_PROMPT = """You rate how well a weather assistant answered a user, from 1 to 5.

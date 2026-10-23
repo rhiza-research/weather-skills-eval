@@ -59,7 +59,7 @@ ENVIRON = {
     "OPENROUTER_API_KEY": "or-test",
     "LANGFUSE_TRACING_ENVIRONMENT": "eval",
     "EVAL_SIMULATED_USER_MODEL": "openrouter/test/user",
-    "EVAL_JUDGE_MODEL": "openrouter/test/judge",
+    "EVAL_JUDGE_MODELS": "openrouter/test/judge",
     "EVAL_DOCKER_NETWORK": "weather-skills-eval",
     "EVAL_TRACE_SETTLE_SECONDS": "1",
     "APP_SECRET": "webui-secret",
@@ -143,6 +143,9 @@ class Harness:
         judge_without_verdict=False,
         quality_error=None,
         verdict_error=None,
+        verdict_error_for=None,
+        failing_judges=None,
+        quality_scores=None,
         **docker_options,
     ):
         self.clock = FakeClock()
@@ -153,6 +156,9 @@ class Harness:
             judge_without_verdict=judge_without_verdict,
             quality_error=quality_error,
             verdict_error=verdict_error,
+            verdict_error_for=verdict_error_for,
+            failing_judges=failing_judges,
+            quality_scores=quality_scores,
         )
         self.gateway = FakeGateway(items, self.models)
         self.container = container or FakeContainer(["running"])
@@ -268,6 +274,23 @@ def test_run_plays_every_task_into_one_experiment_and_removes_the_container(tmp_
     assert metadata["dataset_version"] == "latest"
     assert metadata["dataset_items"] == "3"
     assert metadata["dataset_skill_packs"] == ""
+    # The models that graded the run, and the hash of what grades it.
+    assert metadata["simulated_user_model"] == "openrouter/test/user"
+    assert metadata["judge_models"] == "openrouter/test/judge"
+    assert "judge_model" not in metadata
+    assert len(metadata["comparability_hash"]) == 16
+    for index in range(3):
+        assert harness.output(index)["judges"] == [
+            {
+                "model": "openrouter/test/judge",
+                "state": "passed",
+                "passed": True,
+                "reasoning": "verdict passed",
+            }
+        ]
+        # One judge cannot disagree with itself.
+        assert "judges_agree" not in harness.scores(index)
+        assert harness.scores(index)["answer_quality:test/judge"] == 4
     assert all(isinstance(v, str) for v in metadata.values())
     assert summary.items == 3 and summary.goals_reached == 3
     assert summary.runner_lost == []
@@ -978,6 +1001,276 @@ def test_user_done_and_judge_failed_ends_as_user_done(tmp_path):
     assert harness.scores()["turns_to_goal"] == 2
     assert len(harness.models.verdict_calls()) == 1
     assert output["reasoning"].endswith("(final check failed: verdict failed)")
+
+
+# The judge panel
+
+PANEL = ["openrouter/test/judge-a", "openrouter/test/judge-b", "openrouter/test/judge-c"]
+
+
+def evidence_messages(call: dict) -> list[dict]:
+    """The harness-evidence messages of a verdict call."""
+    return [m for m in call["messages"] if isinstance(m.get("content"), list)]
+
+
+def test_a_judge_panel_rules_on_the_same_evidence_and_the_majority_decides(tmp_path):
+    items = [task("t1", "rain map kenya", turn_limit=3, deliverables=["image"])]
+    harness = Harness(
+        tmp_path,
+        items,
+        map_reply(presenting=display_image("maps/rain.png")),
+        failing_judges={PANEL[1]},
+        quality_scores={PANEL[0]: 5, PANEL[1]: 2, PANEL[2]: 4},
+    )
+    harness.run(EVAL_JUDGE_MODELS=",".join(PANEL))
+
+    output = harness.output()
+    assert output["outcome"] == "goal_reached"
+    # Every judge ruled once, with its own model, on the same evidence.
+    verdicts = harness.models.verdict_calls()
+    assert sorted(call["model"] for call in verdicts) == PANEL
+    assert evidence_messages(verdicts[0])
+    assert all(evidence_messages(call) == evidence_messages(verdicts[0]) for call in verdicts)
+    # The evidence was read once for the whole panel, after the user's read.
+    read_map = [("/artifacts", None), ("/artifacts/content", "maps/rain.png")]
+    assert harness.app.file_requests == read_map * 2
+    # Each judge's verdict and reasoning is on the item, in the order of EVAL_JUDGE_MODELS.
+    assert output["judges"] == [
+        {"model": PANEL[0], "state": "passed", "passed": True, "reasoning": "verdict passed"},
+        {"model": PANEL[1], "state": "failed", "passed": False, "reasoning": "verdict failed"},
+        {"model": PANEL[2], "state": "passed", "passed": True, "reasoning": "verdict passed"},
+    ]
+    assert output["reasoning"] == (
+        f"{PANEL[0]} passed: verdict passed; {PANEL[1]} failed: verdict failed; "
+        f"{PANEL[2]} passed: verdict passed"
+    )
+    scores, comments = harness.scores(), harness.comments()
+    assert scores["goal_reached"] == 1.0
+    assert scores["judges_agree"] == 0.0
+    assert comments["judges_agree"] == (
+        "test/judge-a passed; test/judge-b failed; test/judge-c passed"
+    )
+    # Every judge rates the answer; answer_quality is their mean.
+    ratings = [c[2] for c in harness.models.calls if c[0] == "judge" and not c[2].get("tools")]
+    assert sorted(call["model"] for call in ratings) == PANEL
+    assert scores["answer_quality:test/judge-a"] == 5
+    assert scores["answer_quality:test/judge-b"] == 2
+    assert scores["answer_quality:test/judge-c"] == 4
+    assert comments["answer_quality:test/judge-a"] == "clear answer"
+    assert scores["answer_quality"] == pytest.approx(11 / 3)
+    assert comments["answer_quality"] == "mean of 3 of 3 judges"
+
+
+def test_a_panel_that_agrees_records_judges_agree(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.run(EVAL_JUDGE_MODELS=",".join(PANEL))
+
+    output = harness.output()
+    assert output["outcome"] == "goal_reached"
+    # The same reasoning from every judge is given once.
+    assert output["reasoning"] == "verdict passed"
+    assert [j["passed"] for j in output["judges"]] == [True, True, True]
+    assert harness.scores()["judges_agree"] == 1.0
+
+
+def test_a_tied_panel_fails(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1), failing_judges={PANEL[0]})
+    harness.run(EVAL_JUDGE_MODELS=",".join(PANEL[:2]))
+
+    output = harness.output()
+    assert output["outcome"] == "user_done"
+    assert output["goal_reached"] is False
+    assert output["reasoning"].endswith(
+        f"(final check failed: {PANEL[0]} failed: verdict failed; "
+        f"{PANEL[1]} passed: verdict passed)"
+    )
+    assert harness.scores()["goal_reached"] == 0.0
+    assert harness.scores()["judges_agree"] == 0.0
+
+
+def test_a_panel_without_a_result_to_judge_calls_no_judge(tmp_path):
+    items = [task("t1", "rain map kenya", turn_limit=2, deliverables=["zarr"])]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.run(EVAL_JUDGE_MODELS=",".join(PANEL))
+
+    output = harness.output()
+    problem = "No result presented: no reply presented a file"
+    assert output["outcome"] == "user_done"
+    assert output["reasoning"].endswith(f"(final check failed: {problem})")
+    assert output["judges"] == [
+        {"model": model, "state": "failed", "passed": False, "reasoning": problem}
+        for model in PANEL
+    ]
+    assert harness.models.verdict_calls() == []
+    # No judge model was called, so the judges did not agree on anything.
+    assert "judges_agree" not in harness.scores()
+
+
+CUT_OFF = "The judge reply was cut off at max_tokens 8192"
+
+
+def test_an_errored_judge_is_left_out_and_the_others_decide(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(
+        tmp_path,
+        items,
+        reply_done_on(1),
+        verdict_error=ModelReplyError(CUT_OFF),
+        verdict_error_for=PANEL[1],
+    )
+    harness.run(EVAL_JUDGE_MODELS=",".join(PANEL))
+
+    output = harness.output()
+    assert output["outcome"] == "goal_reached"
+    assert output["error"] is None
+    # The errored judge is recorded with its error; the other judges ruled.
+    assert [(j["state"], j["passed"]) for j in output["judges"]] == [
+        ("passed", True),
+        ("error", None),
+        ("passed", True),
+    ]
+    assert CUT_OFF in output["judges"][1]["reasoning"]
+    assert output["reasoning"] == (
+        f"{PANEL[0]} passed: verdict passed; "
+        f"{PANEL[1]} errored: {output['judges'][1]['reasoning']}; "
+        f"{PANEL[2]} passed: verdict passed"
+    )
+    scores, comments = harness.scores(), harness.comments()
+    assert scores["goal_reached"] == 1.0
+    # The two judges that ruled agree.
+    assert scores["judges_agree"] == 1.0
+    assert comments["judges_agree"] == (
+        f"test/judge-a passed; test/judge-b errored: {output['judges'][1]['reasoning']}; "
+        "test/judge-c passed"
+    )
+    assert "failed" not in comments["judges_agree"]
+    # Every judge still rated the answer.
+    assert scores["answer_quality"] == 4
+
+
+def test_an_errored_judge_beside_a_failing_one_leaves_a_failing_majority(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(
+        tmp_path,
+        items,
+        reply_done_on(1),
+        failing_judges={PANEL[2]},
+        verdict_error=ModelReplyError(CUT_OFF),
+        verdict_error_for=PANEL[1],
+    )
+    harness.run(EVAL_JUDGE_MODELS=",".join(PANEL))
+
+    output = harness.output()
+    # One pass and one fail among the judges that ruled is a tie, which fails.
+    assert output["outcome"] == "user_done"
+    assert harness.scores()["judges_agree"] == 0.0
+
+
+def test_one_judge_left_after_an_error_decides_without_judges_agree(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(
+        tmp_path,
+        items,
+        reply_done_on(1),
+        verdict_error=ModelReplyError(CUT_OFF),
+        verdict_error_for=PANEL[1],
+    )
+    harness.run(EVAL_JUDGE_MODELS=",".join(PANEL[:2]))
+
+    assert harness.output()["outcome"] == "goal_reached"
+    assert "judges_agree" not in harness.scores()
+
+
+def test_a_panel_where_no_judge_ruled_ends_the_play_as_error(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1), verdict_error=ModelReplyError(CUT_OFF))
+    harness.run(EVAL_JUDGE_MODELS=",".join(PANEL[:2]))
+
+    output = harness.output()
+    assert output["outcome"] == "error"
+    assert output["error"].startswith(f"No judge ruled: {PANEL[0]} errored: ")
+    assert f"; {PANEL[1]} errored: " in output["error"]
+    assert CUT_OFF in output["error"]
+    assert [j["state"] for j in output["judges"]] == ["error", "error"]
+    scores = harness.scores()
+    assert scores["goal_reached"] == 0.0
+    assert "judges_agree" not in scores
+
+
+def test_a_judge_whose_rating_fails_is_left_out_of_the_mean(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    # A score of 0 is not a rating, so judge-b's rating fails.
+    harness = Harness(tmp_path, items, reply_done_on(1), quality_scores={PANEL[0]: 5, PANEL[1]: 0})
+    harness.run(EVAL_JUDGE_MODELS=",".join(PANEL[:2]))
+
+    scores, comments = harness.scores(), harness.comments()
+    assert scores["answer_quality:test/judge-a"] == 5
+    assert "answer_quality:test/judge-b" not in scores
+    assert scores["answer_quality"] == 5
+    assert comments["answer_quality"] == (
+        "mean of 1 of 2 judges; not rated by test/judge-b: answer quality not rated: "
+        "Answer quality is not an integer from 1 to 5: {'score': 0, 'reasoning': 'clear answer'}"
+    )
+
+
+# The comparability hash
+
+
+def run_metadata(tmp_path, items=None, change=None, **settings) -> dict:
+    """The experiment metadata of one run; ``change`` edits the harness first."""
+    harness = Harness(tmp_path, items or [task("t1", "rain forecast kenya")], reply_done_on(1))
+    if change:
+        change(harness)
+    harness.run(**settings)
+    return harness.gateway.experiments[0]["metadata"]
+
+
+def test_runs_with_the_same_judges_in_another_order_share_the_comparability_hash(tmp_path):
+    first = run_metadata(tmp_path, EVAL_JUDGE_MODELS=",".join(PANEL))
+    reordered = run_metadata(tmp_path, EVAL_JUDGE_MODELS=",".join(reversed(PANEL)))
+
+    assert first["judge_models"] == reordered["judge_models"] == ",".join(sorted(PANEL))
+    assert first["comparability_hash"] == reordered["comparability_hash"]
+
+
+def test_what_is_under_test_does_not_change_the_comparability_hash(tmp_path):
+    first = run_metadata(tmp_path)
+
+    def other_agent(harness):
+        harness.app.base_model_id = "open-router-.anthropic/claude-opus-5.5"
+        harness.config_path.write_text(
+            CONFIG.replace(APP_IMAGE_LINE, f"image: {APP_REPOSITORY}:other")
+            .replace(RUNNER_IMAGE, f"{RUNNER_REPOSITORY}:other")
+            .replace("model: weather-agent", "model: other-agent")
+        )
+
+    second = run_metadata(tmp_path, change=other_agent)
+
+    assert second["model"] != first["model"]
+    assert second["image"] != first["image"]
+    assert second["runner_image"] != first["runner_image"]
+    assert second["catalog_model"] != first["catalog_model"]
+    assert second["comparability_hash"] == first["comparability_hash"]
+
+
+@pytest.mark.parametrize(
+    "items, settings",
+    [
+        (None, {"EVAL_JUDGE_MODELS": "openrouter/test/other-judge"}),
+        (None, {"EVAL_SIMULATED_USER_MODEL": "openrouter/test/other-user"}),
+        ([task("t1", "rain forecast uganda")], {}),
+        ([task("t1", "rain forecast kenya", criteria=["The assistant gives totals"])], {}),
+        (None, {"EVAL_MAX_TURNS": "19"}),
+    ],
+    ids=["one-judge", "user-model", "item-input", "item-criteria", "max-turns"],
+)
+def test_runs_graded_differently_have_different_comparability_hashes(tmp_path, items, settings):
+    first = run_metadata(tmp_path)
+    second = run_metadata(tmp_path, items=items, **settings)
+
+    assert second["comparability_hash"] != first["comparability_hash"]
 
 
 def test_play_continues_while_the_user_asks_for_more(tmp_path):
@@ -1825,7 +2118,7 @@ def test_final_judge_without_a_verdict_ends_as_error_with_scores(tmp_path):
     output = harness.output()
     scores = harness.scores()
     assert output["outcome"] == "error"
-    assert output["error"].startswith("The final judge call failed:")
+    assert output["error"].startswith("No judge ruled: openrouter/test/judge errored: ")
     assert "tool calls not found" in output["error"]
     assert scores["goal_reached"] == 0.0
     assert scores["turns_to_goal"] == 1
@@ -1932,7 +2225,7 @@ def test_a_cut_off_verdict_ends_the_play_as_error(tmp_path):
 
     output = harness.output()
     assert output["outcome"] == "error"
-    assert output["error"].startswith("The final judge call failed:")
+    assert output["error"].startswith("No judge ruled: openrouter/test/judge errored: ")
     assert "EVAL_MODEL_MAX_TOKENS" in output["error"]
 
 

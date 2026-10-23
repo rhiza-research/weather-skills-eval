@@ -3,9 +3,9 @@
 # requires-python = ">=3.12"
 # dependencies = ["python-dotenv>=1.2.4", "questionary>=2.1.1"]
 # ///
-"""Runs the eval for the configs picked from a checklist, with the app image,
-runner image, concurrency and repetitions chosen for the run. Every run it
-starts records the same batch id."""
+"""Runs the eval for the configs picked from a checklist, with the judge models,
+simulated user model, app image, runner image, concurrency and repetitions
+chosen for the run. Every run it starts records the same batch id."""
 
 import os
 import subprocess
@@ -20,22 +20,55 @@ from dotenv import dotenv_values
 ROOT = Path(__file__).resolve().parent.parent
 
 # Used when neither the shell nor .env sets the value. A blank concurrency means
-# the harness's own default.
+# the harness's own default; the simulated user model has no default.
 DEFAULTS = {
+    "EVAL_SIMULATED_USER_MODEL": "",
     "APP_IMAGE": "ghcr.io/rhiza-research/weather-skills-chat:prod",
     "RUNNER_IMAGE": "ghcr.io/rhiza-research/weather-skills-sandbox-runner:prod",
     "EVAL_CONCURRENCY": "",
 }
 
+# The judge models offered in the checklist, as LiteLLM names them.
+JUDGE_MODELS = [
+    "openrouter/google/gemini-4-argon",
+    "openrouter/anthropic/claude-opus-5.5",
+    "openrouter/openai/gpt-5.5",
+]
+
+
+def _dotenv(dotenv_path):
+    # Not interpolated: a ${NAME} reference would prefill another, possibly secret, value.
+    return dotenv_values(dotenv_path, interpolate=False)
+
 
 def prefilled(environ, dotenv_path):
     """Each value from the shell, else from .env, else its default."""
-    # Not interpolated: a ${NAME} reference would prefill another, possibly secret, value.
-    dotenv = dotenv_values(dotenv_path, interpolate=False)
+    dotenv = _dotenv(dotenv_path)
     return {
         name: environ.get(name) or dotenv.get(name) or default
         for name, default in DEFAULTS.items()
     }
+
+
+def ticked_judges(environ, dotenv_path):
+    """The models of JUDGE_MODELS that EVAL_JUDGE_MODELS names, from the shell, else from .env."""
+    current = environ.get("EVAL_JUDGE_MODELS") or _dotenv(dotenv_path).get("EVAL_JUDGE_MODELS")
+    named = {model.strip() for model in (current or "").split(",")}
+    return [model for model in JUDGE_MODELS if model in named]
+
+
+def judges_valid(picked):
+    """True for at least one judge, else the message questionary shows."""
+    return bool(picked) or "Pick at least one judge"
+
+
+def simulated_user_valid(text):
+    """True for a model name, else the message questionary shows."""
+    return bool(text.strip()) or "A simulated user model is required"
+
+
+# Validators of the prefilled prompts; a prompt not named here takes any answer.
+VALIDATORS = {"EVAL_SIMULATED_USER_MODEL": simulated_user_valid}
 
 
 def env_args(values):
@@ -59,9 +92,20 @@ def run_eval(results):
     picked = questionary.checkbox("Configs to run:", choices=configs).unsafe_ask()
     if not picked:
         return 0
+    ticked = ticked_judges(os.environ, ROOT / ".env")
+    judges = questionary.checkbox(
+        "Judge models:",
+        choices=[questionary.Choice(model, checked=model in ticked) for model in JUDGE_MODELS],
+        validate=judges_valid,
+    ).unsafe_ask()
     values = {
-        name: questionary.text(f"{name}:", default=value).unsafe_ask().strip()
-        for name, value in prefilled(os.environ, ROOT / ".env").items()
+        "EVAL_JUDGE_MODELS": ",".join(judges),
+        **{
+            name: questionary.text(f"{name}:", default=value, validate=VALIDATORS.get(name))
+            .unsafe_ask()
+            .strip()
+            for name, value in prefilled(os.environ, ROOT / ".env").items()
+        },
     }
     repetitions = int(
         questionary.text("Repetitions:", default="1", validate=repetitions_valid)
@@ -133,13 +177,40 @@ def main():
 
 def test_a_value_comes_from_the_shell_then_dotenv_then_the_default(tmp_path):
     dotenv = tmp_path / ".env"
-    dotenv.write_text("APP_IMAGE=dotenv:app\nRUNNER_IMAGE=${APP_IMAGE}\n")
+    dotenv.write_text(
+        "APP_IMAGE=dotenv:app\nRUNNER_IMAGE=${APP_IMAGE}\n"
+        "EVAL_SIMULATED_USER_MODEL=openrouter/dotenv/user\n"
+    )
     assert prefilled({"APP_IMAGE": "shell:app"}, dotenv) == {
+        "EVAL_SIMULATED_USER_MODEL": "openrouter/dotenv/user",
         "APP_IMAGE": "shell:app",
         "RUNNER_IMAGE": "${APP_IMAGE}",
         "EVAL_CONCURRENCY": "",
     }
+    from_shell = prefilled({"EVAL_SIMULATED_USER_MODEL": "openrouter/shell/user"}, dotenv)
+    assert from_shell["EVAL_SIMULATED_USER_MODEL"] == "openrouter/shell/user"
     assert prefilled({}, tmp_path / "missing") == DEFAULTS
+
+
+def test_judges_are_ticked_from_the_shell_then_dotenv(tmp_path):
+    dotenv = tmp_path / ".env"
+    dotenv.write_text(f"EVAL_JUDGE_MODELS={JUDGE_MODELS[0]}\n")
+    assert ticked_judges({}, dotenv) == [JUDGE_MODELS[0]]
+    # Spaces are ignored, the checklist's order kept, and a model not in it is left out.
+    shell = {"EVAL_JUDGE_MODELS": f" {JUDGE_MODELS[2]} , openrouter/other/judge,{JUDGE_MODELS[1]}"}
+    assert ticked_judges(shell, dotenv) == [JUDGE_MODELS[1], JUDGE_MODELS[2]]
+    assert ticked_judges({}, tmp_path / "missing") == []
+
+
+def test_at_least_one_judge_must_be_picked():
+    assert judges_valid([JUDGE_MODELS[0]]) is True
+    assert judges_valid([]) == "Pick at least one judge"
+
+
+def test_the_simulated_user_model_must_not_be_blank():
+    assert simulated_user_valid(" openrouter/test/user ") is True
+    for text in ("", "   "):
+        assert simulated_user_valid(text) == "A simulated user model is required"
 
 
 def test_every_value_is_passed_with_dash_e():
@@ -172,15 +243,29 @@ def test_a_full_run(tmp_path, monkeypatch, capsys):
     (tmp_path / "configs").mkdir()
     for name in ("a", "b", "example"):
         (tmp_path / "configs" / f"{name}.yaml").write_text(f"name: {name}\n")
+    (tmp_path / ".env").write_text(
+        f"EVAL_JUDGE_MODELS={JUDGE_MODELS[1]}\nEVAL_SIMULATED_USER_MODEL=openrouter/test/user\n"
+    )
     monkeypatch.setitem(globals(), "ROOT", tmp_path)
-    for name in DEFAULTS:
+    for name in [*DEFAULTS, "EVAL_JUDGE_MODELS"]:
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setattr(questionary, "checkbox", lambda message, choices: _Answer(choices))
+    judge_choices = []
+
+    def checkbox(message, choices, **kwargs):
+        if message == "Judge models:":
+            assert kwargs["validate"] is judges_valid
+            judge_choices.extend((c.value, c.checked) for c in choices)
+            # The ticked judge and the first one.
+            return _Answer([c.value for c in choices if c.checked or c.value == JUDGE_MODELS[0]])
+        return _Answer(choices)
+
+    monkeypatch.setattr(questionary, "checkbox", checkbox)
 
     def text(message, default, **kwargs):
         if message == "Repetitions:":
             assert kwargs["validate"] is repetitions_valid
             return _Answer(" 2 ")
+        assert kwargs["validate"] is VALIDATORS.get(message.removesuffix(":"))
         return _Answer(f" {default} ")
 
     monkeypatch.setattr(questionary, "text", text)
@@ -206,8 +291,15 @@ def test_a_full_run(tmp_path, monkeypatch, capsys):
     assert build == ["docker", "compose", "build", "eval"]
     assert build_kwargs["env"]["HARNESS_COMMIT"] == "abc"
     assert pull == ["docker", "pull", DEFAULTS["APP_IMAGE"]]
-    # The prefilled answers, with their spaces trimmed, and the batch id.
-    values = {**DEFAULTS, "EVAL_BATCH": "2026-10-22T20:00:00Z"}
+    # Every judge model is offered, the one .env names ticked.
+    assert judge_choices == [(model, model == JUDGE_MODELS[1]) for model in JUDGE_MODELS]
+    # The picked judges, the prefilled answers with their spaces trimmed, and the batch id.
+    values = {
+        "EVAL_JUDGE_MODELS": f"{JUDGE_MODELS[0]},{JUDGE_MODELS[1]}",
+        **DEFAULTS,
+        "EVAL_SIMULATED_USER_MODEL": "openrouter/test/user",
+        "EVAL_BATCH": "2026-10-22T20:00:00Z",
+    }
     command = ["docker", "compose", "run", "--rm", "-T", *env_args(values), "eval", "run", "-"]
     # Two rounds of every picked config.
     assert runs == [

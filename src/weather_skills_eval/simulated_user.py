@@ -107,6 +107,14 @@ def unusable(data: dict, *, message_required: bool = True) -> str | None:
 
 FILES_HEADER = "Files the assistant showed you in its latest reply that had files:"
 
+CONVERSATION_HEADER = "The conversation so far:\n\n"
+
+REPLY_REQUEST = "Write your JSON reply."
+
+RETRY_REQUEST = (
+    "Your previous reply could not be used: {reason}. Write your JSON reply again, as described."
+)
+
 
 def files_message(evidence: Evidence) -> dict:
     """What a real user sees of the presented files: paths, kinds and images.
@@ -217,11 +225,7 @@ class SimulatedUser(AgentAdapter):
         retry = [
             *messages,
             *shown,
-            {
-                "role": "user",
-                "content": f"Your previous reply could not be used: {reason}. Write your JSON "
-                "reply again, as described.",
-            },
+            {"role": "user", "content": RETRY_REQUEST.format(reason=reason)},
         ]
         data, reason = parse_reply(
             await self._complete_once(retry), message_required=message_required
@@ -245,15 +249,12 @@ class SimulatedUser(AgentAdapter):
     async def _respond(self, input: AgentInput, *, counted: bool):
         messages = [
             {"role": "system", "content": self._system_prompt()},
-            {
-                "role": "user",
-                "content": "The conversation so far:\n\n" + transcript(input.messages),
-            },
+            {"role": "user", "content": CONVERSATION_HEADER + transcript(input.messages)},
         ]
         evidence = await self._collect_evidence()
         if evidence.files or evidence.unlisted:
             messages.append(files_message(evidence))
-        messages.append({"role": "user", "content": "Write your JSON reply."})
+        messages.append({"role": "user", "content": REPLY_REQUEST})
         data = await self._reply(messages, message_required=counted)
         ends = data["done"] or data["give_up"]
         if counted:
