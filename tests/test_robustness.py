@@ -1180,6 +1180,7 @@ def test_cli_summary_names_tasks_lost_to_a_runner_restart(
         goals_reached=1,
         metadata={"config_name": "example"},
         runner_lost=runner_lost,
+        agent_cost_usd=1.2345678,
     )
     monkeypatch.setattr(cli, "run", lambda *args, **kwargs: summary)
     assert cli.main(["run", "configs/example.yaml"]) == 0
@@ -1188,7 +1189,31 @@ def test_cli_summary_names_tasks_lost_to_a_runner_restart(
         "Experiment cfg (example), run cfg - run",
         "Goal reached on 1 of 3 tasks",
     ]
-    assert lines[2:] == ([lost_line] if lost_line else [])
+    cost = 'Cost {"config_name": "example", "served_model": "cfg", "agent_cost_usd": 1.234568}'
+    assert lines[2:] == ([lost_line] if lost_line else []) + [cost]
+
+
+def test_cli_summary_ends_with_the_cost_line_after_the_experiment_url(monkeypatch, capsys):
+    summary = RunSummary(
+        experiment_name="anthropic/claude-opus-5.5",
+        run_name="r",
+        experiment_url="http://langfuse.invalid/experiment",
+        items=1,
+        goals_reached=1,
+        metadata={"config_name": "opus-agent"},
+        runner_lost=[],
+        agent_cost_usd=0.0,
+    )
+    monkeypatch.setattr(cli, "run", lambda *args, **kwargs: summary)
+    assert cli.main(["run", "-"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[-2] == "http://langfuse.invalid/experiment"
+    assert lines[-1].startswith("Cost ")
+    assert json.loads(lines[-1].removeprefix("Cost ")) == {
+        "config_name": "opus-agent",
+        "served_model": "anthropic/claude-opus-5.5",
+        "agent_cost_usd": 0.0,
+    }
 
 
 @pytest.mark.parametrize(
@@ -1396,6 +1421,7 @@ def test_cli_main_keeps_scenario_off_langwatch_when_a_key_is_set(monkeypatch):
             goals_reached=1,
             metadata={},
             runner_lost=[],
+            agent_cost_usd=0.0,
         )
 
     monkeypatch.setattr(cli, "run", play_and_resolve)

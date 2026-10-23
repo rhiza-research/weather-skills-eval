@@ -29,12 +29,33 @@ The configs set `pull: false`, so run `docker pull <APP_IMAGE>` first when runni
 2. It lists the judge models as a checklist: `openrouter/google/gemini-4-argon`, `openrouter/anthropic/claude-opus-5.5` and `openrouter/openai/gpt-5.5`, each ticked when `EVAL_JUDGE_MODELS` in the shell, else in `.env`, names it. At least one must be picked.
 3. It asks for `EVAL_SIMULATED_USER_MODEL`, `APP_IMAGE`, `RUNNER_IMAGE` and `EVAL_CONCURRENCY`, each prefilled from the shell, else from `.env`, else from its default: blank for the simulated user model, `ghcr.io/rhiza-research/weather-skills-chat:prod`, `ghcr.io/rhiza-research/weather-skills-sandbox-runner:prod`, and blank for the concurrency. A blank simulated user model is not accepted.
 4. It asks for the number of repetitions, a whole number of at least 1, default 1.
-5. It asks "Pull the app image?", default yes.
-6. It builds the eval image once with `HARNESS_COMMIT` set to `git rev-parse HEAD`, then, on yes, runs `docker pull <APP_IMAGE>`. A failed build or pull exits with its exit code.
-7. It prints the batch id, the UTC time it reached this step (`Batch 2026-10-22T20:07:57Z`).
-8. It runs the picked configs in rounds, each config once per round, as many rounds as the repetitions, with the picked judges as `EVAL_JUDGE_MODELS` (comma-separated), the values and `EVAL_BATCH=<batch id>` passed as `-e`. It prints each run's exit code (`<config> run <round>: exit <code>`) and exits 1 if any failed.
+5. It prints the batch's estimated cost (see [Cost estimate](#cost-estimate)).
+6. It asks "Pull the app image?", default yes.
+7. It builds the eval image once with `HARNESS_COMMIT` set to `git rev-parse HEAD`, then, on yes, runs `docker pull <APP_IMAGE>`. A failed build or pull exits with its exit code.
+8. It prints the batch id, the UTC time it reached this step (`Batch 2026-10-22T20:07:57Z`).
+9. It runs the picked configs in rounds, each config once per round, as many rounds as the repetitions, with the picked judges as `EVAL_JUDGE_MODELS` (comma-separated), the values and `EVAL_BATCH=<batch id>` passed as `-e`. It passes each run's stdout on line by line, saves the agent cost from the run's cost line in `.costs.json`, prints each run's exit code (`<config> run <round>: exit <code>`) and exits 1 if any failed.
 
 Ctrl-C prints the exit codes of the runs that finished and exits 130.
+
+### Cost estimate
+
+`.costs.json`, at the repository root and not checked in, holds the agent cost of each config's latest run, by config name (the `name` in the config file):
+
+```json
+{"opus-agent": {"served_model": "anthropic/claude-opus-5.5", "agent_cost_usd": 1.23}}
+```
+
+`run-eval.py` writes it from the cost line each run's summary ends with, and is the only reader. Only a run that prints its config's cost line, one that exits 0, updates it; a failed run leaves that config's saved cost as it was. The estimate for the batch is printed as one line, with the agents' cost and the judges' and simulated user's cost apart:
+
+```
+Estimated cost: $4.29 (agents $3.00, judges and simulated user $1.29)
+```
+
+- Agents: each picked config's saved agent cost, times the repetitions.
+- Judges and simulated user, per run of a config: each picked judge model's price times 102,000 input and 14,000 output tokens, plus the simulated user model's price times 48,000 input and 15,000 output tokens, token counts measured over the 2026-10-22 runs. This is multiplied by the number of picked configs and the repetitions. The prices are `pricing.prompt` and `pricing.completion` (USD per token) from OpenRouter's public models list, `https://openrouter.ai/api/v1/models`, read without a key, for the model id without `openrouter/`.
+- A picked config with no saved cost is left out of the total and named on `Agent cost unknown, not counted: <config names>`, a config file without `name` by its file name; a model the list does not price, or prices as absent, unparsable or negative, is left out and named on `No OpenRouter price, not counted: <models>`.
+
+A `.costs.json` that cannot be read, or a models list that cannot be fetched, prints `Cost estimate unavailable: <reason>` and the run goes on; the estimate never stops a run. A cost line is not saved into a `.costs.json` that cannot be read, and a failed write prints `Cost not saved: .costs.json could not be written: <reason>`.
 
 Each run records the batch id in its experiment's metadata as `batch`, so filtering Langfuse experiments on `metadata.batch` shows the runs of one invocation.
 
@@ -59,6 +80,8 @@ The emulator serves the claim, bind and exec APIs the app's `k8s` sandbox backen
 - Exited with code 0, `dead` or in any other state, disappeared, or unreadable: the run stops at once (exit 3), with the logs when the runner can still be read. No further task is played.
 
 A runner Docker keeps restarting during tasks (a crash loop) does not stop the run by itself: each task it restarts during is counted as lost, and the run exits 0 unless the runner is not back steadily before the next task or after the last one. A run that finishes exits 0 however many tasks were lost this way, and its summary on stdout lists them on their own line (`<n> tasks not scored because the sandbox runner restarted during them: <task ids>`). Langfuse leaves a task that raised out of the experiment's results, so lost tasks are not counted in `Goal reached on <x> of <y> tasks`: `<y>` is the number of tasks that returned a result. With `EVAL_CONCURRENCY` above 1, when the run stops, tasks already playing finish and are checked after the play, and a task still waiting for the runner is not played. An exit 3 after tasks started leaves a partly recorded experiment in Langfuse, which `delete` removes (see [Deleting a run](#deleting-a-run)).
+
+A run's summary on stdout ends with its cost line, after the experiment URL: `Cost ` followed by JSON with the config's `name` as `config_name`, the experiment name as `served_model`, and the sum of the items' `cost_to_goal_usd` as `agent_cost_usd`, rounded to 6 decimal places (`Cost {"config_name": "opus-agent", "served_model": "anthropic/claude-opus-5.5", "agent_cost_usd": 1.23}`). An item without that score, such as one whose trace scores are missing, adds nothing.
 
 ### Exit codes
 

@@ -75,6 +75,8 @@ class RunSummary:
     metadata: dict
     # Ids of the tasks not scored because the runner restarted during their play.
     runner_lost: list[str]
+    # The sum of the items' cost_to_goal_usd; an item without that score adds nothing.
+    agent_cost_usd: float
 
 
 def base_model(entry: dict, catalog_id: str, connections: list[dict]) -> str:
@@ -422,6 +424,12 @@ def _run(
         goals_reached=sum(1 for o in outputs if o.get("goal_reached")),
         metadata=metadata,
         runner_lost=runner_lost,
+        agent_cost_usd=sum(
+            score["value"]
+            for o in outputs
+            for score in o.get("scores", [])
+            if score.get("name") == COST_SCORE
+        ),
     )
 
 

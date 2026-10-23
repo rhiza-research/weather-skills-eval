@@ -1,6 +1,7 @@
 .git
 .venv
 .env
+.costs.json
 **/__pycache__
 .pytest_cache
 .ruff_cache

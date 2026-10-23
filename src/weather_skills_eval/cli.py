@@ -35,6 +35,7 @@ one run, after ``yes`` on stdin unless ``--yes`` is given. Exit codes:
 """
 
 import argparse
+import json
 import logging
 import os
 import signal
@@ -162,6 +163,19 @@ def delete(experiment_id: str, *, yes: bool, runs_factory=LangfuseRuns) -> int:
     return 0
 
 
+COST_LINE = "Cost "
+
+
+def cost_line(config_name: str, served_model: str, agent_cost_usd: float) -> str:
+    """One line, so ``scripts/run-eval.py`` can read it from the run's mixed output."""
+    cost = {
+        "config_name": config_name,
+        "served_model": served_model,
+        "agent_cost_usd": round(agent_cost_usd, 6),
+    }
+    return COST_LINE + json.dumps(cost)
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -222,6 +236,7 @@ def main(
         )
     if summary.experiment_url:
         print(summary.experiment_url)
+    print(cost_line(config_name, summary.experiment_name, summary.agent_cost_usd))
     return 0
 
 

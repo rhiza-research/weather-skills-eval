@@ -294,6 +294,8 @@ def test_run_plays_every_task_into_one_experiment_and_removes_the_container(tmp_
     assert all(isinstance(v, str) for v in metadata.values())
     assert summary.items == 3 and summary.goals_reached == 3
     assert summary.runner_lost == []
+    # The items' cost_to_goal_usd summed: one turn of app_observations each, 0.02 + 0.19.
+    assert summary.agent_cost_usd == pytest.approx(3 * 0.21)
     assert harness.gateway.linked == ["chat-1", "chat-2", "chat-3"]
     # Each item's rollup carries its own chat's app traces.
     assert [ids for _, ids in harness.gateway.app_costs] == [
@@ -2406,6 +2408,22 @@ def test_reads_that_failed_without_observations_are_named_as_missing(tmp_path):
     assert harness.output()["trace_scores"] == "missing: Langfuse could not be read: ReadTimeout: x"
 
 
+def test_items_without_a_cost_score_add_nothing_to_the_agent_cost(tmp_path):
+    items = [task("t1", "rain forecast kenya"), task("t2", "weekly rain")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+
+    def first_chat_unread(chat_id, turns):
+        if chat_id == "chat-1":
+            raise TraceReadError("ReadTimeout: timed out")
+        return app_observations(chat_id, turns), True
+
+    harness.gateway.observations = first_chat_unread
+    summary = harness.run()
+
+    assert "cost_to_goal_usd" not in harness.scores(0)
+    assert summary.agent_cost_usd == pytest.approx(harness.scores(1)["cost_to_goal_usd"])
+
+
 def test_traces_that_never_arrive_are_recorded_as_missing(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))
@@ -3436,6 +3454,8 @@ def test_runner_that_restarts_during_a_task_costs_only_that_task(tmp_path, after
     ]
     assert summary.items == 2 and summary.goals_reached == 2
     assert summary.runner_lost == ["t1"]
+    # Only the scored items' costs.
+    assert summary.agent_cost_usd == pytest.approx(2 * 0.21)
     # /health, then two polls and one check per task; t2's wait found the
     # runner back, so it is not waited for after the last task.
     assert runner.reloads == 10
