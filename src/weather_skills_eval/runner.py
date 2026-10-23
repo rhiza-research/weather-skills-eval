@@ -11,7 +11,10 @@ Order of a run:
 4. Read the resolved configuration from the app (the catalog model's base
    model, tools, skill pack commits), and ask OpenRouter which model answers
    for that base model; the experiment is named after it.
-5. Run the experiment: each item's task waits for the runner to be running
+5. Run the experiment, playing the tasks in a random order drawn for this
+   run, which makes runs at once less likely to reach the same data
+   providers with the same task at the same time: each item's task waits for
+   the runner to be running
    (Docker restarts one that died), plays the task and returns its scores,
    which the evaluator records on the item. A runner that Docker restarted,
    is restarting, or exited with a non-zero code after the play leaves that
@@ -27,10 +30,12 @@ it finishes, numbered out of the total in the order the tasks start.
 """
 
 import asyncio
+import copy
 import hashlib
 import importlib.metadata
 import json
 import logging
+import random
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -279,9 +284,11 @@ def run(
     play_options: dict | None = None,
     stdin=None,
     clock: Callable[[], float] = time.monotonic,
+    rng: random.Random | None = None,
 ) -> RunSummary:
     """``config_path`` is a file, or ``-`` to read the configuration from stdin.
-    ``clock`` times the tasks and the run for the progress log."""
+    ``clock`` times the tasks and the run for the progress log. ``rng``
+    shuffles the order the tasks are played in; an unseeded one when None."""
     run_started = clock()
     settings = load_settings(environ)
     config: RunConfig = load_config(config_path, environ, stdin=stdin)
@@ -297,6 +304,7 @@ def run(
             play_options=play_options,
             clock=clock,
             run_started=run_started,
+            rng=rng or random.Random(),
         )
     finally:
         gateway.flush()
@@ -330,6 +338,15 @@ def _required_packs(dataset, name: str) -> list[str]:
     return [p.strip() for p in packs]
 
 
+def in_play_order(dataset, rng: random.Random):
+    """A copy of ``dataset`` whose ``items``, the list its ``run_experiment``
+    starts in order, are shuffled by ``rng``; ``dataset`` is left as read."""
+    played = copy.copy(dataset)
+    played.items = list(dataset.items)
+    rng.shuffle(played.items)
+    return played
+
+
 def _check_packs(required: list[str], config: RunConfig, name: str) -> None:
     """Stop the run before the app starts when the configuration does not turn
     on a pack the dataset needs, so every run of a dataset plays every item."""
@@ -353,6 +370,7 @@ def _run(
     play_options,
     clock: Callable[[], float],
     run_started: float,
+    rng: random.Random,
 ) -> RunSummary:
     dataset = _read_dataset(gateway, config.dataset)
     log.info("Dataset %s read: %d items", config.dataset, len(dataset.items))
@@ -505,6 +523,7 @@ def _run(
                 gateway.record_app_cost(app_cost, result.app_trace_ids)
             return result.output()
 
+        played = in_play_order(dataset, rng)
         log.info(
             "Experiment %s started: %d tasks, concurrency %d",
             served_model,
@@ -513,7 +532,7 @@ def _run(
         )
         try:
             result = gateway.run_experiment(
-                dataset=dataset,
+                dataset=played,
                 name=served_model,
                 description=model,
                 task=task_fn,

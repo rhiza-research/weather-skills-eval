@@ -1,6 +1,7 @@
 import asyncio
 import json
 import uuid
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import httpx
@@ -8,6 +9,8 @@ import litellm
 import pytest
 from fakes import FakeClock, FakeRunApi
 from langfuse import Langfuse
+from langfuse._client.datasets import DatasetClient
+from langfuse.api import Dataset, DatasetItem, DatasetStatus
 from langfuse.api.core.api_error import ApiError as LangfuseApiError
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -122,6 +125,77 @@ def test_experiment_records_scores_and_links_the_item_trace_to_the_chat(monkeypa
     assert chat_span.attributes["session.id"] == "chat-42"
     assert chat_span.context.trace_id == task_span.context.trace_id
     assert scores[0]["trace_id"] == format(task_span.context.trace_id, "032x")
+
+
+class Reverse:
+    """A random source whose shuffle reverses the order."""
+
+    def shuffle(self, items: list) -> None:
+        items.reverse()
+
+
+def test_a_real_dataset_client_plays_its_items_in_the_runners_play_order(monkeypatch):
+    # Only the HTTP layer is stubbed; the project id read fails, which the SDK allows.
+    client = Langfuse(
+        public_key=f"pk-test-{uuid.uuid4()}",
+        secret_key="sk-test",
+        base_url="http://langfuse.invalid",
+        httpx_client=httpx.Client(
+            transport=httpx.MockTransport(lambda request: httpx.Response(404, json={}))
+        ),
+        span_exporter=InMemorySpanExporter(),
+        tracer_provider=TracerProvider(),
+        environment="eval",
+    )
+    monkeypatch.setattr(client, "create_score", lambda **kwargs: None)
+    created = datetime(2026, 10, 23, tzinfo=UTC)
+    items = [
+        DatasetItem(
+            id=item_id,
+            status=DatasetStatus.ACTIVE,
+            input=f"task {item_id}",
+            expected_output=None,
+            metadata=None,
+            dataset_id="d1",
+            dataset_name="weather-tasks",
+            created_at=created,
+            updated_at=created,
+            media_references=[],
+        )
+        for item_id in ("t1", "t2", "t3")
+    ]
+    dataset = DatasetClient(
+        dataset=Dataset(
+            id="d1",
+            name="weather-tasks",
+            metadata=None,
+            project_id="p1",
+            created_at=created,
+            updated_at=created,
+        ),
+        items=items,
+        langfuse_client=client,
+    )
+    started = []
+
+    async def task(*, item, **kwargs):
+        started.append(item.id)
+        return {"scores": []}
+
+    result = gateway_for(client).run_experiment(
+        dataset=runner.in_play_order(dataset, Reverse()),
+        name="cfg",
+        description="m",
+        task=task,
+        metadata={},
+        concurrency=1,
+    )
+    client.flush()
+
+    assert started == ["t3", "t2", "t1"]
+    assert [r.item.id for r in result.item_results] == ["t3", "t2", "t1"]
+    # The dataset read is left in its order.
+    assert [item.id for item in dataset.items] == ["t1", "t2", "t3"]
 
 
 def test_a_task_lost_to_the_runner_is_recorded_as_an_error_and_the_experiment_goes_on(

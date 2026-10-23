@@ -4,10 +4,10 @@
 # dependencies = ["python-dotenv>=1.2.4", "pyyaml>=6.0.3", "questionary>=2.1.1"]
 # ///
 """Runs the eval for the configs picked from a checklist, with the judge models,
-simulated user model, app image, runner image, concurrency and repetitions
-chosen for the run. Every run it starts records the same batch id. Before
-building, it prints the batch's estimated cost from the agent costs saved in
-.costs.json and OpenRouter's prices."""
+simulated user model, app image, runner image, concurrency, repetitions and
+number of runs at once chosen for the run. Every run it starts records the same
+batch id. Before building, it prints the batch's estimated cost from the agent
+costs saved in .costs.json and OpenRouter's prices."""
 
 import http.client
 import io
@@ -16,6 +16,7 @@ import math
 import os
 import subprocess
 import sys
+import threading
 import types
 import urllib.request
 from datetime import UTC, datetime
@@ -35,6 +36,10 @@ DEFAULTS = {
     "RUNNER_IMAGE": "ghcr.io/rhiza-research/weather-skills-sandbox-runner:prod",
     "EVAL_CONCURRENCY": "",
 }
+
+# How many runs the script keeps going at once; prefilled like DEFAULTS, but
+# not passed with -e, and the harness does not read it.
+PARALLEL_RUNS = {"EVAL_PARALLEL_RUNS": "1"}
 
 # The judge models offered in the checklist, as LiteLLM names them.
 JUDGE_MODELS = [
@@ -60,12 +65,12 @@ def _dotenv(dotenv_path):
     return dotenv_values(dotenv_path, interpolate=False)
 
 
-def prefilled(environ, dotenv_path):
-    """Each value from the shell, else from .env, else its default."""
+def prefilled(environ, dotenv_path, defaults=DEFAULTS):
+    """Each value of ``defaults`` from the shell, else from .env, else its default."""
     dotenv = _dotenv(dotenv_path)
     return {
         name: environ.get(name) or dotenv.get(name) or default
-        for name, default in DEFAULTS.items()
+        for name, default in defaults.items()
     }
 
 
@@ -99,7 +104,7 @@ def new_batch():
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def repetitions_valid(text):
+def whole_number_valid(text):
     """True for a whole number of at least 1, else the message questionary shows."""
     text = text.strip()
     # isdecimal, not isdigit: int() rejects digits such as "²" that isdigit accepts.
@@ -282,7 +287,16 @@ def run_eval(results):
         },
     }
     repetitions = int(
-        questionary.text("Repetitions:", default="1", validate=repetitions_valid)
+        questionary.text("Repetitions:", default="1", validate=whole_number_valid)
+        .unsafe_ask()
+        .strip()
+    )
+    parallel = int(
+        questionary.text(
+            "Runs at once:",
+            default=prefilled(os.environ, ROOT / ".env", PARALLEL_RUNS)["EVAL_PARALLEL_RUNS"],
+            validate=whole_number_valid,
+        )
         .unsafe_ask()
         .strip()
     )
@@ -324,45 +338,180 @@ def run_eval(results):
         "-",
     ]
     # In rounds, each picked config once per round.
-    for repetition in range(1, repetitions + 1):
-        for name in picked:
-            # The run's cost line, saved once the run has ended.
-            run_cost = None
-            with open(ROOT / "configs" / name, "rb") as config:
-                process = subprocess.Popen(
-                    command,
-                    cwd=ROOT,
-                    stdin=config,
-                    stdout=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                try:
-                    # Passed on line by line, as the run prints it.
-                    for line in process.stdout:
-                        print(line, end="", flush=True)
-                        cost = parse_cost_line(line)
-                        # Only the started config's own cost line.
-                        if cost and names[name] and cost["config_name"] == names[name]:
-                            run_cost = cost
-                    returncode = process.wait()
-                except KeyboardInterrupt:
-                    # Ctrl-C reaches docker compose too; let it remove the run's
-                    # containers, reading its output to the end so it never
-                    # blocks on a full pipe.
-                    for line in process.stdout:
-                        print(line, end="", flush=True)
-                    process.wait()
-                    raise
-                finally:
-                    process.stdout.close()
-            if run_cost:
-                save_cost(ROOT / COSTS_FILE, run_cost)
-            label = f"{name} run {repetition}"
-            results.append((label, returncode))
-            print(f"{label}: exit {returncode}", flush=True)
+    queue = [(name, repetition) for repetition in range(1, repetitions + 1) for name in picked]
+    run_queue(command, queue, names, parallel, results)
     return 1 if any(returncode != 0 for _, returncode in results) else 0
+
+
+def _describe(exc):
+    return f"{type(exc).__name__}: {exc}"
+
+
+def pass_on(stream, out, prefix, lock, seen=None):
+    """Prints each line of a run's ``stream`` on ``out`` as the run prints it,
+    whole, under ``lock``, after ``prefix``; with a prefix, a last line without
+    a newline gets one, so the next line printed starts on its own. ``seen``
+    gets each line as the run printed it. A line that cannot be printed, or
+    that ``seen`` fails on, is skipped and reading goes on to the end, so the
+    run never blocks on a full pipe. Returns the first error as text, or None."""
+    error = None
+    try:
+        for line in stream:
+            try:
+                newline = "" if not prefix or line.endswith("\n") else "\n"
+                shown = prefix + line + newline
+                with lock:
+                    print(shown, end="", file=out, flush=True)
+                if seen:
+                    seen(line)
+            except Exception as exc:
+                error = error or _describe(exc)
+    except Exception as exc:
+        # The stream itself could not be read.
+        error = error or _describe(exc)
+    return error
+
+
+def run_queue(command, queue, names, parallel, results):
+    """Runs ``command`` once per queued run, a (config file, round) pair, with
+    the config file on stdin, starting the runs in queue order with at most
+    ``parallel`` going at once: the next starts when one ends. ``names`` maps a
+    config file to its config name.
+
+    Each run's stdout is passed on line by line. With ``parallel`` above 1, its
+    stderr is read and passed on too, and every line of both is prefixed with
+    ``[<config file> run <round>] ``; with 1, stderr is not read and reaches the
+    terminal as the run prints it. When a run ends, its config's cost line is
+    saved, and its exit code is added to ``results`` and printed. A run whose
+    output or exit the script fails to handle is still added, as failed, after
+    a line saying what failed.
+
+    On Ctrl-C, or when a run cannot be started, no further run starts; every
+    run started is read to the end and waited for, and is not added to
+    ``results``; then the exception is raised."""
+    prefixed = parallel > 1
+    # Held to print a line, and to save a cost, record and print an exit.
+    lock = threading.Lock()
+    slots = threading.Semaphore(parallel)
+    interrupted = threading.Event()
+
+    def finish(process, name, repetition):
+        """Reads the run's output to the end, waits for it and records it."""
+        label = f"{name} run {repetition}"
+        prefix = f"[{label}] " if prefixed else ""
+        # The run's cost line, saved once the run has ended.
+        run_cost = None
+        # What the script failed to do for the run, as text.
+        problems = []
+        returncode = None
+
+        def keep_cost(line):
+            nonlocal run_cost
+            cost = parse_cost_line(line)
+            # Only the started config's own cost line.
+            if cost and names[name] and cost["config_name"] == names[name]:
+                run_cost = cost
+
+        def drain(stream, out, seen=None):
+            error = pass_on(stream, out, prefix, lock, seen)
+            if error:
+                problems.append(error)
+
+        stderr_reader = None
+        if prefixed:
+            try:
+                stderr_reader = threading.Thread(target=drain, args=(process.stderr, sys.stderr))
+                stderr_reader.start()
+            except Exception as exc:
+                problems.append(_describe(exc))
+                stderr_reader = None
+        drain(process.stdout, sys.stdout, keep_cost)
+        if stderr_reader:
+            stderr_reader.join()
+        elif prefixed:
+            # Its reader did not start, so it is read here.
+            drain(process.stderr, sys.stderr)
+        try:
+            returncode = process.wait()
+        except Exception as exc:
+            problems.append(_describe(exc))
+        for stream in (process.stdout, process.stderr) if prefixed else (process.stdout,):
+            try:
+                stream.close()
+            except Exception as exc:
+                problems.append(_describe(exc))
+        with lock:
+            if interrupted.is_set():
+                return
+            if run_cost:
+                try:
+                    save_cost(ROOT / COSTS_FILE, run_cost)
+                except Exception as exc:
+                    problems.append(_describe(exc))
+            # Failed, with its own code when that is one, when anything failed.
+            code = (returncode or 1) if problems else returncode
+            results.append((label, code))
+            try:
+                for problem in problems:
+                    print(f"{label}: failed in run-eval.py: {problem}", flush=True)
+                print(f"{label}: exit {code}", flush=True)
+            except Exception:
+                # stdout cannot be written; the run is recorded all the same.
+                pass
+
+    class Started:
+        """A started run, finished once: by its own thread, or by the main
+        thread when that thread never began."""
+
+        def __init__(self, process, name, repetition):
+            self.args = (process, name, repetition)
+            self.claim = threading.Lock()
+            self.done = threading.Event()
+
+        def finish_once(self):
+            if not self.claim.acquire(blocking=False):
+                return
+            try:
+                finish(*self.args)
+            finally:
+                slots.release()
+                self.done.set()
+
+    started = []
+    try:
+        for name, repetition in queue:
+            slots.acquire()
+            with open(ROOT / "configs" / name, "rb") as config:
+                started.append(
+                    Started(
+                        subprocess.Popen(
+                            command,
+                            cwd=ROOT,
+                            stdin=config,
+                            stdout=subprocess.PIPE,
+                            **({"stderr": subprocess.PIPE} if prefixed else {}),
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                        ),
+                        name,
+                        repetition,
+                    )
+                )
+            threading.Thread(target=started[-1].finish_once).start()
+        for run in started:
+            run.done.wait()
+    except BaseException:
+        # Ctrl-C, which reaches every docker compose run too, so each removes
+        # its run's containers, or a run that could not be started. Each
+        # started run is finished here when its thread never began, its output
+        # read to the end so it never blocks on a full pipe.
+        with lock:
+            interrupted.set()
+        for run in started:
+            run.finish_once()
+            run.done.wait()
+        raise
 
 
 def main():
@@ -398,6 +547,17 @@ def test_a_value_comes_from_the_shell_then_dotenv_then_the_default(tmp_path):
     assert prefilled({}, tmp_path / "missing") == DEFAULTS
 
 
+def test_runs_at_once_come_from_the_shell_then_dotenv_then_1(tmp_path):
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("EVAL_PARALLEL_RUNS=3\n")
+    assert prefilled({}, dotenv, PARALLEL_RUNS) == {"EVAL_PARALLEL_RUNS": "3"}
+    shell = {"EVAL_PARALLEL_RUNS": "2"}
+    assert prefilled(shell, dotenv, PARALLEL_RUNS) == {"EVAL_PARALLEL_RUNS": "2"}
+    assert prefilled({}, tmp_path / "missing", PARALLEL_RUNS) == {"EVAL_PARALLEL_RUNS": "1"}
+    # Never among the values passed to a run with -e.
+    assert prefilled(shell, dotenv).keys() == DEFAULTS.keys()
+
+
 def test_judges_are_ticked_from_the_shell_then_dotenv(tmp_path):
     dotenv = tmp_path / ".env"
     dotenv.write_text(f"EVAL_JUDGE_MODELS={JUDGE_MODELS[0]}\n")
@@ -431,10 +591,10 @@ def test_every_value_is_passed_with_dash_e():
     ]
 
 
-def test_repetitions_must_be_a_whole_number_of_at_least_1():
-    assert repetitions_valid(" 3 ") is True
+def test_repetitions_and_runs_at_once_must_be_a_whole_number_of_at_least_1():
+    assert whole_number_valid(" 3 ") is True
     for text in ("0", "", "1.5", "-1", "two", "²"):
-        assert repetitions_valid(text) == "A whole number, at least 1"
+        assert whole_number_valid(text) == "A whole number, at least 1"
 
 
 class _Answer:
@@ -471,7 +631,7 @@ def test_a_full_run(tmp_path, monkeypatch, capsys):
         json.dumps({"a": {"served_model": "provider/model", "agent_cost_usd": 1.5}})
     )
     monkeypatch.setitem(globals(), "ROOT", tmp_path)
-    for name in [*DEFAULTS, "EVAL_JUDGE_MODELS"]:
+    for name in [*DEFAULTS, *PARALLEL_RUNS, "EVAL_JUDGE_MODELS"]:
         monkeypatch.delenv(name, raising=False)
     judge_choices = []
 
@@ -487,8 +647,13 @@ def test_a_full_run(tmp_path, monkeypatch, capsys):
 
     def text(message, default, **kwargs):
         if message == "Repetitions:":
-            assert kwargs["validate"] is repetitions_valid
+            assert kwargs["validate"] is whole_number_valid
             return _Answer(" 2 ")
+        if message == "Runs at once:":
+            assert kwargs["validate"] is whole_number_valid
+            # Neither the shell nor .env sets it.
+            assert default == "1"
+            return _Answer(f" {default} ")
         assert kwargs["validate"] is VALIDATORS.get(message.removesuffix(":"))
         return _Answer(f" {default} ")
 
@@ -579,6 +744,283 @@ def test_a_full_run(tmp_path, monkeypatch, capsys):
         "a": {"served_model": "provider/model", "agent_cost_usd": 1.5},
         "b": {"served_model": "provider/model", "agent_cost_usd": 0.75},
     }
+
+
+class FakeRun:
+    """A run's process: prints ``out`` on stdout and ``err`` on stderr, and exits
+    with ``code``. A held run's stdout ends only once ``release`` is set;
+    ``on_wait`` is called when the run is waited for."""
+
+    def __init__(self, out, err="", code=0, hold=False, on_wait=None):
+        self.release = threading.Event()
+        if not hold:
+            self.release.set()
+        self.stdout = self._stdout(out)
+        self.stderr = io.StringIO(err)
+        self.code = code
+        self.on_wait = on_wait
+        self.waited = False
+
+    def _stdout(self, out):
+        yield from io.StringIO(out)
+        self.release.wait(10)
+
+    def wait(self):
+        self.waited = True
+        if self.on_wait:
+            self.on_wait()
+        return self.code
+
+
+def queue_setup(tmp_path, monkeypatch, configs):
+    """ROOT at ``tmp_path``, with a config file per name in ``configs``; returns
+    the queue of one round of them and their config names."""
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    (tmp_path / "configs").mkdir()
+    for name in configs:
+        (tmp_path / "configs" / f"{name}.yaml").write_text(f"name: {name}\n")
+    return [(f"{name}.yaml", 1) for name in configs], {f"{n}.yaml": n for n in configs}
+
+
+def config_of(kwargs):
+    """The config name in the config file a run was given on stdin."""
+    return kwargs["stdin"].read().decode().removeprefix("name: ").strip()
+
+
+def test_runs_start_in_queue_order_with_at_most_the_runs_at_once(tmp_path, monkeypatch, capsys):
+    queue, names = queue_setup(tmp_path, monkeypatch, "abcde")
+    lock = threading.Lock()
+    started, held = [], []
+    # Runs started and not yet waited for, now and at most.
+    going = {"now": 0, "most": 0}
+
+    def ended():
+        with lock:
+            going["now"] -= 1
+
+    def popen(command, **kwargs):
+        assert kwargs["stdout"] is kwargs["stderr"] is subprocess.PIPE
+        name = config_of(kwargs)
+        process = FakeRun(f"{cost_line(name, 1.0)}\n", hold=True, on_wait=ended)
+        with lock:
+            started.append(name)
+            held.append(process)
+            going["now"] += 1
+            going["most"] = max(going["most"], going["now"])
+            # With every slot taken the oldest run ends; after the last start, all do.
+            releasing = held if len(started) == len(queue) else held[:1]
+            if going["now"] == 3 or len(started) == len(queue):
+                for run in releasing:
+                    run.release.set()
+                del held[: len(releasing)]
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    results = []
+
+    run_queue(["docker"], queue, names, 3, results)
+
+    assert started == list("abcde")
+    assert going["most"] == 3
+    assert sorted(results) == [(f"{name}.yaml run 1", 0) for name in "abcde"]
+    out = capsys.readouterr().out
+    for name in "abcde":
+        assert f"[{name}.yaml run 1] {cost_line(name, 1.0)}\n" in out
+        assert f"\n{name}.yaml run 1: exit 0\n" in f"\n{out}"
+    # Each run's cost is saved.
+    assert read_costs(tmp_path / COSTS_FILE) == {
+        name: {"served_model": "provider/model", "agent_cost_usd": 1.0} for name in "abcde"
+    }
+
+
+def test_with_runs_at_once_every_line_of_a_run_is_prefixed(tmp_path, monkeypatch, capsys):
+    queue, names = queue_setup(tmp_path, monkeypatch, "ab")
+    runs = {
+        # a's last stdout line has no newline.
+        "a": FakeRun("one\ntwo", err="Task 1 of 1 started: t1\n", code=2),
+        "b": FakeRun("three\n", err="Dataset weather-tasks read: 1 items\n"),
+    }
+    monkeypatch.setattr(subprocess, "Popen", lambda command, **kwargs: runs[config_of(kwargs)])
+    results = []
+
+    run_queue(["docker"], queue, names, 2, results)
+
+    captured = capsys.readouterr()
+    # Whole lines, in each run's order; the two runs' lines may interleave.
+    out = captured.out.splitlines(keepends=True)
+    a_lines = [line for line in out if "a.yaml" in line]
+    assert a_lines == ["[a.yaml run 1] one\n", "[a.yaml run 1] two\n", "a.yaml run 1: exit 2\n"]
+    b_lines = [line for line in out if "b.yaml" in line]
+    assert b_lines == ["[b.yaml run 1] three\n", "b.yaml run 1: exit 0\n"]
+    assert len(out) == 5
+    assert sorted(captured.err.splitlines(keepends=True)) == [
+        "[a.yaml run 1] Task 1 of 1 started: t1\n",
+        "[b.yaml run 1] Dataset weather-tasks read: 1 items\n",
+    ]
+    assert sorted(results) == [("a.yaml run 1", 2), ("b.yaml run 1", 0)]
+
+
+def test_ctrl_c_waits_for_every_running_run_and_records_none(tmp_path, monkeypatch, capsys):
+    queue, names = queue_setup(tmp_path, monkeypatch, "abc")
+    runs = []
+
+    def popen(command, **kwargs):
+        name = config_of(kwargs)
+        if name == "c":
+            # Ctrl-C while the third run starts; the terminal's interrupt ends
+            # the two running ones a moment later.
+            threading.Timer(0.5, lambda: [run.release.set() for run in runs]).start()
+            raise KeyboardInterrupt
+        runs.append(FakeRun(f"{name} working\n{cost_line(name, 1.0)}\n", code=130, hold=True))
+        return runs[-1]
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    results = []
+
+    try:
+        run_queue(["docker"], queue, names, 3, results)
+    except KeyboardInterrupt:
+        pass
+    else:
+        raise AssertionError("expected KeyboardInterrupt")
+
+    # Both were read to the end and waited for, and neither is recorded or has its cost saved.
+    assert [run.waited for run in runs] == [True, True]
+    out = capsys.readouterr().out
+    for name in "ab":
+        assert f"[{name}.yaml run 1] {name} working\n" in out
+        assert f"[{name}.yaml run 1] {cost_line(name, 1.0)}\n" in out
+    assert "exit" not in out
+    assert results == []
+    assert not (tmp_path / COSTS_FILE).exists()
+
+
+def test_ctrl_c_keeps_a_finished_run_and_waits_for_the_running_one(tmp_path, monkeypatch, capsys):
+    queue, names = queue_setup(tmp_path, monkeypatch, "abc")
+    runs = {}
+
+    def popen(command, **kwargs):
+        name = config_of(kwargs)
+        if name == "c":
+            # With 2 at once, c starts only once a has ended and been recorded;
+            # Ctrl-C then, while b runs, which the interrupt ends a moment later.
+            threading.Timer(0.5, runs["b"].release.set).start()
+            raise KeyboardInterrupt
+        held = name == "b"
+        runs[name] = FakeRun(f"{cost_line(name, 1.0)}\n", code=130 if held else 0, hold=held)
+        return runs[name]
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    results = []
+
+    try:
+        run_queue(["docker"], queue, names, 2, results)
+    except KeyboardInterrupt:
+        pass
+    else:
+        raise AssertionError("expected KeyboardInterrupt")
+
+    assert results == [("a.yaml run 1", 0)]
+    assert read_costs(tmp_path / COSTS_FILE) == {
+        "a": {"served_model": "provider/model", "agent_cost_usd": 1.0}
+    }
+    # b was read to the end and waited for, and is not recorded.
+    assert runs["b"].waited
+    out = capsys.readouterr().out
+    assert f"[b.yaml run 1] {cost_line('b', 1.0)}\n" in out
+    assert "b.yaml run 1: exit" not in out
+
+
+def test_a_run_whose_output_the_script_fails_on_is_recorded_as_failed(
+    tmp_path, monkeypatch, capsys
+):
+    queue, names = queue_setup(tmp_path, monkeypatch, "a")
+
+    def failing(line):
+        raise RuntimeError("cannot parse")
+
+    monkeypatch.setitem(globals(), "parse_cost_line", failing)
+    run = FakeRun("one\ntwo\n")
+    monkeypatch.setattr(subprocess, "Popen", lambda command, **kwargs: run)
+    results = []
+
+    run_queue(["docker"], queue, names, 1, results)
+
+    # Read to the end and waited for, and recorded as failed though it exited 0.
+    assert run.waited
+    assert results == [("a.yaml run 1", 1)]
+    assert capsys.readouterr().out == (
+        "one\ntwo\n"
+        "a.yaml run 1: failed in run-eval.py: RuntimeError: cannot parse\n"
+        "a.yaml run 1: exit 1\n"
+    )
+
+
+def test_a_line_that_cannot_be_printed_is_skipped_and_reading_goes_on():
+    class Broken:
+        def __init__(self):
+            self.written = []
+
+        def write(self, text):
+            if "bad" in text:
+                raise OSError("closed")
+            self.written.append(text)
+
+        def flush(self):
+            pass
+
+    out = Broken()
+    stream = io.StringIO("bad\ngood\n")
+
+    assert pass_on(stream, out, "[a.yaml run 1] ", threading.Lock()) == "OSError: closed"
+    assert "".join(out.written) == "[a.yaml run 1] good\n"
+    assert stream.read() == ""
+
+
+def test_runs_at_once_from_dotenv_read_stderr_and_prefix_every_line(
+    tmp_path, monkeypatch, capsys
+):
+    queue_setup(tmp_path, monkeypatch, "a")
+    (tmp_path / ".env").write_text(
+        "EVAL_SIMULATED_USER_MODEL=openrouter/test/user\nEVAL_PARALLEL_RUNS=2\n"
+    )
+    for name in [*DEFAULTS, *PARALLEL_RUNS, "EVAL_JUDGE_MODELS"]:
+        monkeypatch.delenv(name, raising=False)
+    defaults = {}
+
+    def checkbox(message, choices, **kwargs):
+        return _Answer([JUDGE_MODELS[0]] if message == "Judge models:" else choices)
+
+    def text(message, default, **kwargs):
+        defaults[message] = default
+        return _Answer(default)
+
+    monkeypatch.setattr(questionary, "checkbox", checkbox)
+    monkeypatch.setattr(questionary, "text", text)
+    monkeypatch.setattr(questionary, "confirm", lambda message, default: _Answer(False))
+    monkeypatch.setitem(globals(), "new_batch", lambda: "2026-10-23T09:00:00Z")
+    monkeypatch.setitem(globals(), "openrouter_prices", lambda: PRICES)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout="abc\n"),
+    )
+    started = []
+
+    def popen(command, **kwargs):
+        started.append(kwargs)
+        return FakeRun("Goal reached on 1 of 1 tasks\n", err="Task 1 of 1 started: t1\n")
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+
+    assert main() == 0
+
+    assert defaults["Runs at once:"] == "2"
+    assert started[0]["stderr"] is subprocess.PIPE
+    captured = capsys.readouterr()
+    assert "[a.yaml run 1] Goal reached on 1 of 1 tasks\n" in captured.out
+    assert "\na.yaml run 1: exit 0\n" in captured.out
+    assert "[a.yaml run 1] Task 1 of 1 started: t1\n" in captured.err
 
 
 def test_the_estimate_is_one_total_with_agents_and_grading_apart():

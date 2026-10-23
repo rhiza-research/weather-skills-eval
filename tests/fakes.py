@@ -22,6 +22,14 @@ from weather_skills_eval.langfuse_gateway import play_scores
 from weather_skills_eval.scoring import TraceRead
 
 
+class KeepOrder:
+    """A random source whose shuffle leaves the order as it is, so a run plays
+    its tasks in the dataset's order."""
+
+    def shuffle(self, items: list) -> None:
+        pass
+
+
 class FakeClock:
     def __init__(self) -> None:
         self.now = 1000.0

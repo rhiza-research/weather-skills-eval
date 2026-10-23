@@ -5,6 +5,7 @@ import asyncio
 import base64
 import io
 import json
+import random
 import re
 import tarfile
 import textwrap
@@ -29,6 +30,7 @@ from fakes import (
     FakeDocker,
     FakeGateway,
     FakeModels,
+    KeepOrder,
     Reply,
     app_observations,
     broadcast_observations,
@@ -44,6 +46,7 @@ from fakes import (
 )
 
 from weather_skills_eval import play as play_module
+from weather_skills_eval import runner as runner_module
 from weather_skills_eval.app_client import ChatError
 from weather_skills_eval.config import RUNNER_ENV, ConfigError
 from weather_skills_eval.instance import AppInstance, AppStartError, RunnerStartError
@@ -172,8 +175,12 @@ class Harness:
         self.health_checks += 1
         return True
 
-    def run(self, health=None, config_path=None, stdin=None, **settings):
-        """``settings`` are harness settings to add to ENVIRON."""
+    def run(
+        self, health=None, config_path=None, stdin=None, rng=None, keep_order=True, **settings
+    ):
+        """``settings`` are harness settings to add to ENVIRON. The tasks are
+        played in the dataset's order unless ``rng`` is given, or with
+        ``keep_order`` false, in the order of run's own random source."""
         return run(
             config_path or self.config_path,
             {**ENVIRON, **settings},
@@ -192,6 +199,7 @@ class Harness:
                 "now": lambda: PLAY_START,
             },
             clock=self.clock,
+            rng=rng or (KeepOrder() if keep_order else None),
         )
 
     def scores(self, index=0):
@@ -1275,6 +1283,59 @@ def test_runs_graded_differently_have_different_comparability_hashes(tmp_path, i
     second = run_metadata(tmp_path, items=items, **settings)
 
     assert second["comparability_hash"] != first["comparability_hash"]
+
+
+# The play order
+
+SIX_TASKS = [task(f"t{n}", f"rain forecast kenya {n}") for n in range(1, 7)]
+
+
+def test_each_run_plays_the_tasks_in_an_order_of_its_own_with_the_same_hash(tmp_path):
+    orders, hashes = [], []
+    for seed in (1, 2):
+        harness = Harness(tmp_path, SIX_TASKS, reply_done_on(1))
+        harness.run(rng=random.Random(seed))
+        experiment = harness.gateway.experiments[0]
+        orders.append([r.item.id for r in experiment["items"]])
+        hashes.append(experiment["metadata"]["comparability_hash"])
+
+    # Each run's order is its own random source's shuffle of the dataset's order.
+    expected = []
+    for seed in (1, 2):
+        ids = [item["id"] for item in SIX_TASKS]
+        random.Random(seed).shuffle(ids)
+        expected.append(ids)
+    assert orders == expected
+    assert orders[0] != orders[1]
+    # The hash reads the items in order of id, so the play order leaves it alone.
+    assert hashes[0] == hashes[1]
+
+
+def test_without_a_random_source_a_run_shuffles_with_an_unseeded_one(tmp_path, monkeypatch):
+    built = []
+
+    class Recording(random.Random):
+        def __init__(self, *args):
+            built.append(self)
+            self.args = args
+            self.shuffled = []
+            super().__init__(*args)
+
+        def shuffle(self, items):
+            self.shuffled.append([item.id for item in items])
+            super().shuffle(items)
+
+    monkeypatch.setattr(runner_module, "random", SimpleNamespace(Random=Recording))
+    harness = Harness(tmp_path, SIX_TASKS, reply_done_on(1))
+
+    harness.run(keep_order=False)
+
+    [source] = built
+    assert source.args == ()
+    # It shuffled the dataset's items, as read.
+    assert source.shuffled == [[item["id"] for item in SIX_TASKS]]
+    played = [r.item.id for r in harness.gateway.experiments[0]["items"]]
+    assert sorted(played) == sorted(source.shuffled[0])
 
 
 def test_play_continues_while_the_user_asks_for_more(tmp_path):
