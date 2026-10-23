@@ -576,5 +576,7 @@ def _default_gateway(settings: Settings) -> LangfuseGateway:
         trace_settle=settings.trace_settle,
         poll_interval=settings.poll_interval,
         model_retries=settings.model_retries,
+        rate_limit_retries=settings.rate_limit_retries,
+        rate_limit_backoff=settings.rate_limit_backoff,
         model_max_tokens=settings.model_max_tokens,
     )

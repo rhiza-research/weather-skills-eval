@@ -28,10 +28,13 @@ reads the app's traces from the project its own keys belong to.
 
 import asyncio
 import json
+import logging
+import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 
 import httpx
 import litellm
@@ -43,6 +46,8 @@ from opentelemetry.sdk.trace import TracerProvider
 
 from .llm import ModelReplyError
 from .scoring import APP_TRACE_NAME, TraceRead
+
+log = logging.getLogger(__name__)
 
 OBSERVATION_FIELDS = "core,basic,model,usage,metadata"
 TOOL_OUTPUT_FIELDS = "core,io"
@@ -127,6 +132,31 @@ def _transient(exc: Exception) -> bool:
     return status is not None and (status == 429 or status >= 500)
 
 
+def _retry_after(exc: Exception) -> float | None:
+    """The seconds a rate-limit error's ``Retry-After`` header asks to wait,
+    given as seconds or as an HTTP date; None without one that reads as
+    either. LiteLLM keeps the provider's response headers on ``response``.
+    A date without a time zone is taken as UTC."""
+    response_headers = getattr(getattr(exc, "response", None), "headers", None)
+    for headers in (response_headers, getattr(exc, "headers", None)):
+        value = next((v for k, v in (headers or {}).items() if k.lower() == "retry-after"), None)
+        if value is None:
+            continue
+        try:
+            seconds = float(value)
+        except ValueError:
+            try:
+                date = parsedate_to_datetime(value)
+            except (TypeError, ValueError):
+                continue
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=UTC)
+            seconds = (date - datetime.now(UTC)).total_seconds()
+        if math.isfinite(seconds):
+            return seconds
+    return None
+
+
 def _usage(response) -> dict[str, int]:
     usage = getattr(response, "usage", None)
     if usage is None:
@@ -206,9 +236,12 @@ class LangfuseGateway:
         poll_interval: float,
         model_max_tokens: int,
         model_retries: int = 2,
+        rate_limit_retries: int,
+        rate_limit_backoff: float,
         client: Langfuse | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        rate_limit_sleep: Callable[[float], None] = time.sleep,
     ):
         # Its own tracer provider keeps spans of other OpenTelemetry users in
         # the process (LangWatch, used by Scenario) out of Langfuse.
@@ -218,9 +251,12 @@ class LangfuseGateway:
         self._trace_settle = trace_settle
         self._poll_interval = poll_interval
         self._model_retries = model_retries
+        self._rate_limit_retries = rate_limit_retries
+        self._rate_limit_backoff = rate_limit_backoff
         self._model_max_tokens = model_max_tokens
         self._clock = clock
         self._sleep = sleep
+        self._rate_limit_sleep = rate_limit_sleep
 
     def dataset(self, name: str):
         return self.client.get_dataset(name)
@@ -242,7 +278,7 @@ class LangfuseGateway:
         with the harness's own key. An alias such as
         ``~anthropic/claude-opus-latest`` resolves only when a request is made,
         to the model it points to. The request is not traced."""
-        response = litellm.completion(
+        response = self._completion(
             model=f"openrouter/{model}",
             messages=[{"role": "user", "content": "Reply with OK."}],
             max_tokens=SERVED_MODEL_MAX_TOKENS,
@@ -255,6 +291,34 @@ class LangfuseGateway:
         if served.startswith("~"):
             raise ModelReplyError(f"OpenRouter's reply for {model} names the alias {served}")
         return served
+
+    def _completion(self, **kwargs):
+        """``litellm.completion``, made again while it fails with a rate limit
+        (HTTP 429), at most ``rate_limit_retries`` more times. LiteLLM's own
+        ``num_retries`` are immediate and do not outlast a provider's limit.
+        The wait is ``rate_limit_backoff`` seconds, doubled for each retry,
+        or the error's ``Retry-After`` when that is longer, but never longer
+        than the schedule's last wait, so a provider cannot hold a call for
+        hours. It blocks the calling thread."""
+        longest = self._rate_limit_backoff * 2 ** (self._rate_limit_retries - 1)
+        retry = 0
+        while True:
+            try:
+                return litellm.completion(**kwargs)
+            except litellm.RateLimitError as exc:
+                if retry >= self._rate_limit_retries:
+                    raise
+                step = self._rate_limit_backoff * 2**retry
+                wait = min(max(step, _retry_after(exc) or 0.0), longest)
+                retry += 1
+                log.warning(
+                    "%s rate-limited (HTTP 429), retry %d of %d in %gs",
+                    kwargs.get("model"),
+                    retry,
+                    self._rate_limit_retries,
+                    wait,
+                )
+                self._rate_limit_sleep(wait)
 
     def link_item_to_chat(self, chat_id: str) -> None:
         """Give the current experiment item's trace the chat id as its session.
@@ -308,7 +372,8 @@ class LangfuseGateway:
                     model=kwargs.get("model"),
                     input=kwargs.get("messages"),
                 ) as generation:
-                    response = litellm.completion(**kwargs)
+                    # Every attempt is inside the one generation.
+                    response = self._completion(**kwargs)
                     choice = response.choices[0]
                     message = choice.message
                     generation.update(

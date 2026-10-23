@@ -892,6 +892,8 @@ def test_final_judge_and_quality_rating_send_8192_output_tokens(monkeypatch):
         trace_settle=1,
         poll_interval=1,
         model_max_tokens=load_settings(settings_env()).model_max_tokens,
+        rate_limit_retries=load_settings(settings_env()).rate_limit_retries,
+        rate_limit_backoff=load_settings(settings_env()).rate_limit_backoff,
         client=Langfuse(
             public_key=f"pk-test-{uuid.uuid4()}",
             secret_key="sk-test",
@@ -959,6 +961,8 @@ def test_simulated_user_call_sends_8192_output_tokens(monkeypatch):
         trace_settle=1,
         poll_interval=1,
         model_max_tokens=load_settings(settings_env()).model_max_tokens,
+        rate_limit_retries=load_settings(settings_env()).rate_limit_retries,
+        rate_limit_backoff=load_settings(settings_env()).rate_limit_backoff,
         client=Langfuse(
             public_key=f"pk-test-{uuid.uuid4()}",
             secret_key="sk-test",

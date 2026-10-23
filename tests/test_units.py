@@ -515,6 +515,29 @@ def test_max_turns_defaults_to_20():
         load_settings(settings_env(EVAL_MAX_TURNS="0"))
 
 
+def test_rate_limit_retries_default_to_6_from_15_seconds():
+    settings = load_settings(settings_env())
+    assert settings.rate_limit_retries == 6
+    assert settings.rate_limit_backoff == 15
+    settings = load_settings(
+        settings_env(EVAL_RATE_LIMIT_RETRIES="0", EVAL_RATE_LIMIT_BACKOFF_SECONDS="0.5")
+    )
+    assert settings.rate_limit_retries == 0
+    assert settings.rate_limit_backoff == 0.5
+
+
+@pytest.mark.parametrize("value", ["-1", "1.5", "many"])
+def test_rate_limit_retries_must_be_a_whole_number_of_at_least_0(value):
+    with pytest.raises(SettingsError, match="EVAL_RATE_LIMIT_RETRIES"):
+        load_settings(settings_env(EVAL_RATE_LIMIT_RETRIES=value))
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "inf", "nan", "soon"])
+def test_rate_limit_backoff_must_be_a_finite_number_greater_than_0(value):
+    with pytest.raises(SettingsError, match="EVAL_RATE_LIMIT_BACKOFF_SECONDS"):
+        load_settings(settings_env(EVAL_RATE_LIMIT_BACKOFF_SECONDS=value))
+
+
 def test_batch_is_read_stripped_and_empty_when_unset():
     assert load_settings(settings_env()).batch == ""
     assert load_settings(settings_env(EVAL_BATCH="  ")).batch == ""

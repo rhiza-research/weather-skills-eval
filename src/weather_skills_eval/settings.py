@@ -23,6 +23,8 @@ class Settings:
     trace_settle: float
     concurrency: int
     model_retries: int
+    rate_limit_retries: int
+    rate_limit_backoff: float
     model_max_tokens: int
     max_turns: int
     harness_commit: str
@@ -103,6 +105,8 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         trace_settle=trace_settle,
         concurrency=_whole(environ, "EVAL_CONCURRENCY", 1, minimum=1),
         model_retries=_whole(environ, "EVAL_MODEL_RETRIES", 2, minimum=0),
+        rate_limit_retries=_whole(environ, "EVAL_RATE_LIMIT_RETRIES", 6, minimum=0),
+        rate_limit_backoff=_number(environ, "EVAL_RATE_LIMIT_BACKOFF_SECONDS", 15),
         model_max_tokens=_whole(environ, "EVAL_MODEL_MAX_TOKENS", 8192, minimum=1),
         max_turns=_whole(environ, "EVAL_MAX_TURNS", 20, minimum=1),
         # Set at image build time from the harness checkout; see compose.yaml.

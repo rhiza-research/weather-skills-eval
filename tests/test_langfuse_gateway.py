@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -43,7 +44,14 @@ def real_client(exporter: InMemorySpanExporter) -> Langfuse:
 
 
 def gateway_for(client, **options) -> LangfuseGateway:
-    settings = {"trace_timeout": 2, "trace_settle": 1, "poll_interval": 1, "model_max_tokens": 8192}
+    settings = {
+        "trace_timeout": 2,
+        "trace_settle": 1,
+        "poll_interval": 1,
+        "model_max_tokens": 8192,
+        "rate_limit_retries": 6,
+        "rate_limit_backoff": 15,
+    }
     settings.update(options)
     return LangfuseGateway(environment="eval", client=client, **settings)
 
@@ -905,6 +913,212 @@ def test_a_reply_that_names_the_alias_is_an_error(monkeypatch):
 
     with pytest.raises(ModelReplyError, match="names the alias ~anthropic/claude-opus-latest"):
         gateway.served_model("~anthropic/claude-opus-latest")
+
+
+def rate_limited(retry_after: str | None = None) -> litellm.RateLimitError:
+    """The error LiteLLM raises for an OpenRouter 429."""
+    return litellm.RateLimitError(
+        "temporarily rate-limited upstream",
+        llm_provider="openrouter",
+        model="meta-llama/llama-4-maverick",
+        response=httpx.Response(429, headers={"retry-after": retry_after} if retry_after else {}),
+    )
+
+
+def failing_first(monkeypatch, errors: list[Exception], reply) -> list[dict]:
+    """``litellm.completion`` raises ``errors`` in order, then returns ``reply``;
+    the list returned holds the kwargs of each call."""
+    calls = []
+
+    def completion(**kwargs):
+        calls.append(kwargs)
+        if len(calls) <= len(errors):
+            raise errors[len(calls) - 1]
+        return reply
+
+    monkeypatch.setattr(litellm, "completion", completion)
+    return calls
+
+
+def ok_reply():
+    return litellm.ModelResponse(
+        model="openrouter/meta-llama/llama-4-maverick",
+        choices=[{"message": {"role": "assistant", "content": "{}"}}],
+        usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    )
+
+
+def user_call(gateway):
+    return gateway.traced_completion(
+        "simulated-user",
+        "chat-1",
+        model="openrouter/meta-llama/llama-4-maverick",
+        messages=[{"role": "user", "content": "x"}],
+    )
+
+
+def test_a_rate_limited_call_waits_then_returns_the_reply_in_one_generation(monkeypatch, caplog):
+    exporter = InMemorySpanExporter()
+    client = real_client(exporter)
+    clock = FakeClock()
+    gateway = gateway_for(client, rate_limit_sleep=clock.sleep_sync)
+    reply = ok_reply()
+    calls = failing_first(monkeypatch, [rate_limited(), rate_limited()], reply)
+
+    with caplog.at_level(logging.WARNING, logger="weather_skills_eval"):
+        response = user_call(gateway)
+    client.flush()
+
+    assert response is reply
+    assert len(calls) == 3
+    assert clock.sleeps == [15, 30]
+    waits = [r for r in caplog.records if r.name == "weather_skills_eval.langfuse_gateway"]
+    assert [r.getMessage() for r in waits] == [
+        "openrouter/meta-llama/llama-4-maverick rate-limited (HTTP 429), retry 1 of 6 in 15s",
+        "openrouter/meta-llama/llama-4-maverick rate-limited (HTTP 429), retry 2 of 6 in 30s",
+    ]
+    generations = [s for s in exporter.get_finished_spans() if s.name == "simulated-user"]
+    assert len(generations) == 1
+    assert generations[0].attributes["langfuse.observation.type"] == "generation"
+
+
+def test_rate_limit_waits_double_from_the_backoff_and_the_last_429_is_raised(monkeypatch):
+    clock = FakeClock()
+    gateway = gateway_for(
+        real_client(InMemorySpanExporter()),
+        rate_limit_retries=6,
+        rate_limit_backoff=15,
+        rate_limit_sleep=clock.sleep_sync,
+    )
+    calls = failing_first(monkeypatch, [rate_limited() for _ in range(7)], ok_reply())
+
+    with pytest.raises(litellm.RateLimitError):
+        user_call(gateway)
+
+    assert len(calls) == 7
+    assert clock.sleeps == [15, 30, 60, 120, 240, 480]
+
+
+def test_a_retry_after_longer_than_the_backoff_is_waited(monkeypatch):
+    clock = FakeClock()
+    gateway = gateway_for(
+        real_client(InMemorySpanExporter()),
+        rate_limit_backoff=15,
+        rate_limit_sleep=clock.sleep_sync,
+    )
+    reply = ok_reply()
+    failing_first(monkeypatch, [rate_limited("100"), rate_limited("1")], reply)
+
+    assert user_call(gateway) is reply
+    # A Retry-After shorter than the backoff does not shorten the wait.
+    assert clock.sleeps == [100, 30]
+
+
+def test_no_rate_limit_retries_fail_a_429_at_once(monkeypatch):
+    clock = FakeClock()
+    gateway = gateway_for(
+        real_client(InMemorySpanExporter()),
+        rate_limit_retries=0,
+        rate_limit_sleep=clock.sleep_sync,
+    )
+    calls = failing_first(monkeypatch, [rate_limited()], ok_reply())
+
+    with pytest.raises(litellm.RateLimitError):
+        user_call(gateway)
+
+    assert len(calls) == 1
+    assert clock.sleeps == []
+
+
+def test_an_error_that_is_not_a_rate_limit_is_not_waited_on(monkeypatch):
+    clock = FakeClock()
+    gateway = gateway_for(real_client(InMemorySpanExporter()), rate_limit_sleep=clock.sleep_sync)
+    error = litellm.InternalServerError("upstream failed", llm_provider="openrouter", model="m")
+    calls = failing_first(monkeypatch, [error], ok_reply())
+
+    with pytest.raises(litellm.InternalServerError):
+        user_call(gateway)
+
+    assert len(calls) == 1
+    assert clock.sleeps == []
+
+
+def test_a_rate_limited_served_model_request_waits_and_is_made_again(monkeypatch):
+    clock = FakeClock()
+    gateway = gateway_for(real_client(InMemorySpanExporter()), rate_limit_sleep=clock.sleep_sync)
+    calls = failing_first(monkeypatch, [rate_limited()], ok_reply())
+
+    assert gateway.served_model("meta-llama/llama-4-maverick") == "meta-llama/llama-4-maverick"
+    assert len(calls) == 2
+    assert clock.sleeps == [15]
+
+
+def test_a_retry_after_longer_than_the_last_wait_is_cut_to_it(monkeypatch):
+    clock = FakeClock()
+    gateway = gateway_for(
+        real_client(InMemorySpanExporter()),
+        rate_limit_retries=6,
+        rate_limit_backoff=15,
+        rate_limit_sleep=clock.sleep_sync,
+    )
+    reply = ok_reply()
+    failing_first(monkeypatch, [rate_limited("86400"), rate_limited("1e300")], reply)
+
+    assert user_call(gateway) is reply
+    assert clock.sleeps == [480, 480]
+
+
+@pytest.mark.parametrize(
+    "date", ["Fri, 01 Jan 2100 00:00:00 GMT", "Fri, 01 Jan 2100 00:00:00 -0000"], ids=repr
+)
+def test_a_retry_after_http_date_is_waited_up_to_the_last_wait(monkeypatch, date):
+    # -0000 parses without a time zone and is taken as UTC.
+    clock = FakeClock()
+    gateway = gateway_for(real_client(InMemorySpanExporter()), rate_limit_sleep=clock.sleep_sync)
+    reply = ok_reply()
+    failing_first(monkeypatch, [rate_limited(date)], reply)
+
+    assert user_call(gateway) is reply
+    assert clock.sleeps == [480]
+
+
+def test_a_retry_after_only_in_the_errors_headers_is_waited(monkeypatch):
+    clock = FakeClock()
+    gateway = gateway_for(real_client(InMemorySpanExporter()), rate_limit_sleep=clock.sleep_sync)
+    error = litellm.RateLimitError(
+        "rate-limited",
+        llm_provider="openrouter",
+        model="m",
+        response=httpx.Response(429, headers={"retry-after": "not a date"}),
+        headers={"Retry-After": "100"},
+    )
+    reply = ok_reply()
+    failing_first(monkeypatch, [error], reply)
+
+    assert user_call(gateway) is reply
+    # The unreadable response header does not stop the error's own header being read.
+    assert clock.sleeps == [100]
+
+
+def test_the_default_gateway_gets_the_rate_limit_settings(monkeypatch):
+    settings = load_settings(
+        {
+            "LANGFUSE_PUBLIC_KEY": "pk",
+            "LANGFUSE_SECRET_KEY": "sk",
+            "OPENROUTER_API_KEY": "or",
+            "LANGFUSE_TRACING_ENVIRONMENT": "eval",
+            "EVAL_SIMULATED_USER_MODEL": "u",
+            "EVAL_JUDGE_MODELS": "j",
+            "EVAL_DOCKER_NETWORK": "n",
+            "EVAL_RATE_LIMIT_RETRIES": "3",
+            "EVAL_RATE_LIMIT_BACKOFF_SECONDS": "2.5",
+        }
+    )
+    built = {}
+    monkeypatch.setattr(runner, "LangfuseGateway", lambda **kwargs: built.update(kwargs))
+    runner._default_gateway(settings)
+    assert built["rate_limit_retries"] == 3
+    assert built["rate_limit_backoff"] == 2.5
 
 
 def _completion_kwargs(monkeypatch, gateway, **kwargs) -> dict:
