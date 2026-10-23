@@ -35,6 +35,7 @@ one run, after ``yes`` on stdin unless ``--yes`` is given. Exit codes:
 """
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -107,6 +108,28 @@ def keep_runs_off_langwatch() -> None:
     for name in list(os.environ):
         if name.upper() == "LANGWATCH_API_KEY":
             del os.environ[name]
+
+
+@contextlib.contextmanager
+def log_to_stderr():
+    """While the run lasts, print the harness's log lines, INFO and above, on
+    stderr, one message per line: its progress through the run and its
+    warnings. They stay off stdout, which ``scripts/run-eval.py`` reads for
+    the summary. The lines do not also reach the root logger, so a handler another
+    library put there does not print them twice."""
+    logger = logging.getLogger(__package__)
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    level, propagate = logger.level, logger.propagate
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        yield
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(level)
+        logger.propagate = propagate
 
 
 def _terminate(signum, frame):
@@ -208,7 +231,8 @@ def main(
     keep_runs_off_langwatch()
 
     try:
-        summary = run(args.config, environ, docker_client_factory=docker_client_factory)
+        with log_to_stderr():
+            summary = run(args.config, environ, docker_client_factory=docker_client_factory)
     except (SettingsError, ConfigError, TaskError, DatasetError) as exc:
         return _fail(EXIT_NOT_STARTED, f"Run not started: {exc}")
     except RunnerStartError as exc:

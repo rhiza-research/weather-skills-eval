@@ -37,6 +37,17 @@ The configs set `pull: false`, so run `docker pull <APP_IMAGE>` first when runni
 
 Ctrl-C prints the exit codes of the runs that finished and exits 130.
 
+### Progress
+
+While a run lasts, `run` prints its progress on stderr, one line each. It begins once the dataset is read; a harness setting or configuration error prints only `Run not started: <error>`. First the main steps of starting the run: the dataset read, with its item count (`Dataset weather-tasks read: 12 items`); each image pull as it begins and ends (`Pulling image <image>`, `Image <image> pulled`, and the same for the runner image), or with `pull: false` the app image found on the Docker host; the runner container and the app container started; the wait for `/health` (`Waiting up to <EVAL_APP_START_TIMEOUT_SECONDS>s for <app container> to answer /health`) and its end; the model OpenRouter serves for the base model; and the experiment started, with the number of tasks and `EVAL_CONCURRENCY`. Then each task when it starts and when it finishes, numbered out of the total:
+
+```
+Task 3 of 12 started: wind
+Task 3 of 12 finished: wind, goal_reached, 4m12s; 5 of 12 finished, 18m elapsed
+```
+
+The finished line gives the task's outcome (see [Outcomes](#outcomes)), followed for `chat_error` and `error` by the first line of the error (`chat_error: <error>`), the time from the task's start, how many tasks have finished, and the time since the run started. Times are in whole seconds, leaving out each part that is 0 (`18m`, `1h5s`). With `EVAL_CONCURRENCY` above 1, tasks are numbered in the order they start, which can differ from the dataset's order. A task the sandbox runner restarted during gives `not scored, the sandbox runner restarted during it` in place of the outcome, and any other task that raised gives `raised <error type>: <first line of the error>`. A task not played because the sandbox runner had already failed logs `Task <n> of <total> skipped: <task id>, the sandbox runner failed` instead of a started and a finished line. After the last task, the harness logs `Waiting for the runner after the last task` when it waits for the runner then (see [Sandbox runner](#sandbox-runner)), and `Removing the run's containers and volume` before it removes them, also when the run fails after the app image was read. The harness's warnings, such as that it is waiting for the runner, are printed on stderr the same way. `run-eval.py` reads only stdout, so stderr, and with it the progress, reaches the terminal as the run prints it.
+
 ### Cost estimate
 
 `.costs.json`, at the repository root and not checked in, holds the agent cost of each config's latest run, by config name (the `name` in the config file):

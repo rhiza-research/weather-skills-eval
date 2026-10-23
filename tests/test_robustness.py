@@ -1216,6 +1216,49 @@ def test_cli_summary_ends_with_the_cost_line_after_the_experiment_url(monkeypatc
     }
 
 
+def test_cli_prints_the_run_log_on_stderr_while_the_run_lasts(monkeypatch, capsys):
+    package = logging.getLogger("weather_skills_eval")
+    handlers, level, propagate = list(package.handlers), package.level, package.propagate
+
+    def logging_run(*args, **kwargs):
+        logging.getLogger("weather_skills_eval.runner").info("Task 1 of 1 started: t1")
+        return RunSummary(
+            experiment_name="cfg",
+            run_name="cfg - run",
+            experiment_url=None,
+            items=1,
+            goals_reached=1,
+            metadata={"config_name": "example"},
+            runner_lost=[],
+            agent_cost_usd=0.0,
+        )
+
+    monkeypatch.setattr(cli, "run", logging_run)
+    assert cli.main(["run", "-"]) == 0
+    captured = capsys.readouterr()
+    assert "Task 1 of 1 started: t1" in captured.err.splitlines()
+    # Stdout holds only the summary.
+    assert "Task 1" not in captured.out
+    # The logger is as it was once the run has ended.
+    assert (package.handlers, package.level, package.propagate) == (handlers, level, propagate)
+
+
+def test_cli_restores_the_logger_when_the_run_fails(monkeypatch, capsys):
+    package = logging.getLogger("weather_skills_eval")
+    handlers, level, propagate = list(package.handlers), package.level, package.propagate
+
+    def failing_run(*args, **kwargs):
+        logging.getLogger("weather_skills_eval.runner").info("Dataset d read: 1 items")
+        raise SettingsError("EVAL_JUDGE_MODELS is not set")
+
+    monkeypatch.setattr(cli, "run", failing_run)
+    assert cli.main(["run", "-"]) == 2
+    err = capsys.readouterr().err.splitlines()
+    assert "Dataset d read: 1 items" in err
+    assert "Run not started: EVAL_JUDGE_MODELS is not set" in err
+    assert (package.handlers, package.level, package.propagate) == (handlers, level, propagate)
+
+
 @pytest.mark.parametrize(
     "name, value", [("EVAL_MAX_TURNS", "0"), ("EVAL_MODEL_MAX_TOKENS", "lots")]
 )

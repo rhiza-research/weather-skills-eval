@@ -806,6 +806,15 @@ def test_skill_versions_follow_semver_with_prereleases_below_releases():
     assert highest_skill_versions([skill("a", "1", ""), skill("b", "2", "")]) == ["a", "b"]
 
 
+def test_a_duration_leaves_out_each_part_that_is_0():
+    assert runner.duration(252) == "4m12s"
+    assert runner.duration(1080) == "18m"
+    assert runner.duration(3605) == "1h5s"
+    assert runner.duration(7322.4) == "2h2m2s"
+    assert runner.duration(59.6) == "1m"
+    assert runner.duration(0.4) == "0s"
+
+
 def test_visible_text_drops_tool_blocks():
     content = 'Fetching.\n<details type="tool_calls" done="true">\n<summary>x</summary>\n</details>\nDone.'
     assert visible_text(content) == "Fetching.\n\nDone."

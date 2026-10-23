@@ -5,6 +5,7 @@ import asyncio
 import base64
 import io
 import json
+import re
 import tarfile
 import textwrap
 import threading
@@ -190,6 +191,7 @@ class Harness:
                 "sleep": self.clock.sleep,
                 "now": lambda: PLAY_START,
             },
+            clock=self.clock,
         )
 
     def scores(self, index=0):
@@ -3517,14 +3519,20 @@ def test_runner_found_stopped_for_good_after_a_task_stops_the_run_at_once(
     assert harness.docker.volume().removed
 
 
-def test_runner_restarted_during_the_last_task_is_waited_for_after_it(tmp_path):
+def test_runner_restarted_during_the_last_task_is_waited_for_after_it(tmp_path, caplog):
     items = [task("t1", "rain forecast kenya")]
     runner = FakeContainer([*BEFORE_T1, RESTARTED])
     harness = Harness(tmp_path, items, reply_done_on(1), runner=runner)
     tasks_raised = []
     keep_task_errors(harness, tasks_raised)
 
-    summary = harness.run()
+    with caplog.at_level("INFO"):
+        summary = harness.run()
+
+    assert progress_lines(caplog)[-2:] == [
+        "Waiting for the runner after the last task",
+        "Removing the run's containers and volume",
+    ]
 
     assert [item_id for item_id, _ in tasks_raised] == ["t1"]
     assert summary.items == 0 and summary.runner_lost == ["t1"]
@@ -3616,3 +3624,155 @@ def test_cleanup_errors_are_logged_and_do_not_replace_the_run_error(tmp_path, ca
     assert "Could not remove app container" in logged
     assert "Could not remove runner container" in logged
     assert "Could not remove volume" in logged
+
+
+# The progress log
+
+# A duration as the progress log writes it, such as 4m12s.
+DURATION = r"[0-9hms]+"
+
+
+def progress_lines(caplog) -> list[str]:
+    """The run's INFO log lines, in order."""
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name in ("weather_skills_eval.runner", "weather_skills_eval.instance")
+        and r.levelname == "INFO"
+    ]
+
+
+def task_lines(caplog) -> list[str]:
+    return [line for line in progress_lines(caplog) if line.startswith("Task ")]
+
+
+def finished_line(number: int, task_id: str, result: str, done: int, total: int = 3) -> str:
+    """A pattern for the line a task logs when it finishes."""
+    return (
+        f"Task {number} of {total} finished: {task_id}, {re.escape(result)}, {DURATION}; "
+        f"{done} of {total} finished, {DURATION} elapsed"
+    )
+
+
+def test_the_run_logs_each_step_and_each_task_out_of_the_total(tmp_path, caplog):
+    harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1))
+
+    with caplog.at_level("INFO"):
+        harness.run()
+
+    lines = progress_lines(caplog)
+    runner_name = harness.docker.create_calls[0]["name"]
+    app_name = harness.docker.run_calls[0]["name"]
+    assert lines[:11] == [
+        "Dataset weather-tasks read: 3 items",
+        f"Pulling image {APP_REPOSITORY}:test",
+        f"Image {APP_REPOSITORY}:test pulled",
+        f"Pulling runner image {RUNNER_IMAGE}",
+        f"Runner image {RUNNER_IMAGE} pulled",
+        f"Runner container {runner_name} started",
+        f"App container {app_name} started",
+        f"Waiting up to 600s for {app_name} to answer /health",
+        f"App container {app_name} answered /health",
+        "OpenRouter serves anthropic/claude-haiku-5.5 as anthropic/claude-haiku-5.5",
+        "Experiment anthropic/claude-haiku-5.5 started: 3 tasks, concurrency 1",
+    ]
+    tasks = lines[11:17]
+    # No task lost the runner, so it is not waited for after the last task.
+    assert lines[17:] == ["Removing the run's containers and volume"]
+    for number, task_id in enumerate(["t1", "t2", "t3"], start=1):
+        assert tasks[2 * number - 2] == f"Task {number} of 3 started: {task_id}"
+        pattern = finished_line(number, task_id, "goal_reached", number)
+        assert re.fullmatch(pattern, tasks[2 * number - 1])
+
+
+def test_an_image_on_the_docker_host_is_logged_as_found_there(tmp_path, caplog):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1), local=local_image())
+    harness.config_path.write_text(CONFIG + "pull: false\n")
+
+    with caplog.at_level("INFO"):
+        harness.run()
+
+    lines = progress_lines(caplog)
+    found = f"Image {APP_REPOSITORY}:test found on the Docker host"
+    assert found in lines
+    assert f"Pulling image {APP_REPOSITORY}:test" not in lines
+    assert f"Runner image {RUNNER_IMAGE} pulled" in lines
+
+
+def test_tasks_are_numbered_in_the_order_they_start(tmp_path, caplog):
+    harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1))
+    record = harness.gateway.run_experiment
+
+    def last_first(*, dataset, **kwargs):
+        # The tasks start in another order than the dataset's, as they can
+        # with EVAL_CONCURRENCY above 1.
+        return record(dataset=SimpleNamespace(items=list(reversed(dataset.items))), **kwargs)
+
+    harness.gateway.run_experiment = last_first
+
+    with caplog.at_level("INFO"):
+        harness.run()
+
+    lines = task_lines(caplog)
+    assert lines[0::2] == [
+        "Task 1 of 3 started: t3",
+        "Task 2 of 3 started: t2",
+        "Task 3 of 3 started: t1",
+    ]
+    assert re.fullmatch(finished_line(1, "t3", "goal_reached", 1), lines[1])
+
+
+def test_a_chat_error_logs_the_first_line_of_its_error(tmp_path, caplog):
+    def reply(opening, number, text):
+        return Reply(error="Model not found")
+
+    harness = Harness(tmp_path, [task("t1", "broken request")], reply)
+
+    with caplog.at_level("INFO"):
+        harness.run()
+
+    output = harness.output()
+    assert output["outcome"] == "chat_error"
+    result = f"chat_error: {output['error'].splitlines()[0]}"
+    assert re.fullmatch(finished_line(1, "t1", result, 1, total=1), task_lines(caplog)[1])
+
+
+def test_a_task_lost_to_a_runner_restart_logs_that_instead_of_an_outcome(tmp_path, caplog):
+    runner = FakeContainer([*BEFORE_T1, RESTARTED, RESTARTED], logs=b"emulator crashed")
+    harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
+    keep_task_errors(harness, [])
+
+    with caplog.at_level("INFO"):
+        harness.run()
+
+    lines = task_lines(caplog)
+    lost = "not scored, the sandbox runner restarted during it"
+    assert re.fullmatch(finished_line(1, "t1", lost, 1), lines[1])
+    # The run goes on, and the next tasks have their outcomes.
+    assert re.fullmatch(finished_line(2, "t2", "goal_reached", 2), lines[3])
+    assert re.fullmatch(finished_line(3, "t3", "goal_reached", 3), lines[5])
+
+
+def test_a_task_that_raises_logs_the_first_line_of_its_error(tmp_path, caplog):
+    runner = FakeContainer([*BEFORE_T1, ("exited", 0, 0)], logs=b"emulator stopped")
+    harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
+    keep_task_errors(harness, [])
+
+    with caplog.at_level("INFO"):
+        with pytest.raises(RunnerStartError):
+            harness.run(**SHORT_WAIT)
+
+    lines = task_lines(caplog)
+    error = (
+        "raised RunnerStartError: Runner container stopped during task t1: it is exited, "
+        "restarted 0 times, 0 before."
+    )
+    assert re.fullmatch(finished_line(1, "t1", error, 1), lines[1])
+    # t2 and t3 raise the same error without being played.
+    assert lines[2:] == [
+        "Task 2 of 3 skipped: t2, the sandbox runner failed",
+        "Task 3 of 3 skipped: t3, the sandbox runner failed",
+    ]
+    # The runner's logs, after the first line, are left out.
+    assert "emulator stopped" not in "\n".join(lines)

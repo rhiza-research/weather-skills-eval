@@ -294,7 +294,9 @@ class AppInstance:
         if not pull:
             # An image built on the host has no repo digest until it is pushed.
             image = self._local(ref, error, what)
+            log.info("%s %s found on the Docker host", what, ref)
             return image, self._repo_digest(ref, image)
+        log.info("Pulling %s %s", what.lower(), ref)
         image = self._pull(ref, error, what)
         digest = self._repo_digest(ref, image)
         if digest is None:
@@ -302,6 +304,7 @@ class AppInstance:
                 f"{what} {ref} has no digest for {repository_of(ref)} "
                 f"(digests: {image.attrs.get('RepoDigests') or []})"
             )
+        log.info("%s %s pulled", what, ref)
         return image, digest
 
     @staticmethod
@@ -484,6 +487,7 @@ class AppInstance:
         runner container and volume by name, in that order, since a volume in
         use cannot be removed. Never
         raises: a cleanup error must not replace the error that ended the run."""
+        log.info("Removing the run's containers and volume")
         self.container = None
         self.runner = None
         self._remove_container(self.emulator_source_name, "emulator source")
@@ -510,6 +514,7 @@ class AppInstance:
             )
             self.runner_image_id = runner_image.id
             self._start_runner(runner_image, image, files)
+            log.info("Runner container %s started", self.runner_name)
             self.container = self._docker.containers.run(
                 image.id,
                 detach=True,
@@ -519,7 +524,10 @@ class AppInstance:
                 labels=self._labels(LABEL_VALUE),
                 volumes={self.volume_name: {"bind": APP_DATA_DIR, "mode": "rw"}},
             )
+            log.info("App container %s started", self.name)
+            log.info("Waiting up to %gs for %s to answer /health", self._start_timeout, self.name)
             self._wait_for_health()
+            log.info("App container %s answered /health", self.name)
         except BaseException as exc:
             self.remove()
             if isinstance(exc, DOCKER_ERRORS):
