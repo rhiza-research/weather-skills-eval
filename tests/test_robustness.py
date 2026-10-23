@@ -1462,7 +1462,7 @@ def test_cli_main_keeps_scenario_off_langwatch_when_a_key_is_set(monkeypatch):
             experiment_url=None,
             items=1,
             goals_reached=1,
-            metadata={},
+            metadata={"config_name": "example"},
             runner_lost=[],
             agent_cost_usd=0.0,
         )

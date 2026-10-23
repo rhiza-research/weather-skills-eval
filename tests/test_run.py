@@ -175,9 +175,7 @@ class Harness:
         self.health_checks += 1
         return True
 
-    def run(
-        self, health=None, config_path=None, stdin=None, rng=None, keep_order=True, **settings
-    ):
+    def run(self, health=None, config_path=None, stdin=None, rng=None, keep_order=True, **settings):
         """``settings`` are harness settings to add to ENVIRON. The tasks are
         played in the dataset's order unless ``rng`` is given, or with
         ``keep_order`` false, in the order of run's own random source."""
