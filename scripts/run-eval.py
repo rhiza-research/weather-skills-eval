@@ -69,8 +69,7 @@ def prefilled(environ, dotenv_path, defaults=DEFAULTS):
     """Each value of ``defaults`` from the shell, else from .env, else its default."""
     dotenv = _dotenv(dotenv_path)
     return {
-        name: environ.get(name) or dotenv.get(name) or default
-        for name, default in defaults.items()
+        name: environ.get(name) or dotenv.get(name) or default for name, default in defaults.items()
     }
 
 
@@ -977,9 +976,7 @@ def test_a_line_that_cannot_be_printed_is_skipped_and_reading_goes_on():
     assert stream.read() == ""
 
 
-def test_runs_at_once_from_dotenv_read_stderr_and_prefix_every_line(
-    tmp_path, monkeypatch, capsys
-):
+def test_runs_at_once_from_dotenv_read_stderr_and_prefix_every_line(tmp_path, monkeypatch, capsys):
     queue_setup(tmp_path, monkeypatch, "a")
     (tmp_path / ".env").write_text(
         "EVAL_SIMULATED_USER_MODEL=openrouter/test/user\nEVAL_PARALLEL_RUNS=2\n"
