@@ -26,7 +26,7 @@ The configs set `pull: false`, so run `docker pull <APP_IMAGE>` first when runni
 `uv run scripts/run-eval.py` does the same for the configs you pick:
 
 1. It lists `configs/*.yaml` other than `example.yaml` as a checklist.
-2. It lists the judge models as a checklist: `openrouter/google/gemini-4-argon`, `openrouter/anthropic/claude-opus-5.5` and `openrouter/openai/gpt-5.5`, each ticked when `EVAL_JUDGE_MODELS` in the shell, else in `.env`, names it. At least one must be picked.
+2. It offers the judge models `EVAL_JUDGE_MODELS` names in the shell, else in `.env` (comma-separated; spaces trimmed, empty names and repeats dropped), as a checklist with each ticked. At least one must be picked. When it names none, the script prints `EVAL_JUDGE_MODELS names no judge model; set it in the shell or .env` and exits 2 before asking anything.
 3. It asks for `EVAL_SIMULATED_USER_MODEL`, `APP_IMAGE`, `RUNNER_IMAGE` and `EVAL_CONCURRENCY`, each prefilled from the shell, else from `.env`, else from its default: blank for the simulated user model, `ghcr.io/rhiza-research/weather-skills-chat:prod`, `ghcr.io/rhiza-research/weather-skills-sandbox-runner:prod`, and blank for the concurrency. A blank simulated user model is not accepted.
 4. It asks for the number of repetitions, a whole number of at least 1, default 1.
 5. It asks "Runs at once:", how many runs it keeps going at once, a whole number of at least 1, prefilled from `EVAL_PARALLEL_RUNS` in the shell, else in `.env`, else 1. The script does not pass it with `-e`, and the harness does not read it.

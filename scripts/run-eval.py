@@ -41,13 +41,6 @@ DEFAULTS = {
 # not passed with -e, and the harness does not read it.
 PARALLEL_RUNS = {"EVAL_PARALLEL_RUNS": "1"}
 
-# The judge models offered in the checklist, as LiteLLM names them.
-JUDGE_MODELS = [
-    "openrouter/google/gemini-4-argon",
-    "openrouter/anthropic/claude-opus-5.5",
-    "openrouter/openai/gpt-5.5",
-]
-
 # Each config's agent cost from its latest run, by config name; not checked in.
 COSTS_FILE = ".costs.json"
 # The line a run's summary reports its agent cost on.
@@ -73,11 +66,12 @@ def prefilled(environ, dotenv_path, defaults=DEFAULTS):
     }
 
 
-def ticked_judges(environ, dotenv_path):
-    """The models of JUDGE_MODELS that EVAL_JUDGE_MODELS names, from the shell, else from .env."""
+def judge_models(environ, dotenv_path):
+    """The models EVAL_JUDGE_MODELS names, from the shell, else from .env, in its
+    order, spaces trimmed, without empty names or repeats."""
     current = environ.get("EVAL_JUDGE_MODELS") or _dotenv(dotenv_path).get("EVAL_JUDGE_MODELS")
-    named = {model.strip() for model in (current or "").split(",")}
-    return [model for model in JUDGE_MODELS if model in named]
+    named = (model.strip() for model in (current or "").split(","))
+    return list(dict.fromkeys(model for model in named if model))
 
 
 def judges_valid(picked):
@@ -266,14 +260,17 @@ def show_estimate(configs, repetitions, judges, user_model):
 
 
 def run_eval(results):
+    offered = judge_models(os.environ, ROOT / ".env")
+    if not offered:
+        print("EVAL_JUDGE_MODELS names no judge model; set it in the shell or .env", flush=True)
+        return 2
     configs = sorted(p.name for p in (ROOT / "configs").glob("*.yaml") if p.name != "example.yaml")
     picked = questionary.checkbox("Configs to run:", choices=configs).unsafe_ask()
     if not picked:
         return 0
-    ticked = ticked_judges(os.environ, ROOT / ".env")
     judges = questionary.checkbox(
         "Judge models:",
-        choices=[questionary.Choice(model, checked=model in ticked) for model in JUDGE_MODELS],
+        choices=[questionary.Choice(model, checked=True) for model in offered],
         validate=judges_valid,
     ).unsafe_ask()
     values = {
@@ -557,19 +554,45 @@ def test_runs_at_once_come_from_the_shell_then_dotenv_then_1(tmp_path):
     assert prefilled(shell, dotenv).keys() == DEFAULTS.keys()
 
 
-def test_judges_are_ticked_from_the_shell_then_dotenv(tmp_path):
+# Judge models as EVAL_JUDGE_MODELS names them in the tests.
+JUDGES = ["openrouter/test/judge-a", "openrouter/test/judge-b", "openrouter/test/judge-c"]
+
+
+def test_judge_models_come_from_the_shell_then_dotenv(tmp_path):
     dotenv = tmp_path / ".env"
-    dotenv.write_text(f"EVAL_JUDGE_MODELS={JUDGE_MODELS[0]}\n")
-    assert ticked_judges({}, dotenv) == [JUDGE_MODELS[0]]
-    # Spaces are ignored, the checklist's order kept, and a model not in it is left out.
-    shell = {"EVAL_JUDGE_MODELS": f" {JUDGE_MODELS[2]} , openrouter/other/judge,{JUDGE_MODELS[1]}"}
-    assert ticked_judges(shell, dotenv) == [JUDGE_MODELS[1], JUDGE_MODELS[2]]
-    assert ticked_judges({}, tmp_path / "missing") == []
+    dotenv.write_text(f"EVAL_JUDGE_MODELS={JUDGES[0]}\n")
+    assert judge_models({}, dotenv) == [JUDGES[0]]
+    # Spaces trimmed, its order kept, empty names and repeats dropped, any model offered.
+    shell = {"EVAL_JUDGE_MODELS": f" {JUDGES[2]} ,,{JUDGES[1]}, {JUDGES[2]}"}
+    assert judge_models(shell, dotenv) == [JUDGES[2], JUDGES[1]]
+    assert judge_models({}, tmp_path / "missing") == []
+    assert judge_models({"EVAL_JUDGE_MODELS": " , "}, tmp_path / "missing") == []
 
 
 def test_at_least_one_judge_must_be_picked():
-    assert judges_valid([JUDGE_MODELS[0]]) is True
+    assert judges_valid([JUDGES[0]]) is True
     assert judges_valid([]) == "Pick at least one judge"
+
+
+def test_without_judge_models_the_script_stops_before_asking_more(tmp_path, monkeypatch, capsys):
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs" / "a.yaml").write_text("name: a\n")
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    monkeypatch.delenv("EVAL_JUDGE_MODELS", raising=False)
+    asked = []
+
+    def checkbox(message, choices, **kwargs):
+        asked.append(message)
+        return _Answer(choices)
+
+    monkeypatch.setattr(questionary, "checkbox", checkbox)
+
+    assert main() == 2
+
+    assert asked == []
+    assert capsys.readouterr().out == (
+        "EVAL_JUDGE_MODELS names no judge model; set it in the shell or .env\n"
+    )
 
 
 def test_the_simulated_user_model_must_not_be_blank():
@@ -612,8 +635,8 @@ def cost_line(config, cost, served_model="provider/model"):
 
 # USD per token, (input, output), of the models the tests price.
 PRICES = {
-    JUDGE_MODELS[0].removeprefix("openrouter/"): (1e-6, 2e-6),
-    JUDGE_MODELS[1].removeprefix("openrouter/"): (1e-6, 2e-6),
+    JUDGES[0].removeprefix("openrouter/"): (1e-6, 2e-6),
+    JUDGES[1].removeprefix("openrouter/"): (1e-6, 2e-6),
     "test/user": (1e-6, 1e-6),
 }
 
@@ -623,7 +646,8 @@ def test_a_full_run(tmp_path, monkeypatch, capsys):
     for name in ("a", "b", "example"):
         (tmp_path / "configs" / f"{name}.yaml").write_text(f"name: {name}\n")
     (tmp_path / ".env").write_text(
-        f"EVAL_JUDGE_MODELS={JUDGE_MODELS[1]}\nEVAL_SIMULATED_USER_MODEL=openrouter/test/user\n"
+        f"EVAL_JUDGE_MODELS={JUDGES[0]},{JUDGES[1]},{JUDGES[2]}\n"
+        "EVAL_SIMULATED_USER_MODEL=openrouter/test/user\n"
     )
     # A saved cost for a, from an earlier run; none for b.
     (tmp_path / COSTS_FILE).write_text(
@@ -638,8 +662,8 @@ def test_a_full_run(tmp_path, monkeypatch, capsys):
         if message == "Judge models:":
             assert kwargs["validate"] is judges_valid
             judge_choices.extend((c.value, c.checked) for c in choices)
-            # The ticked judge and the first one.
-            return _Answer([c.value for c in choices if c.checked or c.value == JUDGE_MODELS[0]])
+            # The third judge unticked.
+            return _Answer([c.value for c in choices if c.checked and c.value != JUDGES[2]])
         return _Answer(choices)
 
     monkeypatch.setattr(questionary, "checkbox", checkbox)
@@ -703,11 +727,11 @@ def test_a_full_run(tmp_path, monkeypatch, capsys):
     assert build == ["docker", "compose", "build", "eval"]
     assert build_kwargs["env"]["HARNESS_COMMIT"] == "abc"
     assert pull == ["docker", "pull", DEFAULTS["APP_IMAGE"]]
-    # Every judge model is offered, the one .env names ticked.
-    assert judge_choices == [(model, model == JUDGE_MODELS[1]) for model in JUDGE_MODELS]
-    # The picked judges, the prefilled answers with their spaces trimmed, and the batch id.
+    # Every judge model .env names is offered, ticked.
+    assert judge_choices == [(judge, True) for judge in JUDGES]
+    # Only the picked judges, the prefilled answers with their spaces trimmed, and the batch id.
     values = {
-        "EVAL_JUDGE_MODELS": f"{JUDGE_MODELS[0]},{JUDGE_MODELS[1]}",
+        "EVAL_JUDGE_MODELS": f"{JUDGES[0]},{JUDGES[1]}",
         **DEFAULTS,
         "EVAL_SIMULATED_USER_MODEL": "openrouter/test/user",
         "EVAL_BATCH": "2026-10-22T20:00:00Z",
@@ -979,6 +1003,7 @@ def test_a_line_that_cannot_be_printed_is_skipped_and_reading_goes_on():
 def test_runs_at_once_from_dotenv_read_stderr_and_prefix_every_line(tmp_path, monkeypatch, capsys):
     queue_setup(tmp_path, monkeypatch, "a")
     (tmp_path / ".env").write_text(
+        f"EVAL_JUDGE_MODELS={JUDGES[0]}\n"
         "EVAL_SIMULATED_USER_MODEL=openrouter/test/user\nEVAL_PARALLEL_RUNS=2\n"
     )
     for name in [*DEFAULTS, *PARALLEL_RUNS, "EVAL_JUDGE_MODELS"]:
@@ -986,7 +1011,7 @@ def test_runs_at_once_from_dotenv_read_stderr_and_prefix_every_line(tmp_path, mo
     defaults = {}
 
     def checkbox(message, choices, **kwargs):
-        return _Answer([JUDGE_MODELS[0]] if message == "Judge models:" else choices)
+        return _Answer([JUDGES[0]] if message == "Judge models:" else choices)
 
     def text(message, default, **kwargs):
         defaults[message] = default
@@ -1023,7 +1048,7 @@ def test_runs_at_once_from_dotenv_read_stderr_and_prefix_every_line(tmp_path, mo
 def test_the_estimate_is_one_total_with_agents_and_grading_apart():
     costs = {"a": {"agent_cost_usd": 2.0}, "b": {"agent_cost_usd": 0.5}}
     configs = [("a.yaml", "a"), ("b.yaml", "b")]
-    lines = estimate_lines(configs, 3, costs, JUDGE_MODELS[:2], "openrouter/test/user", PRICES)
+    lines = estimate_lines(configs, 3, costs, JUDGES[:2], "openrouter/test/user", PRICES)
     # Agents: (2.0 + 0.5) * 3. Grading: (0.13 * 2 + 0.063) * 2 configs * 3 rounds.
     assert lines == ["Estimated cost: $9.44 (agents $7.50, judges and simulated user $1.94)"]
 
@@ -1032,15 +1057,13 @@ def test_a_config_without_a_saved_cost_and_a_model_without_a_price_are_named():
     costs = {"a": {"agent_cost_usd": 1.0}, "c": {"agent_cost_usd": "1.0"}}
     configs = [("a.yaml", "a"), ("a2.yaml", "a"), ("b.yaml", "b"), ("b2.yaml", "b")]
     configs += [("c.yaml", "c"), ("unnamed.yaml", None)]
-    lines = estimate_lines(
-        configs, 1, costs, [JUDGE_MODELS[0], JUDGE_MODELS[2]], "test/user", PRICES
-    )
-    # Agents: a twice. Grading: (0.13 + 0.063) * 6 configs; gpt-5.5 has no price
+    lines = estimate_lines(configs, 1, costs, [JUDGES[0], JUDGES[2]], "test/user", PRICES)
+    # Agents: a twice. Grading: (0.13 + 0.063) * 6 configs; judge-c has no price
     # in PRICES. A config that sets no name is named by its file name.
     assert lines == [
         "Estimated cost: $3.16 (agents $2.00, judges and simulated user $1.16)",
         "Agent cost unknown, not counted: b, c, unnamed.yaml",
-        f"No OpenRouter price, not counted: {JUDGE_MODELS[2]}",
+        f"No OpenRouter price, not counted: {JUDGES[2]}",
     ]
 
 
@@ -1170,7 +1193,7 @@ def test_with_every_cost_saved_the_estimate_is_one_total(tmp_path, monkeypatch, 
     asked, ran = estimate_setup(tmp_path, monkeypatch)
     (tmp_path / COSTS_FILE).write_text(json.dumps({"a": {"agent_cost_usd": 1.0}}))
 
-    show_estimate([("a.yaml", "a")], 1, [JUDGE_MODELS[0]], "test/user")
+    show_estimate([("a.yaml", "a")], 1, [JUDGES[0]], "test/user")
 
     assert asked == [] and ran == []
     assert capsys.readouterr().out == (
@@ -1181,7 +1204,7 @@ def test_with_every_cost_saved_the_estimate_is_one_total(tmp_path, monkeypatch, 
 def test_a_config_without_a_saved_cost_is_named_unknown(tmp_path, monkeypatch, capsys):
     asked, ran = estimate_setup(tmp_path, monkeypatch)
 
-    show_estimate([("a.yaml", "a")], 1, [JUDGE_MODELS[0]], "test/user")
+    show_estimate([("a.yaml", "a")], 1, [JUDGES[0]], "test/user")
 
     assert asked == [] and ran == []
     assert capsys.readouterr().out == (
@@ -1195,7 +1218,7 @@ def test_an_unreadable_cost_file_makes_the_estimate_unavailable(tmp_path, monkey
     asked, ran = estimate_setup(tmp_path, monkeypatch)
     (tmp_path / COSTS_FILE).write_text("not json")
 
-    show_estimate([("a.yaml", "a")], 1, [JUDGE_MODELS[0]], "test/user")
+    show_estimate([("a.yaml", "a")], 1, [JUDGES[0]], "test/user")
 
     assert asked == [] and ran == []
     assert capsys.readouterr().out.startswith(
@@ -1212,7 +1235,7 @@ def test_failed_prices_make_the_estimate_unavailable(tmp_path, monkeypatch, caps
 
         monkeypatch.setitem(globals(), "openrouter_prices", offline)
 
-        show_estimate([("a.yaml", "a")], 1, [JUDGE_MODELS[0]], "test/user")
+        show_estimate([("a.yaml", "a")], 1, [JUDGES[0]], "test/user")
 
         assert capsys.readouterr().out == (
             "Cost estimate unavailable: OpenRouter prices could not be read: no network\n"
