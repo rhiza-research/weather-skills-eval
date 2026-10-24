@@ -1,9 +1,9 @@
-name: glm-5.3-agent
+name: gpt-sol-agent
 image: ${APP_IMAGE}
 runner_image: ${RUNNER_IMAGE}
 # false runs the image already on the Docker host instead of pulling it.
 pull: false
-model: weather-agent-glm-5.3
+model: weather-agent-gpt-sol
 dataset: weather-eval-tasks
 env:
   WEBUI_SECRET_KEY: ${APP_WEBUI_SECRET_KEY}
@@ -19,14 +19,14 @@ env:
       model_call_tracing: openrouter
 
   CATALOG_MODELS:
-    - id: weather-agent-glm-5.3
-      name: "Weather Agent GLM 5.3"
-      base_model_id: "open-router-.z-ai/glm-5.3"
+    - id: weather-agent-gpt-sol
+      name: "Weather Agent GPT Sol"
+      base_model_id: "open-router-.~openai/gpt-sol-latest"
       meta:
         profile_image_url: /static/favicon.png
-        description: "The primary chat for weather skills. Backed by GLM 5.3"
+        description: "The primary chat for weather skills. Backed by GPT Sol"
         capabilities:
-          vision: false
+          vision: true
           usage: false
           citations: true
         suggestion_prompts: null
@@ -34,8 +34,6 @@ env:
       params:
         stream_response: true
         function_calling: native
-        provider:
-          quantizations: ["fp8"]
         system: |-
           You are an agent helping forecasters, agricultural researchers, and data scientists fetch, transform, and visualize forecast and observational data. Prefer the installed weather skills for every fetch, transform, and plot so users can trust the output. Discover the skills you actually have and follow each skill's own description. Do not interpret results unless the user explicitly asks; display the artifacts (plots, paths, numbers) and stop.
 

@@ -1,10 +1,9 @@
-name: glm-5.3-low-agent
-variant: reasoning_low
+name: gemini-flash-agent
 image: ${APP_IMAGE}
 runner_image: ${RUNNER_IMAGE}
 # false runs the image already on the Docker host instead of pulling it.
 pull: false
-model: weather-agent-glm-5.3-low
+model: weather-agent-gemini-flash
 dataset: weather-eval-tasks
 env:
   WEBUI_SECRET_KEY: ${APP_WEBUI_SECRET_KEY}
@@ -20,14 +19,14 @@ env:
       model_call_tracing: openrouter
 
   CATALOG_MODELS:
-    - id: weather-agent-glm-5.3-low
-      name: "Weather Agent GLM 5.3 (low reasoning)"
-      base_model_id: "open-router-.z-ai/glm-5.3"
+    - id: weather-agent-gemini-flash
+      name: "Weather Agent Gemini Flash"
+      base_model_id: "open-router-.~google/gemini-flash-latest"
       meta:
         profile_image_url: /static/favicon.png
-        description: "The primary chat for weather skills. Backed by GLM 5.3 at low reasoning effort"
+        description: "The primary chat for weather skills. Backed by Gemini Flash"
         capabilities:
-          vision: false
+          vision: true
           usage: false
           citations: true
         suggestion_prompts: null
@@ -35,9 +34,6 @@ env:
       params:
         stream_response: true
         function_calling: native
-        reasoning_effort: low
-        provider:
-          quantizations: ["fp8"]
         system: |-
           You are an agent helping forecasters, agricultural researchers, and data scientists fetch, transform, and visualize forecast and observational data. Prefer the installed weather skills for every fetch, transform, and plot so users can trust the output. Discover the skills you actually have and follow each skill's own description. Do not interpret results unless the user explicitly asks; display the artifacts (plots, paths, numbers) and stop.
 

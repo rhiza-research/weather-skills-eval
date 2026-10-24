@@ -1,9 +1,10 @@
-name: gpt-6-luna-agent
+name: glm-medium-agent
+variant: reasoning_medium
 image: ${APP_IMAGE}
 runner_image: ${RUNNER_IMAGE}
 # false runs the image already on the Docker host instead of pulling it.
 pull: false
-model: weather-agent-gpt-6-luna
+model: weather-agent-glm-medium
 dataset: weather-eval-tasks
 env:
   WEBUI_SECRET_KEY: ${APP_WEBUI_SECRET_KEY}
@@ -19,14 +20,14 @@ env:
       model_call_tracing: openrouter
 
   CATALOG_MODELS:
-    - id: weather-agent-gpt-6-luna
-      name: "Weather Agent GPT-6 Luna"
-      base_model_id: "open-router-.openai/gpt-6-luna"
+    - id: weather-agent-glm-medium
+      name: "Weather Agent GLM (medium reasoning)"
+      base_model_id: "open-router-.~z-ai/glm-latest"
       meta:
         profile_image_url: /static/favicon.png
-        description: "The primary chat for weather skills. Backed by GPT-6 Luna"
+        description: "The primary chat for weather skills. Backed by GLM at medium reasoning effort"
         capabilities:
-          vision: true
+          vision: false
           usage: false
           citations: true
         suggestion_prompts: null
@@ -34,6 +35,9 @@ env:
       params:
         stream_response: true
         function_calling: native
+        reasoning_effort: medium
+        provider:
+          quantizations: ["fp8"]
         system: |-
           You are an agent helping forecasters, agricultural researchers, and data scientists fetch, transform, and visualize forecast and observational data. Prefer the installed weather skills for every fetch, transform, and plot so users can trust the output. Discover the skills you actually have and follow each skill's own description. Do not interpret results unless the user explicitly asks; display the artifacts (plots, paths, numbers) and stop.
 

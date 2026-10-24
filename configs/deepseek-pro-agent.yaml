@@ -1,10 +1,9 @@
-name: glm-5.3-high-agent
-variant: reasoning_high
+name: deepseek-pro-agent
 image: ${APP_IMAGE}
 runner_image: ${RUNNER_IMAGE}
 # false runs the image already on the Docker host instead of pulling it.
 pull: false
-model: weather-agent-glm-5.3-high
+model: weather-agent-deepseek-pro
 dataset: weather-eval-tasks
 env:
   WEBUI_SECRET_KEY: ${APP_WEBUI_SECRET_KEY}
@@ -20,12 +19,12 @@ env:
       model_call_tracing: openrouter
 
   CATALOG_MODELS:
-    - id: weather-agent-glm-5.3-high
-      name: "Weather Agent GLM 5.3 (high reasoning)"
-      base_model_id: "open-router-.z-ai/glm-5.3"
+    - id: weather-agent-deepseek-pro
+      name: "Weather Agent DeepSeek Pro"
+      base_model_id: "open-router-.~deepseek/deepseek-pro-latest"
       meta:
         profile_image_url: /static/favicon.png
-        description: "The primary chat for weather skills. Backed by GLM 5.3 at high reasoning effort"
+        description: "The primary chat for weather skills. Backed by DeepSeek Pro"
         capabilities:
           vision: false
           usage: false
@@ -35,7 +34,6 @@ env:
       params:
         stream_response: true
         function_calling: native
-        reasoning_effort: high
         provider:
           quantizations: ["fp8"]
         system: |-
