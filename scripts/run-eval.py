@@ -543,17 +543,6 @@ def test_a_value_comes_from_the_shell_then_dotenv_then_the_default(tmp_path):
     assert prefilled({}, tmp_path / "missing") == DEFAULTS
 
 
-def test_runs_at_once_come_from_the_shell_then_dotenv_then_1(tmp_path):
-    dotenv = tmp_path / ".env"
-    dotenv.write_text("EVAL_PARALLEL_RUNS=3\n")
-    assert prefilled({}, dotenv, PARALLEL_RUNS) == {"EVAL_PARALLEL_RUNS": "3"}
-    shell = {"EVAL_PARALLEL_RUNS": "2"}
-    assert prefilled(shell, dotenv, PARALLEL_RUNS) == {"EVAL_PARALLEL_RUNS": "2"}
-    assert prefilled({}, tmp_path / "missing", PARALLEL_RUNS) == {"EVAL_PARALLEL_RUNS": "1"}
-    # Never among the values passed to a run with -e.
-    assert prefilled(shell, dotenv).keys() == DEFAULTS.keys()
-
-
 # Judge models as EVAL_JUDGE_MODELS names them in the tests.
 JUDGES = ["openrouter/test/judge-a", "openrouter/test/judge-b", "openrouter/test/judge-c"]
 

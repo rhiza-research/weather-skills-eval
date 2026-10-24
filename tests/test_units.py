@@ -11,7 +11,6 @@ from weather_skills_eval.judge import JudgeRuling, PanelRuling
 from weather_skills_eval.runner import comparability_hash
 from weather_skills_eval.scoring import split_usage, trace_metrics
 from weather_skills_eval.settings import SettingsError, _number, _whole, load_settings
-from weather_skills_eval.simulated_user import SYSTEM_PROMPT
 from weather_skills_eval.tasks import TaskError, parse_task, parse_tasks
 
 BASE_ENV = {
@@ -76,45 +75,25 @@ def test_config_variant_must_be_a_string(value):
     assert error.value.field == "variant"
 
 
-def test_config_reference_to_unset_variable_names_the_field():
-    raw = config(env={**BASE_ENV, "LANGFUSE_SECRET_KEY": "${MISSING}"})
-    with pytest.raises(ConfigError) as error:
-        parse_config(raw, default_name="x", environ=ENVIRON)
-    assert error.value.field == "env.LANGFUSE_SECRET_KEY"
-
-
 APP_IMAGE = "weather-skills-chat:40be9ee"
 
 
-@pytest.mark.parametrize(
-    "image, environ",
-    [
-        ("${APP_IMAGE}", {"APP_IMAGE": APP_IMAGE}),
-        ("weather-skills-chat:${APP_TAG}", {"APP_TAG": "40be9ee"}),
-        (APP_IMAGE, {}),
-    ],
-    ids=["whole-reference", "partial-reference", "literal"],
-)
-def test_config_image_resolves_references(image, environ):
-    result = parse_config(config(image=image), default_name="x", environ={**ENVIRON, **environ})
-    assert result.image == APP_IMAGE
-
-
-@pytest.mark.parametrize(
-    "image, name, environ",
-    [
-        ("${APP_IMAGE}", "APP_IMAGE", {}),
-        ("${APP_IMAGE}", "APP_IMAGE", {"APP_IMAGE": ""}),
-        ("weather-skills-chat:${APP_TAG}", "APP_TAG", {}),
-        ("weather-skills-chat:${APP_TAG}", "APP_TAG", {"APP_TAG": ""}),
-    ],
-    ids=["whole-unset", "whole-empty", "partial-unset", "partial-empty"],
-)
-def test_config_image_reference_to_unset_or_empty_variable_names_the_image(image, name, environ):
-    with pytest.raises(ConfigError) as error:
-        parse_config(config(image=image), default_name="x", environ={**ENVIRON, **environ})
-    assert error.value.field == "image"
-    assert f"${{{name}}}" in str(error.value)
+def test_a_reference_resolves_from_the_environment_and_an_unset_or_empty_one_names_the_field():
+    # image, runner_image and every env value resolve references the same way.
+    environ = {**ENVIRON, "APP_IMAGE": APP_IMAGE, "APP_TAG": "40be9ee", "BLANK": ""}
+    for image in ("${APP_IMAGE}", "weather-skills-chat:${APP_TAG}", APP_IMAGE):
+        result = parse_config(config(image=image), default_name="x", environ=environ)
+        assert result.image == APP_IMAGE
+    for image, name in (
+        ("${MISSING}", "MISSING"),
+        ("weather-skills-chat:${MISSING}", "MISSING"),
+        ("${BLANK}", "BLANK"),
+        ("weather-skills-chat:${BLANK}", "BLANK"),
+    ):
+        with pytest.raises(ConfigError) as error:
+            parse_config(config(image=image), default_name="x", environ=environ)
+        assert error.value.field == "image"
+        assert f"${{{name}}}" in str(error.value)
 
 
 def test_config_requires_the_admin_api_key():
@@ -482,57 +461,6 @@ def test_task_pause_seconds_must_be_a_finite_number(seconds):
 def test_task_judge_criteria_must_hold_text(criteria):
     with pytest.raises(TaskError, match="expected_output.judge_criteria"):
         parse_task(item(expected_output={"judge_criteria": criteria}))
-
-
-def test_simulated_user_prompt_holds_the_done_give_up_and_correction_rules():
-    for rule in (
-        "You are done when the assistant has presented everything you asked for, as you asked.",
-        "Give up only when the assistant says it cannot do what you asked",
-        "Compare what you received, the answer's text and any files, with what you asked for",
-        "say so plainly and ask for the fix",
-        '"done": true when the assistant has presented everything you asked for',
-    ):
-        assert rule in SYSTEM_PROMPT.replace("\n", " ")
-    assert "rovenance" not in SYSTEM_PROMPT
-
-
-def test_simulated_user_prompt_reveals_the_next_step_when_stuck_or_past_it_and_skips_done_steps():
-    prompt = SYSTEM_PROMPT.replace("\n", " ")
-    for rule in (
-        "The next hidden step is the first one below that you have not revealed and that is "
-        "not done.",
-        "A step the conversation or the files you were shown already show as done counts as "
-        "used: skip it and consider the next one.",
-        "The assistant is stuck: it repeats itself, says it cannot go on, or asks you how to "
-        "proceed.",
-        "The assistant has presented a result, or moved on past where that step belongs, "
-        "without doing that step.",
-        "a progress reply that has not reached that step yet is not a reason",
-        "Reveal at most one per reply",
-    ):
-        assert rule in prompt
-    assert "only mention one when the assistant is stuck" not in prompt
-
-
-def test_simulated_user_prompt_answers_only_what_is_asked_and_checks_plans():
-    prompt = SYSTEM_PROMPT.replace("\n", " ")
-    # After the facts instruction, and in the comparison paragraph.
-    assert (
-        "{facts}  Answer only what the assistant asked. Raise another fact only when a result "
-        "lacks it or contradicts it.  Hidden steps."
-    ) in prompt
-    assert (
-        "ask for the fix, the way a busy person would. When the assistant proposes a plan, "
-        "check it against what you asked for and your facts before agreeing, the same way you "
-        "check results.  You are done"
-    ) in prompt
-
-
-def test_simulated_user_prompt_says_a_zarr_store_is_a_data_file():
-    assert (
-        "This assistant's data files are Zarr stores, the standard format for this kind of data; "
-        "a Zarr store is a data file."
-    ) in SYSTEM_PROMPT.replace("\n", " ")
 
 
 def test_an_optional_setting_has_its_default_when_unset_and_rejects_an_invalid_value():

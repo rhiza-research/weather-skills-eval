@@ -49,6 +49,7 @@ from fakes import (
 from weather_skills_eval import cli
 from weather_skills_eval import play as play_module
 from weather_skills_eval import runner as runner_module
+from weather_skills_eval import simulated_user as simulated_user_module
 from weather_skills_eval.app_client import ChatError
 from weather_skills_eval.config import RUNNER_ENV, ConfigError
 from weather_skills_eval.instance import AppInstance, AppStartError, RunnerStartError
@@ -524,6 +525,23 @@ def test_every_turn_requests_a_streaming_completion(tmp_path):
     assert all(body["stream"] is True for body in completions)
     assert "turn" not in completions[0]
     assert "turn" in completions[1]
+
+
+def test_the_simulated_user_is_sent_its_prompt_filled_with_the_task(tmp_path, monkeypatch):
+    template = "MOCK PROMPT\nopening: {opening}\nfacts: {facts}\nhidden:\n{hidden_steps}"
+    monkeypatch.setattr(simulated_user_module, "SYSTEM_PROMPT", template)
+    items = [task("t1", "rain forecast kenya", hidden=["Use the weekly total", "Plot it"])]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.run()
+
+    [call] = harness.models.user_calls()
+    assert call["messages"][0] == {
+        "role": "system",
+        "content": (
+            "MOCK PROMPT\nopening: rain forecast kenya\nfacts: Region: Kenya. Period: next week.\n"
+            "hidden:\n- Use the weekly total\n- Plot it"
+        ),
+    }
 
 
 STARTED = (
