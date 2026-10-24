@@ -528,6 +528,13 @@ def test_simulated_user_prompt_answers_only_what_is_asked_and_checks_plans():
     ) in prompt
 
 
+def test_simulated_user_prompt_says_a_zarr_store_is_a_data_file():
+    assert (
+        "This assistant's data files are Zarr stores, the standard format for this kind of data; "
+        "a Zarr store is a data file."
+    ) in SYSTEM_PROMPT.replace("\n", " ")
+
+
 def test_max_turns_defaults_to_20():
     assert load_settings(settings_env()).max_turns == 20
     assert load_settings(settings_env(EVAL_MAX_TURNS="50")).max_turns == 50

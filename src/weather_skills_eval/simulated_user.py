@@ -27,6 +27,9 @@ CLASSIFICATIONS = ("clarifying_question", "progress", "answer", "other")
 SYSTEM_PROMPT = """You play a person who asked a weather assistant for help. You are the user, \
 never the assistant. Write the way a busy person types: short and plain.
 
+This assistant's data files are Zarr stores, the standard format for this kind of data; a \
+Zarr store is a data file.
+
 What you want, in your own words when you started:
 {opening}
 
