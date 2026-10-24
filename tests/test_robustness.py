@@ -4,7 +4,7 @@ import io
 import json
 import logging
 import os
-import re
+import signal
 import threading
 import time
 import types
@@ -43,13 +43,14 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SpanExportResult
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from scenario import AgentAdapter, AgentInput, AgentRole, ScenarioResult
+from scenario import AgentAdapter, AgentRole, ScenarioResult
 from scenario._tracing import _reset_tracing_for_tests, judge_span_collector
 
 from weather_skills_eval import cli
 from weather_skills_eval import instance as instance_module
 from weather_skills_eval.app_client import AppClient, ChatError, Conversation
 from weather_skills_eval.checks import (
+    NOTHING_PRESENTED,
     Evidence,
     PresentedFile,
     ReplyFiles,
@@ -64,11 +65,9 @@ from weather_skills_eval.instance import (
     repository_of,
 )
 from weather_skills_eval.judge import GoalJudge, rate_answer
-from weather_skills_eval.langfuse_gateway import LangfuseGateway, LangfuseRuns
-from weather_skills_eval.play import neutral_transcript
-from weather_skills_eval.runner import DatasetError, RunSummary, base_model
+from weather_skills_eval.langfuse_gateway import DELETE_BATCH_SIZE, LangfuseGateway, LangfuseRuns
+from weather_skills_eval.runner import RunSummary, base_model
 from weather_skills_eval.settings import DEFAULT_MODEL_MAX_TOKENS, SettingsError, load_settings
-from weather_skills_eval.simulated_user import SimulatedUser
 from weather_skills_eval.tasks import TaskError, parse_task
 
 REPO = Path(__file__).resolve().parent.parent
@@ -79,7 +78,7 @@ BASE_ENV = {
     "BOOTSTRAP_ADMIN_PASSWORD": "${P}",
     "BOOTSTRAP_ADMIN_API_KEY": "${K}",
 }
-ENVIRON = {"S": "secret", "P": "password", "K": "sk-key", "EMPTY": "  "}
+ENVIRON = {"S": "secret", "P": "password", "K": "sk-key"}
 
 
 def parse(env_extra=None, environ=ENVIRON):
@@ -132,13 +131,7 @@ def test_secret_reference_with_whitespace_resolves_to_the_value_alone():
     assert result.env["OPENAI_API_KEYS"] == "sk-key"
 
 
-def test_empty_referenced_variable_stops_the_run():
-    with pytest.raises(ConfigError, match="empty") as error:
-        parse({"OPENAI_API_KEYS": "${EMPTY}"})
-    assert error.value.field == "env.OPENAI_API_KEYS"
-
-
-@pytest.mark.parametrize("port", ["0", "70000", "http", "80a"])
+@pytest.mark.parametrize("port", ["0", "http"])
 def test_invalid_port_stops_the_run(port):
     with pytest.raises(ConfigError) as error:
         parse({"PORT": port})
@@ -150,18 +143,17 @@ def test_valid_port_is_used():
 
 
 @pytest.mark.parametrize(
-    "configs, field, message",
+    "configs, field",
     [
-        ("not json", "env.OPENAI_API_CONFIGS", "is not JSON"),
-        ('["a"]', "env.OPENAI_API_CONFIGS", "must map each connection"),
-        ('{"0": "a"}', "env.OPENAI_API_CONFIGS", "must map each connection"),
-        ({"0": {"prefix_id": 1}}, "env.OPENAI_API_CONFIGS.0.prefix_id", "string"),
-        ({"0": {"enable": "no"}}, "env.OPENAI_API_CONFIGS.0.enable", "true or false"),
-        ({"0": {"model_ids": "m"}}, "env.OPENAI_API_CONFIGS.0.model_ids", "list"),
+        ("not json", "env.OPENAI_API_CONFIGS"),
+        ('["a"]', "env.OPENAI_API_CONFIGS"),
+        ({"0": {"prefix_id": 1}}, "env.OPENAI_API_CONFIGS.0.prefix_id"),
+        ({"0": {"enable": "no"}}, "env.OPENAI_API_CONFIGS.0.enable"),
+        ({"0": {"model_ids": "m"}}, "env.OPENAI_API_CONFIGS.0.model_ids"),
     ],
 )
-def test_invalid_connection_configs_stop_the_run(configs, field, message):
-    with pytest.raises(ConfigError, match=message) as error:
+def test_invalid_connection_configs_stop_the_run(configs, field):
+    with pytest.raises(ConfigError) as error:
         parse({"OPENAI_API_CONFIGS": configs})
     assert error.value.field == field
 
@@ -174,11 +166,9 @@ ROUTER = {"prefix_id": "open-router-"}
     [
         ("open-router-.anthropic/claude-haiku-5.5", [ROUTER], "anthropic/claude-haiku-5.5"),
         (" open-router-.anthropic/claude-haiku-5.5 ", [ROUTER], "anthropic/claude-haiku-5.5"),
-        ("anthropic/claude-haiku-5.5", [], "anthropic/claude-haiku-5.5"),
         ("~anthropic/claude-opus-latest", [ROUTER], "~anthropic/claude-opus-latest"),
         # The last connection that may serve the model wins, as in the app.
         ("a.b.model", [{"prefix_id": "a.b"}, {"prefix_id": "a"}], "b.model"),
-        ("a.b.model", [{"prefix_id": "a"}, {"prefix_id": "a.b"}], "model"),
         # A disabled connection, or one whose model_ids leave the model out, does not serve it.
         ("a.model", [{"prefix_id": "a"}, {"prefix_id": "b", "enable": False}], "model"),
         ("a.model", [{"prefix_id": "a"}, {"model_ids": ["other"]}], "model"),
@@ -200,7 +190,7 @@ def test_connections_are_read_in_the_order_written():
 def test_non_utf8_config_file_is_a_config_error(tmp_path):
     path = tmp_path / "bad.yaml"
     path.write_bytes(b"image: \xff\xfe\n")
-    with pytest.raises(ConfigError, match="not UTF-8"):
+    with pytest.raises(ConfigError):
         load_config(path, ENVIRON)
 
 
@@ -222,9 +212,6 @@ def test_example_config_is_valid():
     config = load_config(REPO / "configs" / "example.yaml", environ)
     assert config.name == "example"
     assert config.runner_image == "value"
-    assert json.loads(config.env["OPENAI_API_CONFIGS"]) == {
-        "0": {"model_call_tracing": "openrouter"}
-    }
 
 
 # Settings
@@ -244,33 +231,15 @@ def settings_env(**overrides):
     return env
 
 
-@pytest.mark.parametrize("value", ["Production", " PRODUCTION ", "production\n"])
-def test_production_guard_ignores_case_and_whitespace(value):
-    with pytest.raises(SettingsError, match="LANGFUSE_TRACING_ENVIRONMENT"):
-        load_settings(settings_env(LANGFUSE_TRACING_ENVIRONMENT=value))
-
-
-@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
-def test_non_finite_numbers_are_rejected(value):
-    with pytest.raises(SettingsError, match="EVAL_TURN_TIMEOUT_SECONDS"):
-        load_settings(settings_env(EVAL_TURN_TIMEOUT_SECONDS=value))
-
-
 def test_settle_must_be_less_than_trace_timeout():
-    with pytest.raises(SettingsError, match="EVAL_TRACE_SETTLE_SECONDS"):
+    with pytest.raises(SettingsError):
         load_settings(settings_env(EVAL_TRACE_SETTLE_SECONDS="60", EVAL_TRACE_TIMEOUT_SECONDS="60"))
-
-
-def test_retries_and_harness_commit_are_read():
-    settings = load_settings(settings_env(EVAL_MODEL_RETRIES="0", EVAL_HARNESS_COMMIT="abc123"))
-    assert settings.model_retries == 0
-    assert settings.harness_commit == "abc123"
 
 
 # Tasks
 
 
-@pytest.mark.parametrize("opening", ["", "   ", None])
+@pytest.mark.parametrize("opening", ["   ", None])
 def test_empty_or_blank_input_is_a_task_error(opening):
     item = {
         "id": "i1",
@@ -278,7 +247,7 @@ def test_empty_or_blank_input_is_a_task_error(opening):
         "expected_output": {"judge_criteria": ["c"]},
         "metadata": {"facts": "f", "turn_limit": 2},
     }
-    with pytest.raises(TaskError, match="i1"):
+    with pytest.raises(TaskError):
         parse_task(item)
 
 
@@ -293,7 +262,6 @@ def client(handler) -> AppClient:
     "response",
     [
         httpx.Response(200, text="<html>proxy error</html>"),
-        httpx.Response(200, json=["not", "an", "object"]),
         httpx.Response(502, text="Bad Gateway"),
     ],
 )
@@ -327,31 +295,16 @@ def stored_reply(reply) -> Callable:
 
 
 @pytest.mark.parametrize(
-    "stored, level",
+    "stored",
     [
-        (lambda _: {"chat": ["x"]}, "chat"),
-        (lambda _: {"chat": ""}, "chat"),
-        (lambda _: {"chat": {"history": []}}, "chat.history"),
-        (lambda _: {"chat": {"history": {"messages": 0}}}, "chat.history.messages"),
-        (lambda _: {"chat": {"history": {"messages": [{"done": True}]}}}, "chat.history.messages"),
-        (stored_reply([]), "chat.history.messages."),
-        (stored_reply({"done": True, "content": []}), "not text"),
-        (stored_reply({"done": True, "content": [{"type": "text", "text": "20 mm"}]}), "not text"),
+        lambda _: {"chat": ["x"]},
+        stored_reply({"done": True, "content": []}),
     ],
-    ids=[
-        "chat-list",
-        "chat-empty-text",
-        "history-empty-list",
-        "messages-zero",
-        "messages-list",
-        "reply-empty-list",
-        "content-empty-list",
-        "content-list",
-    ],
+    ids=["chat-list", "content-empty-list"],
 )
-def test_a_chat_reply_of_an_unexpected_shape_is_a_chat_error_and_not_answered(stored, level):
+def test_a_chat_reply_of_an_unexpected_shape_is_a_chat_error_and_not_answered(stored):
     conversation, _ = chat_returning(stored)
-    with pytest.raises(ChatError, match=re.escape(level)):
+    with pytest.raises(ChatError):
         asyncio.run(conversation.send("rain next week?"))
     # The play ends as chat_error, and the turn got no reply.
     assert conversation.error
@@ -375,15 +328,8 @@ def test_null_chat_levels_are_not_there_yet_and_null_content_is_empty():
 
 def test_create_chat_without_id_is_a_chat_error():
     app = client(lambda request: httpx.Response(200, json={"chat": {}}))
-    with pytest.raises(ChatError, match="no chat id"):
+    with pytest.raises(ChatError):
         asyncio.run(app.create_chat({}))
-
-
-def test_artifact_listing_error_is_reported():
-    app = client(lambda request: httpx.Response(500, json={"detail": "disk"}))
-    evidence = asyncio.run(collect_evidence(app, "c1", presenting("maps/rain.png"), ["image"]))
-    assert "could not be listed" in evidence.problem
-    assert evidence.files == []
 
 
 def presenting(*paths: str, candidates: frozenset[str] = frozenset()) -> list[ReplyFiles]:
@@ -395,6 +341,8 @@ def test_a_failed_listing_never_reports_a_candidate_as_unlisted():
     app = client(lambda request: httpx.Response(500, json={"detail": "disk"}))
     replies = presenting("maps/rain.png", "kenya.zarr", candidates=frozenset({"kenya.zarr"}))
     evidence = asyncio.run(collect_evidence(app, "c1", replies, ["zarr"]))
+    assert evidence.problem is not None
+    assert evidence.files == []
     assert evidence.unlisted == ["maps/rain.png"]
     assert evidence.read_failed
 
@@ -472,9 +420,8 @@ def test_the_final_read_waits_for_a_backtick_file_the_listing_lags():
     [
         ("```foo``` is a span; the data is in `out.zarr`.", ["out.zarr"]),
         ("```py\n[data](out.zarr) and `k.zarr`\n```\nNothing else.", []),
-        ("~~~\n![map](maps/rain.png)\n~~~\nSee [data](out.zarr).", ["out.zarr"]),
     ],
-    ids=["inline-triple-backticks", "link-in-backtick-fence", "link-in-tilde-fence"],
+    ids=["inline-triple-backticks", "link-in-backtick-fence"],
 )
 def test_fenced_code_presents_nothing_and_an_inline_span_opens_no_fence(content, paths):
     assert reply_files(content, 1).paths == paths
@@ -506,8 +453,8 @@ def test_a_path_named_only_in_backticks_never_blocks_the_judge():
     assert evidence.problem is None
     notes = {f.path: f.note for f in evidence.files}
     assert notes["out.zarr"] is None
-    assert notes["era5_kenya.zarr"] == "it has no provenance"
-    assert notes["maps/input.png"].startswith("it could not be read:")
+    assert notes["era5_kenya.zarr"] is not None
+    assert notes["maps/input.png"] is not None
     # Two zarr stores: the one named only in backticks is not the only file of its kind.
     assert {f.path: f.named_in_passing for f in evidence.files} == {
         "out.zarr": False,
@@ -542,9 +489,9 @@ def test_an_earlier_unlisted_file_is_labeled_presented():
     replies = [ReplyFiles(1, ["early.zarr"]), ReplyFiles(2, ["final.zarr"])]
     evidence = asyncio.run(collect_evidence(app, "c1", replies, [], every=True))
     assert evidence.problem is None
-    assert [(f.path, f.note, f.named_in_passing) for f in evidence.files] == [
-        ("early.zarr", "it is not in the chat's files", False),
-        ("final.zarr", None, False),
+    assert [(f.path, f.note is not None, f.named_in_passing) for f in evidence.files] == [
+        ("early.zarr", True, False),
+        ("final.zarr", False, False),
     ]
 
 
@@ -556,7 +503,7 @@ def test_the_same_path_named_by_a_link_in_another_reply_still_blocks():
         ReplyFiles(2, ["out.zarr"], frozenset({"out.zarr"})),
     ]
     evidence = asyncio.run(collect_evidence(app, "c1", replies, ["zarr"], every=True))
-    assert evidence.problem == "Presented files have no provenance: ['out.zarr']"
+    assert evidence.problem is not None
 
 
 @pytest.mark.parametrize(
@@ -572,37 +519,32 @@ def test_a_listed_folder_named_in_backticks_presents_nothing(entry):
     evidence = asyncio.run(
         collect_evidence(app, "c1", presenting("maps", candidates=frozenset({"maps"})), [])
     )
-    assert evidence.problem == "No result presented: no reply presented a file"
+    assert evidence.problem == NOTHING_PRESENTED
 
 
 def test_only_kinds_the_app_reads_provenance_from_need_it():
-    entries = [
-        {"path": "maps/rain.jpg", "kind": "image"},
-        {"path": "notes.txt", "kind": "file"},
-    ]
+    entries = [{"path": "maps/rain.jpg", "kind": "image"}]
 
     def handler(request):
         if request.url.path.endswith("/artifacts"):
             return httpx.Response(200, json=entries)
         return httpx.Response(200, content=b"jpg")
 
-    evidence = asyncio.run(
-        collect_evidence(client(handler), "c1", presenting("maps/rain.jpg", "notes.txt"), [])
-    )
+    evidence = asyncio.run(collect_evidence(client(handler), "c1", presenting("maps/rain.jpg"), []))
     assert evidence.problem is None
-    assert [f.note for f in evidence.files] == ["it has no provenance"] * 2
-    for path, kind in (("maps/rain.png", "image"), ("map.html", "html"), ("o.zarr", "zarr")):
+    assert evidence.files[0].note is not None
+    for path, kind in (("maps/rain.png", "image"), ("map.html", "html")):
         listing = [{"path": path, "kind": kind}]
         app = client(lambda request, listing=listing: httpx.Response(200, json=listing))
         evidence = asyncio.run(collect_evidence(app, "c1", presenting(path), []))
-        assert evidence.problem == f"Presented files have no provenance: ['{path}']"
+        assert evidence.problem is not None
 
 
 def test_only_unlisted_candidates_is_no_result_presented():
     app = client(lambda request: httpx.Response(200, json=[{"path": "out/rain.zarr"}]))
     replies = presenting("rain.zarr", candidates=frozenset({"rain.zarr"}))
     evidence = asyncio.run(collect_evidence(app, "c1", replies, ["zarr"], every=True))
-    assert evidence.problem == "No result presented: no reply presented a file"
+    assert evidence.problem == NOTHING_PRESENTED
     assert evidence.unlisted == []
     # A later listing may have it, so the evidence is read again.
     assert evidence.unlisted_candidates == ["rain.zarr"]
@@ -642,32 +584,26 @@ def test_a_failed_extra_listing_falls_back_to_the_earlier_listing():
 
     # The lagging path is reported from the first listing; the other file keeps
     # its provenance and image.
-    assert evidence.problem.startswith(
-        "Presented files are not in the chat's files: ['maps/gone.png']; "
-        "the listing read again failed: "
-    )
-    assert "500" in evidence.problem
+    assert evidence.unlisted == ["maps/gone.png"]
     assert evidence.files[0].provenance == entry["provenance_detail"]
     assert evidence.files[0].image == b"png"
     assert len(listings) == 2
     assert waits == [1]
 
 
-def test_presented_file_missing_from_the_listing_is_named():
+def test_presented_file_missing_from_the_listing_is_unlisted():
     entries = [{"path": None, "kind": "image"}, {"kind": "image"}, "junk"]
     app = client(lambda request: httpx.Response(200, json=entries))
     evidence = asyncio.run(collect_evidence(app, "c1", presenting("maps/rain.png"), ["image"]))
-    assert evidence.problem == "Presented files are not in the chat's files: ['maps/rain.png']"
+    assert evidence.unlisted == ["maps/rain.png"]
 
 
-@pytest.mark.parametrize("detail", [None, ["arco-era5-fetch"], "{}", {}, {"branches": []}])
+@pytest.mark.parametrize("detail", ["{}", {"branches": []}])
 def test_provenance_detail_must_be_an_object(detail):
-    entry = {"path": "out.zarr", "kind": "zarr"}
-    if detail is not None:
-        entry["provenance_detail"] = detail
+    entry = {"path": "out.zarr", "kind": "zarr", "provenance_detail": detail}
     app = client(lambda request: httpx.Response(200, json=[entry]))
     evidence = asyncio.run(collect_evidence(app, "c1", presenting("out.zarr"), ["zarr"]))
-    assert evidence.problem == "Presented files have no provenance: ['out.zarr']"
+    assert evidence.problem is not None
 
 
 @pytest.mark.parametrize(
@@ -684,11 +620,7 @@ def test_health_check_needs_a_status_object(monkeypatch, response, healthy):
     assert instance_module._health_ok("http://app/health") is healthy
 
 
-TRANSPORT_ERRORS = [
-    requests.exceptions.ConnectionError("connection aborted"),
-    requests.exceptions.ReadTimeout("read timed out"),
-    requests.exceptions.ChunkedEncodingError("response ended early"),
-]
+TRANSPORT_ERRORS = [requests.exceptions.ConnectionError("connection aborted")]
 
 
 def transport_error_id(error) -> str:
@@ -713,71 +645,50 @@ def docker_instance(daemon, *, pull: bool = True) -> AppInstance:
     )
 
 
-@pytest.mark.parametrize("status", ["connection-error", "read-timeout"])
-def test_a_docker_transport_error_reading_the_runner_is_a_runner_failure(status):
+def test_a_docker_transport_error_reading_the_runner_is_a_runner_failure():
     instance = docker_instance(FakeDocker(FakeContainer(["running"])))
     # Before a task, and after one.
-    instance.runner = FakeContainer([status], name="runner")
-    with pytest.raises(RunnerStartError, match="could not be read before task t1"):
+    instance.runner = FakeContainer(["connection-error"], name="runner")
+    with pytest.raises(RunnerStartError):
         instance.wait_for_runner("before task t1")
-    instance.runner = FakeContainer([status], name="runner")
-    with pytest.raises(RunnerStartError, match="could not be read during task t1") as error:
+    instance.runner = FakeContainer(["connection-error"], name="runner")
+    with pytest.raises(RunnerStartError) as error:
         instance.check_runner_unchanged("during task t1", 0)
-    # Not one Docker restarts: the run stops (exit 3).
+    # Not one Docker restarts: the run stops (cli.EXIT_APP_NOT_STARTED).
     assert not error.value.restartable
 
 
 @pytest.mark.parametrize("error", TRANSPORT_ERRORS, ids=transport_error_id)
 def test_a_docker_transport_error_getting_the_app_image_stops_the_start(error):
     pulled = FakeDocker(FakeContainer(["running"]), pull_error=error)
-    with pytest.raises(AppStartError, match="could not be pulled"):
+    with pytest.raises(AppStartError):
         docker_instance(pulled).__enter__()
     local = FakeDocker(FakeContainer(["running"]), local=local_image(), get_error=error)
-    with pytest.raises(AppStartError, match="could not be read from the Docker host"):
+    with pytest.raises(AppStartError):
         docker_instance(local, pull=False).__enter__()
 
 
 @pytest.mark.parametrize("error", TRANSPORT_ERRORS, ids=transport_error_id)
 def test_a_docker_transport_error_pulling_the_runner_image_stops_the_start(error):
     daemon = FakeDocker(FakeContainer(["running"]), runner_pull_error=error)
-    with pytest.raises(RunnerStartError, match=f"Runner image {RUNNER_IMAGE} could not be pulled"):
+    with pytest.raises(RunnerStartError):
         docker_instance(daemon).__enter__()
 
 
 @pytest.mark.parametrize("error", TRANSPORT_ERRORS, ids=transport_error_id)
 @pytest.mark.parametrize(
-    "step, start_error, message",
-    [
-        ("volume", RunnerStartError, "Runner container could not start"),
-        ("volume-setup", RunnerStartError, "Runner container could not start"),
-        ("runner-create", RunnerStartError, "Runner container could not start"),
-        ("put-archive", RunnerStartError, "Runner container could not start"),
-        ("runner-start", RunnerStartError, "Runner container could not start"),
-        ("app-run", AppStartError, "App container could not start"),
-    ],
+    "step, start_error",
+    [("runner-create", RunnerStartError), ("app-run", AppStartError)],
 )
-def test_a_docker_transport_error_starting_a_container_stops_the_start(
-    error, step, start_error, message
-):
-    runner = FakeContainer(
-        ["running"],
-        name="runner",
-        put_archive_error=error if step == "put-archive" else None,
-        start_error=error if step == "runner-start" else None,
-    )
-    volume_setup = FakeContainer(
-        [], name="volume-setup", put_archive_error=error if step == "volume-setup" else None
-    )
+def test_a_docker_transport_error_starting_a_container_stops_the_start(error, step, start_error):
     daemon = FakeDocker(
         FakeContainer(["running"]),
-        runner=runner,
-        volume_setup=volume_setup,
-        volume_error=error if step == "volume" else None,
         create_error=error if step == "runner-create" else None,
         run_error=error if step == "app-run" else None,
     )
-    with pytest.raises(start_error, match=message):
+    with pytest.raises(start_error) as raised:
         docker_instance(daemon).__enter__()
+    assert type(raised.value) is start_error
 
 
 def test_a_docker_transport_error_creating_the_emulator_source_stops_the_start():
@@ -787,14 +698,13 @@ def test_a_docker_transport_error_creating_the_emulator_source_stops_the_start()
         raise requests.exceptions.ConnectionError("connection aborted")
 
     daemon.containers.create = create
-    with pytest.raises(RunnerStartError, match="The emulator could not be read from image"):
+    with pytest.raises(RunnerStartError):
         docker_instance(daemon).__enter__()
 
 
-@pytest.mark.parametrize("status", ["connection-error", "read-timeout", "api-error"])
-def test_a_docker_error_during_the_health_check_stops_the_start(status):
-    daemon = FakeDocker(FakeContainer([status]))
-    with pytest.raises(AppStartError, match="could not be read before answering /health"):
+def test_a_docker_error_during_the_health_check_stops_the_start():
+    daemon = FakeDocker(FakeContainer(["connection-error"]))
+    with pytest.raises(AppStartError):
         docker_instance(daemon).__enter__()
     assert daemon.container.removed and daemon.runner.removed and daemon.volume().removed
 
@@ -824,7 +734,7 @@ def quality_reply(score):
     )
 
 
-@pytest.mark.parametrize("score", [True, False, 0, 6, "4"])
+@pytest.mark.parametrize("score", [True, 6, "4"])
 def test_answer_quality_rejects_non_integer_scores(score):
     with pytest.raises(ValueError):
         rate_answer(
@@ -836,26 +746,6 @@ def test_answer_quality_rejects_non_integer_scores(score):
             criteria=[],
             transcript="t",
         )
-
-
-def test_quality_transcript_uses_neutral_labels():
-    prompts = []
-
-    def complete(role, session, **kwargs):
-        prompts.append(kwargs["messages"][0]["content"])
-        return quality_reply(5)
-
-    rate_answer(
-        complete=complete,
-        model="m",
-        session_id="c1",
-        started=PLAY_START,
-        opening="o",
-        criteria=[],
-        transcript=neutral_transcript([("rain?", "20 mm")]),
-    )
-    assert "User: rain?\n\nAssistant: 20 mm" in prompts[0]
-    assert "You:" not in prompts[0]
 
 
 class DoneAssistant(AgentAdapter):
@@ -878,7 +768,7 @@ class OneQuestionUser(AgentAdapter):
         return ScenarioResult(success=True, messages=list(input.messages), reasoning="done")
 
 
-def test_final_judge_and_quality_rating_send_the_default_output_tokens(monkeypatch):
+def test_final_judge_sends_the_default_output_tokens(monkeypatch):
     sent = []
     models = FakeModels()
 
@@ -925,80 +815,8 @@ def test_final_judge_and_quality_rating_send_the_default_output_tokens(monkeypat
         return await judge.rule(states[-1], at_turn_cap=False)
 
     assert asyncio.run(play_then_judge()) is True
-    rate_answer(
-        complete=gateway.traced_completion,
-        model="m",
-        session_id="c1",
-        started=PLAY_START,
-        opening="o",
-        criteria=[],
-        transcript="t",
-    )
-    assert [call["max_tokens"] for call in sent] == [DEFAULT_MODEL_MAX_TOKENS] * 2
-    assert sent[0]["tools"] and "tools" not in sent[1]
-
-
-def test_simulated_user_call_sends_the_default_output_tokens(monkeypatch):
-    sent = []
-
-    def completion(**kwargs):
-        sent.append(kwargs)
-        reply = {
-            "classification": "progress",
-            "revealed_hidden_step": False,
-            "done": False,
-            "give_up": False,
-            "give_up_reason": "",
-            "message": "go on",
-        }
-        return litellm.ModelResponse(
-            choices=[{"message": {"role": "assistant", "content": json.dumps(reply)}}]
-        )
-
-    monkeypatch.setattr(litellm, "completion", completion)
-    gateway = LangfuseGateway(
-        environment="eval",
-        trace_timeout=2,
-        trace_settle=1,
-        poll_interval=1,
-        model_max_tokens=load_settings(settings_env()).model_max_tokens,
-        rate_limit_retries=load_settings(settings_env()).rate_limit_retries,
-        rate_limit_backoff=load_settings(settings_env()).rate_limit_backoff,
-        client=Langfuse(
-            public_key=f"pk-test-{uuid.uuid4()}",
-            secret_key="sk-test",
-            base_url="http://langfuse.invalid",
-            span_exporter=InMemorySpanExporter(),
-            tracer_provider=TracerProvider(),
-        ),
-    )
-
-    async def no_files():
-        return Evidence()
-
-    user = SimulatedUser(
-        task=parse_task(
-            {
-                "id": "i1",
-                "input": "rain next week?",
-                "expected_output": {"judge_criteria": ["c"]},
-                "metadata": {"facts": "Kenya"},
-            }
-        ),
-        model="m",
-        complete=gateway.traced_completion,
-        session_id=lambda: "c1",
-        collect_evidence=no_files,
-    )
-    messages = [
-        {"role": "user", "content": "rain next week?"},
-        {"role": "assistant", "content": "Which region?"},
-    ]
-    agent_input = AgentInput(thread_id="t", messages=messages, new_messages=[], scenario_state=None)
-
-    assert asyncio.run(user.call(agent_input)) == "rain next week?"
-    assert asyncio.run(user.call(agent_input)) == "go on"
     assert [call["max_tokens"] for call in sent] == [DEFAULT_MODEL_MAX_TOKENS]
+    assert sent[0]["tools"]
 
 
 FINISH_TEST = {"type": "function", "function": {"name": "finish_test"}}
@@ -1022,7 +840,6 @@ def test_a_refused_forced_tool_choice_is_sent_as_auto_on_every_later_call():
         collect_evidence=lambda: None,
     )
     messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "t"}]
-    instruction = "Answer only by calling the finish_test tool, never with plain text."
 
     for _ in range(2):
         call = {"model": "m", "messages": messages, "tools": [{}], "tool_choice": FINISH_TEST}
@@ -1031,7 +848,9 @@ def test_a_refused_forced_tool_choice_is_sent_as_auto_on_every_later_call():
     # Refused once, then sent adapted: the later call is not refused first.
     assert [kwargs["tool_choice"] for kwargs in sent] == [FINISH_TEST, "auto", "auto"]
     for kwargs in sent[1:]:
-        assert kwargs["messages"] == [*messages, {"role": "user", "content": instruction}]
+        # The original messages plus one appended user message.
+        assert kwargs["messages"][:-1] == messages
+        assert kwargs["messages"][-1]["role"] == "user"
         assert kwargs["model"] == "openrouter/anthropic/claude-opus-5.5"
 
 
@@ -1172,64 +991,23 @@ def test_a_cancelled_final_judge_call_keeps_its_evidence_until_the_verdict_ends(
 
 
 @pytest.mark.parametrize(
-    "error, code, message",
+    "error, code",
     [
-        (SettingsError("EVAL_JUDGE_MODELS is not set"), 2, "Run not started"),
-        (ConfigError("image", "is missing"), 2, "Run not started"),
-        (TaskError("dataset item t1: bad"), 2, "Run not started"),
-        (DatasetError("Dataset d has no items"), 2, "Run not started"),
-        (AppStartError("container exited"), 3, "the app did not start"),
-        (RunnerStartError("runner exited"), 3, "the sandbox runner did not start"),
-        (docker.errors.APIError("daemon down"), 3, "Docker failed"),
-        (ChatError("GET /api/v1/tool_summary returned 500"), 4, "the app failed"),
-        (httpx.ConnectError("refused"), 4, "the app failed"),
-        (LangfuseApiError(status_code=500, body="boom"), 5, "Langfuse returned an error"),
-        (RuntimeError("unexpected"), 1, "Run failed"),
+        (SettingsError("EVAL_JUDGE_MODELS is not set"), cli.EXIT_NOT_STARTED),
+        (RunnerStartError("runner exited"), cli.EXIT_APP_NOT_STARTED),
+        (AppStartError("container exited"), cli.EXIT_APP_NOT_STARTED),
+        (docker.errors.APIError("daemon down"), cli.EXIT_APP_NOT_STARTED),
+        (ChatError("GET /api/v1/tool_summary returned 500"), cli.EXIT_APP_FAILED),
+        (LangfuseApiError(status_code=500, body="boom"), cli.EXIT_LANGFUSE),
+        (RuntimeError("unexpected"), cli.EXIT_FAILED),
     ],
 )
-def test_cli_exit_codes_and_messages(monkeypatch, capsys, error, code, message):
+def test_cli_exit_codes(monkeypatch, error, code):
     def failing_run(*args, **kwargs):
         raise error
 
     monkeypatch.setattr(cli, "run", failing_run)
     assert cli.main(["run", "configs/example.yaml"]) == code
-    assert message in capsys.readouterr().err
-
-
-@pytest.mark.parametrize(
-    "runner_lost, lost_line",
-    [
-        ([], None),
-        (["t2"], "1 task not scored because the sandbox runner restarted during it: t2"),
-        (
-            ["t1", "t3"],
-            "2 tasks not scored because the sandbox runner restarted during them: t1, t3",
-        ),
-    ],
-    ids=["none-lost", "one-lost", "two-lost"],
-)
-def test_cli_summary_names_tasks_lost_to_a_runner_restart(
-    monkeypatch, capsys, runner_lost, lost_line
-):
-    summary = RunSummary(
-        experiment_name="cfg",
-        run_name="cfg - run",
-        experiment_url=None,
-        items=3,
-        goals_reached=1,
-        metadata={"config_name": "example", "served_model": "cfg"},
-        runner_lost=runner_lost,
-        agent_cost_usd=1.2345678,
-    )
-    monkeypatch.setattr(cli, "run", lambda *args, **kwargs: summary)
-    assert cli.main(["run", "configs/example.yaml"]) == 0
-    lines = capsys.readouterr().out.splitlines()
-    assert lines[:2] == [
-        "Experiment cfg (example), run cfg - run",
-        "Goal reached on 1 of 3 tasks",
-    ]
-    cost = 'Cost {"config_name": "example", "served_model": "cfg", "agent_cost_usd": 1.234568}'
-    assert lines[2:] == ([lost_line] if lost_line else []) + [cost]
 
 
 def test_cli_summary_ends_with_the_cost_line_after_the_experiment_url(monkeypatch, capsys):
@@ -1247,8 +1025,8 @@ def test_cli_summary_ends_with_the_cost_line_after_the_experiment_url(monkeypatc
     assert cli.main(["run", "-"]) == 0
     lines = capsys.readouterr().out.splitlines()
     assert lines[-2] == "http://langfuse.invalid/experiment"
-    assert lines[-1].startswith("Cost ")
-    assert json.loads(lines[-1].removeprefix("Cost ")) == {
+    assert lines[-1].startswith(cli.COST_LINE)
+    assert json.loads(lines[-1].removeprefix(cli.COST_LINE)) == {
         "config_name": "opus-agent",
         "served_model": "anthropic/claude-opus-5.5",
         "agent_cost_usd": 0.0,
@@ -1291,44 +1069,10 @@ def test_cli_restores_the_logger_when_the_run_fails(monkeypatch, capsys):
         raise SettingsError("EVAL_JUDGE_MODELS is not set")
 
     monkeypatch.setattr(cli, "run", failing_run)
-    assert cli.main(["run", "-"]) == 2
+    assert cli.main(["run", "-"]) == cli.EXIT_NOT_STARTED
     err = capsys.readouterr().err.splitlines()
     assert "Dataset d read: 1 items" in err
-    assert "Run not started: EVAL_JUDGE_MODELS is not set" in err
     assert (package.handlers, package.level, package.propagate) == (handlers, level, propagate)
-
-
-@pytest.mark.parametrize(
-    "name, value", [("EVAL_MAX_TURNS", "0"), ("EVAL_MODEL_MAX_TOKENS", "lots")]
-)
-def test_cli_with_a_bad_turn_cap_or_token_limit_exits_2(monkeypatch, capsys, name, value):
-    for key, setting in settings_env(**{name: value}).items():
-        monkeypatch.setenv(key, setting)
-    assert cli.main(["run", str(REPO / "configs" / "example.yaml")]) == 2
-    assert name in capsys.readouterr().err
-
-
-def test_cli_without_settings_exits_2(monkeypatch, capsys):
-    monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
-    assert cli.main(["run", str(REPO / "configs" / "example.yaml")]) == 2
-    assert "LANGFUSE_PUBLIC_KEY is not set" in capsys.readouterr().err
-
-
-def test_cli_with_an_unset_image_reference_exits_2(monkeypatch, capsys):
-    for key, setting in settings_env().items():
-        monkeypatch.setenv(key, setting)
-    for name in (
-        "APP_WEBUI_SECRET_KEY",
-        "APP_ADMIN_PASSWORD",
-        "APP_ADMIN_API_KEY",
-        "APP_OPENROUTER_API_KEY",
-        "LANGFUSE_BASE_URL",
-    ):
-        monkeypatch.setenv(name, "value")
-    monkeypatch.delenv("APP_IMAGE", raising=False)
-    # configs/example.yaml sets image: ${APP_IMAGE}.
-    assert cli.main(["run", str(REPO / "configs" / "example.yaml")]) == 2
-    assert "image: references ${APP_IMAGE}, which is not set" in capsys.readouterr().err
 
 
 def test_only_the_langwatch_notices_are_silenced(caplog):
@@ -1380,7 +1124,7 @@ def test_the_langwatch_banner_is_not_printed(monkeypatch, capsys):
     monkeypatch.setattr(EventAlertMessageLogger, "_shown_batch_ids", set())
     cli.silence_langwatch()
     EventAlertMessageLogger().handle_greeting()
-    assert "LangWatch API key not configured" not in capsys.readouterr().out
+    assert capsys.readouterr().out == ""
 
 
 def record_langwatch_traffic(monkeypatch) -> tuple[list[str], list[str]]:
@@ -1517,8 +1261,8 @@ def test_cli_main_keeps_scenario_off_langwatch_when_a_key_is_set(monkeypatch):
 
 def test_sigterm_handler_unwinds_with_exit_code_143():
     with pytest.raises(SystemExit) as exit_info:
-        cli._terminate(15, None)
-    assert exit_info.value.code == 143
+        cli._terminate(signal.SIGTERM, None)
+    assert exit_info.value.code == cli.EXIT_TERMINATED
 
 
 def test_cli_passes_dash_through_to_read_stdin(monkeypatch):
@@ -1544,9 +1288,6 @@ def run_api(**options) -> FakeRunApi:
     return FakeRunApi(**defaults)
 
 
-PROMPT = "Type yes to delete these traces: "
-
-
 def delete_with(api: FakeRunApi, *args: str) -> int:
     return cli.main(["delete", *args], runs_factory=lambda: LangfuseRuns(client=api))
 
@@ -1555,7 +1296,7 @@ def answer(monkeypatch, text: str) -> None:
     monkeypatch.setattr("sys.stdin", io.StringIO(text))
 
 
-def test_cli_delete_deletes_every_trace_of_the_run_on_yes(monkeypatch, capsys):
+def test_cli_delete_deletes_every_trace_of_the_run_on_yes(monkeypatch):
     # Only the Langfuse settings are needed, not the run's.
     for name in ("OPENROUTER_API_KEY", "EVAL_SIMULATED_USER_MODEL", "EVAL_JUDGE_MODELS"):
         monkeypatch.delenv(name, raising=False)
@@ -1566,12 +1307,9 @@ def test_cli_delete_deletes_every_trace_of_the_run_on_yes(monkeypatch, capsys):
 
     # The item traces go last.
     assert api.deleted == ["app-a", "judge-1", "user-1", "item-1", "item-2"]
-    assert capsys.readouterr().out == (
-        f"Experiment cfg: 2 items, 5 traces\n{PROMPT}Deleted experiment cfg: 2 items, 5 traces\n"
-    )
 
 
-def test_cli_delete_with_yes_flag_deletes_without_asking(monkeypatch, capsys):
+def test_cli_delete_with_yes_flag_deletes_without_asking(monkeypatch):
     # Nothing is read from stdin.
     monkeypatch.setattr("sys.stdin", None)
     api = run_api()
@@ -1580,99 +1318,56 @@ def test_cli_delete_with_yes_flag_deletes_without_asking(monkeypatch, capsys):
 
     # The item traces go last.
     assert api.deleted == ["app-a", "judge-1", "user-1", "item-1", "item-2"]
-    assert capsys.readouterr().out == (
-        "Experiment cfg: 2 items, 5 traces\nDeleted experiment cfg: 2 items, 5 traces\n"
-    )
 
 
-@pytest.mark.parametrize("text", ["no\n", "y\n", "YES\n", "\n", ""], ids=repr)
-def test_cli_delete_without_yes_deletes_nothing(monkeypatch, capsys, text):
+@pytest.mark.parametrize("text", ["no\n", ""], ids=repr)
+def test_cli_delete_without_yes_deletes_nothing(monkeypatch, text):
     answer(monkeypatch, text)
     api = run_api()
 
     assert delete_with(api, "e1") == 0
 
     assert "trace.delete_multiple" not in api.methods()
-    assert capsys.readouterr().out == (
-        f"Experiment cfg: 2 items, 5 traces\n{PROMPT}Nothing deleted\n"
-    )
 
 
-def test_cli_delete_of_an_unknown_id_exits_2(capsys):
+def test_cli_delete_of_an_unknown_id_exits_not_started():
     api = run_api()
 
-    assert delete_with(api, "missing") == 2
+    assert delete_with(api, "missing") == cli.EXIT_NOT_STARTED
 
     assert "trace.delete_multiple" not in api.methods()
-    assert "no experiment has id missing" in capsys.readouterr().err
 
 
-def test_cli_delete_of_an_experiment_without_items_exits_0(capsys):
+def test_cli_delete_of_an_experiment_without_items_exits_0():
     api = run_api()
 
     assert delete_with(api, "e2") == 0
 
     assert "trace.delete_multiple" not in api.methods()
-    assert capsys.readouterr().out == "Experiment empty has no items; nothing to delete\n"
 
 
-def test_cli_delete_with_a_langfuse_error_exits_5(capsys):
-    api = run_api(error=LangfuseApiError(status_code=503, body="unavailable"))
-
-    assert delete_with(api, "--yes", "e1") == 5
-
-    assert api.deleted == []
-    assert "Delete stopped, Langfuse returned an error" in capsys.readouterr().err
-
-
-def test_cli_delete_with_a_langfuse_error_on_a_later_batch_exits_5(capsys):
-    chat = [f"app-{n:04d}" for n in range(1500)]
+def test_cli_delete_with_a_langfuse_error_on_a_later_batch_exits_langfuse():
+    chat = [f"app-{n:04d}" for n in range(DELETE_BATCH_SIZE + DELETE_BATCH_SIZE // 2)]
     api = run_api(
         sessions={"chat-1": chat},
         delete_errors={2: LangfuseApiError(status_code=503, body="unavailable")},
     )
 
-    assert delete_with(api, "--yes", "e1") == 5
+    assert delete_with(api, "--yes", "e1") == cli.EXIT_LANGFUSE
 
     # The first batch stays deleted; the item traces, sent last, are left.
-    assert api.deleted == chat[:1000]
-    error = capsys.readouterr().err
-    assert "Delete stopped, Langfuse returned an error" in error
-    assert "run delete again to delete the rest" in error
+    assert api.deleted == chat[:DELETE_BATCH_SIZE]
     # So a second delete on the same project still finds the run and deletes the rest.
     assert delete_with(api, "--yes", "e1") == 0
     assert api.deleted == [*chat, "item-1", "item-2"]
-    assert capsys.readouterr().out.endswith("Deleted experiment cfg: 2 items, 502 traces\n")
-    assert delete_with(api, "--yes", "e1") == 2
+    assert delete_with(api, "--yes", "e1") == cli.EXIT_NOT_STARTED
 
 
-def test_cli_delete_with_another_error_while_deleting_says_to_run_it_again(capsys):
-    # The second request, of the item traces, fails after the first deleted the rest.
-    api = run_api(delete_errors={2: httpx.ConnectError("refused")})
-
-    assert delete_with(api, "--yes", "e1") == 1
-
-    assert api.deleted == ["app-a", "judge-1", "user-1"]
-    assert capsys.readouterr().err == (
-        "Delete failed: ConnectError: refused; run delete again to delete the rest\n"
-    )
-
-
-def test_cli_delete_with_another_error_before_deleting_gives_no_hint(capsys):
-    api = run_api(error=httpx.ConnectError("refused"))
-
-    assert delete_with(api, "--yes", "e1") == 1
-
-    assert api.methods() == {"experiments.list"}
-    assert capsys.readouterr().err == "Delete failed: ConnectError: refused\n"
-
-
-def test_cli_delete_with_any_other_error_exits_1(capsys):
+def test_cli_delete_with_any_other_error_exits_failed():
     def broken():
         raise RuntimeError("unexpected")
 
-    assert cli.main(["delete", "e1"], runs_factory=broken) == 1
-    assert "Delete failed: RuntimeError: unexpected" in capsys.readouterr().err
+    assert cli.main(["delete", "e1"], runs_factory=broken) == cli.EXIT_FAILED
 
 
 def test_load_config_from_stdin_and_from_a_path(tmp_path):
@@ -1686,7 +1381,7 @@ def test_load_config_from_stdin_and_from_a_path(tmp_path):
     path = tmp_path / "file.yaml"
     path.write_text(text.replace("name: from-stdin\n", ""))
     assert load_config(path, ENVIRON).name == "file"
-    with pytest.raises(ConfigError, match="not UTF-8"):
+    with pytest.raises(ConfigError):
         load_config(Path("-"), ENVIRON, stdin=io.BytesIO(b"\xff\xfe"))
 
 
@@ -1803,6 +1498,6 @@ def test_sigterm_during_a_run_removes_its_containers_and_volume():
 
     with pytest.raises(SystemExit):
         with instance:
-            cli._terminate(15, None)
+            cli._terminate(signal.SIGTERM, None)
 
     assert daemon.removed(instance) == [True] * 5

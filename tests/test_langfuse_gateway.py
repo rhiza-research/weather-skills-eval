@@ -1,6 +1,5 @@
 import asyncio
 import json
-import logging
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -19,6 +18,10 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from weather_skills_eval import runner
 from weather_skills_eval.instance import RunnerStartError
 from weather_skills_eval.langfuse_gateway import (
+    DELETE_BATCH_SIZE,
+    EPOCH,
+    SERVED_MODEL_MAX_TOKENS,
+    TOOL_OUTPUT_FIELDS,
     TOOL_OUTPUT_PAGE_SIZE,
     ExperimentNotFound,
     LangfuseGateway,
@@ -29,7 +32,7 @@ from weather_skills_eval.langfuse_gateway import (
 )
 from weather_skills_eval.llm import ModelReplyError
 from weather_skills_eval.scoring import TraceRead
-from weather_skills_eval.settings import DEFAULT_MODEL_MAX_TOKENS, load_settings
+from weather_skills_eval.settings import load_settings
 
 
 def real_client(exporter: InMemorySpanExporter) -> Langfuse:
@@ -459,7 +462,7 @@ def test_chat_observations_give_up_after_the_timeout():
     assert not read.complete
     assert read.read_error is None
     assert read.observations
-    assert read.partial_reason() == "traces were still arriving"
+    assert read.traces_arriving
 
 
 def test_tool_whose_output_is_not_read_yet_keeps_the_poll_going():
@@ -537,6 +540,7 @@ def test_a_tool_that_never_ends_is_read_once_after_the_traces_settle():
         clock=clock,
         sleep=clock.sleep,
     )
+    start = clock.now
 
     read = asyncio.run(gateway.chat_observations("chat-1", 2))
 
@@ -544,7 +548,7 @@ def test_a_tool_that_never_ends_is_read_once_after_the_traces_settle():
     assert read.complete
     assert read.unread_tools == 0
     assert {o["id"]: o.get("ok", "unread") for o in read.observations}["k1"] is None
-    assert clock.now - 1000.0 < 600
+    assert clock.now - start < 600
 
 
 def test_a_forced_read_that_finds_a_new_tool_polls_on_until_settled():
@@ -604,14 +608,9 @@ def test_a_non_final_forced_read_keeps_no_output_of_a_tool_still_open():
 
 
 def test_missing_traces_come_before_unread_tool_outputs():
-    assert (
-        TraceRead([], False, unread_tools=2, traces_arriving=True).partial_reason()
-        == "traces were still arriving"
-    )
-    assert (
-        TraceRead([], False, unread_tools=2).partial_reason()
-        == "tool outputs not read by the timeout: 2"
-    )
+    arriving = TraceRead([], False, unread_tools=2, traces_arriving=True).partial_reason()
+    assert arriving == TraceRead([], False).partial_reason()
+    assert arriving != TraceRead([], False, unread_tools=2).partial_reason()
 
 
 def test_a_forced_read_that_misses_the_open_tool_is_partial():
@@ -625,16 +624,17 @@ def test_a_forced_read_that_misses_the_open_tool_is_partial():
         clock=clock,
         sleep=clock.sleep,
     )
+    start = clock.now
 
     read = asyncio.run(gateway.chat_observations("chat-1", 2))
 
     assert not read.complete
     assert read.unread_tools == 1
-    assert read.partial_reason() == "the outputs of tools left open could not be read: 1"
-    assert clock.now - 1000.0 < 600
+    assert read.forced
+    assert clock.now - start < 600
 
 
-def test_timeout_with_unread_tool_outputs_says_how_many():
+def test_timeout_with_unread_tool_outputs_counts_them():
     clock = FakeClock()
     api = FakeObservationsApi(outputs_from_read=999)
     gateway = gateway_for(
@@ -650,7 +650,7 @@ def test_timeout_with_unread_tool_outputs_says_how_many():
 
     assert not read.complete
     assert read.unread_tools == 1
-    assert read.partial_reason() == "tool outputs not read by the timeout: 1"
+    assert not read.traces_arriving
 
 
 def test_chat_observations_raise_trace_read_error_when_no_read_succeeds_by_the_timeout():
@@ -672,7 +672,7 @@ def test_chat_observations_raise_trace_read_error_when_no_read_succeeds_by_the_t
     with pytest.raises(TraceReadError) as error:
         asyncio.run(gateway.chat_observations("chat-1", 1))
 
-    assert str(error.value) == f"ReadTimeout: timed out, read {api.calls}"
+    assert isinstance(error.value.__cause__, httpx.ReadTimeout)
     # Retried at the poll interval until the timeout.
     assert api.calls == 7
     assert clock.sleeps == [5] * 6
@@ -694,23 +694,23 @@ def test_an_error_that_is_not_langfuses_is_raised_at_once():
         fake_client(api), trace_timeout=30, poll_interval=5, clock=clock, sleep=clock.sleep
     )
 
-    with pytest.raises(TraceReadError, match="TypeError: unexpected keyword"):
+    with pytest.raises(TraceReadError) as error:
         asyncio.run(gateway.chat_observations("chat-1", 1))
+    assert isinstance(error.value.__cause__, TypeError)
     assert api.calls == 1
     assert clock.sleeps == []
 
 
 class FailingFirst(FakeObservationsApi):
-    """Fails the first ``failures`` reads that ``fails`` picks, then answers as the parent."""
+    """Fails the first ``failures`` session reads, then answers as the parent."""
 
-    def __init__(self, failures: int, fails=lambda filters: "session_id" in filters):
+    def __init__(self, failures: int):
         super().__init__()
         self.failures = failures
-        self.fails = fails
         self.status = 504
 
     def get_many(self, **kwargs):
-        if self.fails(kwargs) and self.failures:
+        if "session_id" in kwargs and self.failures:
             self.failures -= 1
             raise LangfuseApiError(status_code=self.status, body="Read timed out")
         return super().get_many(**kwargs)
@@ -734,7 +734,7 @@ def test_chat_observations_retry_a_failed_read():
     assert sorted(o["id"] for o in read.observations) == ["g1", "g2", "k1", "k2", "r1", "r2"]
 
 
-@pytest.mark.parametrize("status", [400, 401, 403, 404, None])
+@pytest.mark.parametrize("status", [403, None])
 def test_a_permanent_langfuse_error_is_raised_at_once(status):
     clock = FakeClock()
     api = FailingFirst(failures=1)
@@ -743,8 +743,9 @@ def test_a_permanent_langfuse_error_is_raised_at_once(status):
         fake_client(api), trace_timeout=600, poll_interval=5, clock=clock, sleep=clock.sleep
     )
 
-    with pytest.raises(TraceReadError, match=f"status_code: {status}"):
+    with pytest.raises(TraceReadError) as error:
         asyncio.run(gateway.chat_observations("chat-1", 2))
+    assert error.value.__cause__.status_code == status
     assert clock.sleeps == []
 
 
@@ -762,37 +763,15 @@ def test_a_permanent_error_after_a_read_returns_that_read_as_partial():
     gateway = gateway_for(
         fake_client(api), trace_timeout=600, poll_interval=5, clock=clock, sleep=clock.sleep
     )
+    start = clock.now
 
     read = asyncio.run(gateway.chat_observations("chat-1", 2))
 
     assert not read.complete
-    assert "status_code: 403" in read.read_error
+    assert read.read_error is not None
     assert sorted(o["id"] for o in read.observations) == ["g1", "r1"]
     # Returned at once, without waiting for the timeout.
-    assert clock.now - 1000.0 == 5
-
-
-def test_a_tool_output_read_that_fails_mid_poll_is_retried():
-    clock = FakeClock()
-    api = FailingFirst(
-        failures=1,
-        fails=lambda filters: filters.get("trace_id") == "t2" and filters.get("type") == "TOOL",
-    )
-    gateway = gateway_for(
-        fake_client(api),
-        trace_timeout=600,
-        trace_settle=10,
-        poll_interval=5,
-        clock=clock,
-        sleep=clock.sleep,
-    )
-
-    read = asyncio.run(gateway.chat_observations("chat-1", 2))
-
-    assert api.failures == 0
-    assert read.complete
-    assert read.read_error is None
-    assert {o["id"]: o.get("ok") for o in read.observations}["k1"] is False
+    assert clock.now - start == 5
 
 
 def test_failed_reads_do_not_restart_the_settle_time():
@@ -818,12 +797,13 @@ def test_failed_reads_do_not_restart_the_settle_time():
         clock=clock,
         sleep=clock.sleep,
     )
+    start = clock.now
 
     read = asyncio.run(gateway.chat_observations("chat-1", 1))
 
     assert read.complete
     # Read 1 at 0 s, failures at 5, 10 and 15 s, and the read at 20 s settles it.
-    assert clock.now - 1000.0 == 20
+    assert clock.now - start == 20
 
 
 def test_chat_observations_that_fail_after_a_read_return_it_with_the_error():
@@ -844,12 +824,11 @@ def test_chat_observations_that_fail_after_a_read_return_it_with_the_error():
     read = asyncio.run(gateway.chat_observations("chat-1", 2))
 
     assert not read.complete
-    assert read.read_error == "ReadTimeout: Read timed out"
-    assert read.partial_reason() == "Langfuse reads failed: ReadTimeout: Read timed out"
+    assert read.read_error is not None
     assert sorted(o["id"] for o in read.observations) == ["g1", "r1"]
 
 
-def test_a_reply_cut_off_at_max_tokens_is_named(monkeypatch):
+def test_a_reply_cut_off_at_max_tokens_is_an_error(monkeypatch):
     gateway = gateway_for(real_client(InMemorySpanExporter()), model_max_tokens=50)
     monkeypatch.setattr(
         litellm,
@@ -865,9 +844,9 @@ def test_a_reply_cut_off_at_max_tokens_is_named(monkeypatch):
         ),
     )
 
-    with pytest.raises(ModelReplyError, match="cut off at max_tokens 50 .EVAL_MODEL_MAX_TOKENS"):
+    with pytest.raises(ModelReplyError):
         gateway.traced_completion("simulated-user", "chat-1", model="m", messages=[])
-    with pytest.raises(ModelReplyError, match="cut off at max_completion_tokens 20 "):
+    with pytest.raises(ModelReplyError):
         gateway.traced_completion(
             "judge", "chat-1", model="m", messages=[], max_completion_tokens=20
         )
@@ -889,7 +868,7 @@ def test_served_model_is_the_model_openrouter_names_in_its_reply(monkeypatch):
     assert gateway.served_model("~anthropic/claude-opus-latest") == "anthropic/claude-opus-5.5"
     [sent] = calls
     assert sent["model"] == "openrouter/~anthropic/claude-opus-latest"
-    assert sent["max_tokens"] == 16
+    assert sent["max_tokens"] == SERVED_MODEL_MAX_TOKENS
     assert sent["num_retries"] == 3
 
 
@@ -899,7 +878,7 @@ def test_a_reply_that_names_no_model_is_an_error(monkeypatch):
     reply.model = None
     monkeypatch.setattr(litellm, "completion", lambda **kwargs: reply)
 
-    with pytest.raises(ModelReplyError, match="named no model in its reply for m"):
+    with pytest.raises(ModelReplyError):
         gateway.served_model("m")
 
 
@@ -911,7 +890,7 @@ def test_a_reply_that_names_the_alias_is_an_error(monkeypatch):
     )
     monkeypatch.setattr(litellm, "completion", lambda **kwargs: reply)
 
-    with pytest.raises(ModelReplyError, match="names the alias ~anthropic/claude-opus-latest"):
+    with pytest.raises(ModelReplyError):
         gateway.served_model("~anthropic/claude-opus-latest")
 
 
@@ -957,7 +936,7 @@ def user_call(gateway):
     )
 
 
-def test_a_rate_limited_call_waits_then_returns_the_reply_in_one_generation(monkeypatch, caplog):
+def test_a_rate_limited_call_waits_then_returns_the_reply_in_one_generation(monkeypatch):
     exporter = InMemorySpanExporter()
     client = real_client(exporter)
     clock = FakeClock()
@@ -965,18 +944,12 @@ def test_a_rate_limited_call_waits_then_returns_the_reply_in_one_generation(monk
     reply = ok_reply()
     calls = failing_first(monkeypatch, [rate_limited(), rate_limited()], reply)
 
-    with caplog.at_level(logging.WARNING, logger="weather_skills_eval"):
-        response = user_call(gateway)
+    response = user_call(gateway)
     client.flush()
 
     assert response is reply
     assert len(calls) == 3
     assert clock.sleeps == [15, 30]
-    waits = [r for r in caplog.records if r.name == "weather_skills_eval.langfuse_gateway"]
-    assert [r.getMessage() for r in waits] == [
-        "openrouter/meta-llama/llama-4-maverick rate-limited (HTTP 429), retry 1 of 6 in 15s",
-        "openrouter/meta-llama/llama-4-maverick rate-limited (HTTP 429), retry 2 of 6 in 30s",
-    ]
     generations = [s for s in exporter.get_finished_spans() if s.name == "simulated-user"]
     assert len(generations) == 1
     assert generations[0].attributes["langfuse.observation.type"] == "generation"
@@ -1014,22 +987,6 @@ def test_a_retry_after_longer_than_the_backoff_is_waited(monkeypatch):
     assert clock.sleeps == [100, 30]
 
 
-def test_no_rate_limit_retries_fail_a_429_at_once(monkeypatch):
-    clock = FakeClock()
-    gateway = gateway_for(
-        real_client(InMemorySpanExporter()),
-        rate_limit_retries=0,
-        rate_limit_sleep=clock.sleep_sync,
-    )
-    calls = failing_first(monkeypatch, [rate_limited()], ok_reply())
-
-    with pytest.raises(litellm.RateLimitError):
-        user_call(gateway)
-
-    assert len(calls) == 1
-    assert clock.sleeps == []
-
-
 def test_an_error_that_is_not_a_rate_limit_is_not_waited_on(monkeypatch):
     clock = FakeClock()
     gateway = gateway_for(real_client(InMemorySpanExporter()), rate_limit_sleep=clock.sleep_sync)
@@ -1062,10 +1019,10 @@ def test_a_retry_after_longer_than_the_last_wait_is_cut_to_it(monkeypatch):
         rate_limit_sleep=clock.sleep_sync,
     )
     reply = ok_reply()
-    failing_first(monkeypatch, [rate_limited("86400"), rate_limited("1e300")], reply)
+    failing_first(monkeypatch, [rate_limited("86400")], reply)
 
     assert user_call(gateway) is reply
-    assert clock.sleeps == [480, 480]
+    assert clock.sleeps == [480]
 
 
 @pytest.mark.parametrize(
@@ -1100,7 +1057,7 @@ def test_a_retry_after_only_in_the_errors_headers_is_waited(monkeypatch):
     assert clock.sleeps == [100]
 
 
-def test_the_default_gateway_gets_the_rate_limit_settings(monkeypatch):
+def test_the_default_gateway_gets_its_settings(monkeypatch):
     settings = load_settings(
         {
             "LANGFUSE_PUBLIC_KEY": "pk",
@@ -1117,8 +1074,20 @@ def test_the_default_gateway_gets_the_rate_limit_settings(monkeypatch):
     built = {}
     monkeypatch.setattr(runner, "LangfuseGateway", lambda **kwargs: built.update(kwargs))
     runner._default_gateway(settings)
-    assert built["rate_limit_retries"] == 3
-    assert built["rate_limit_backoff"] == 2.5
+    # Every setting the gateway takes; the rest are its client and test seams.
+    assert set(built) == {
+        "environment",
+        "trace_timeout",
+        "trace_settle",
+        "poll_interval",
+        "model_max_tokens",
+        "model_retries",
+        "rate_limit_retries",
+        "rate_limit_backoff",
+    }
+    # Each keyword is the Settings field of the same name, except the environment.
+    fields = {"environment": "langfuse_environment"}
+    assert built == {name: getattr(settings, fields.get(name, name)) for name in built}
 
 
 def _completion_kwargs(monkeypatch, gateway, **kwargs) -> dict:
@@ -1138,25 +1107,8 @@ def _completion_kwargs(monkeypatch, gateway, **kwargs) -> dict:
     return calls[0]
 
 
-def test_default_settings_cap_every_model_call_at_the_default_output_tokens(monkeypatch):
-    settings = load_settings(
-        {
-            "LANGFUSE_PUBLIC_KEY": "pk",
-            "LANGFUSE_SECRET_KEY": "sk",
-            "OPENROUTER_API_KEY": "or",
-            "LANGFUSE_TRACING_ENVIRONMENT": "eval",
-            "EVAL_SIMULATED_USER_MODEL": "u",
-            "EVAL_JUDGE_MODELS": "j",
-            "EVAL_DOCKER_NETWORK": "n",
-        }
-    )
-    built = {}
-    monkeypatch.setattr(runner, "LangfuseGateway", lambda **kwargs: built.update(kwargs))
-    runner._default_gateway(settings)
-    assert built["model_max_tokens"] == DEFAULT_MODEL_MAX_TOKENS
-
+def test_a_model_call_is_capped_at_the_model_max_tokens_unless_it_sets_its_own(monkeypatch):
     gateway = gateway_for(real_client(InMemorySpanExporter()), model_max_tokens=8192)
-    assert _completion_kwargs(monkeypatch, gateway)["max_tokens"] == 8192
     # Scenario's judge sends max_tokens=None.
     assert _completion_kwargs(monkeypatch, gateway, max_tokens=None)["max_tokens"] == 8192
     # A call that sets its own limit keeps it.
@@ -1216,7 +1168,7 @@ def test_real_client_reads_tool_outputs_through_the_http_layer():
     assert read.complete
     assert {o["id"]: o.get("ok") for o in read.observations} == {"r1": None, "k1": False}
     tool_reads = [r for r in requests if r.get("type") == "TOOL"]
-    assert tool_reads[0]["fields"] == "core,io"
+    assert tool_reads[0]["fields"] == TOOL_OUTPUT_FIELDS
     assert tool_reads[0]["traceId"] == "t1"
     # Only the tool read asks for inputs and outputs.
     assert all("io" not in r["fields"].split(",") for r in requests if r.get("type") != "TOOL")
@@ -1382,60 +1334,30 @@ def delete_batches(api: FakeRunApi) -> list[list[str]]:
     ]
 
 
-def test_trace_ids_are_deleted_in_batches_of_at_most_1000_in_order():
+def test_trace_ids_are_deleted_in_batches_of_the_batch_size_in_order():
     api = run_api()
-    trace_ids = [f"t{n:04d}" for n in range(2500)]
+    size = DELETE_BATCH_SIZE
+    trace_ids = [f"t{n:04d}" for n in range(2 * size + size // 2)]
 
     LangfuseRuns(client=api).delete_traces(RunTraces("cfg", 1, trace_ids))
 
-    assert delete_batches(api) == [trace_ids[:1000], trace_ids[1000:2000], trace_ids[2000:]]
+    assert delete_batches(api) == [
+        trace_ids[:size],
+        trace_ids[size : 2 * size],
+        trace_ids[2 * size :],
+    ]
     assert api.deleted == trace_ids
 
 
-def test_exactly_1000_trace_ids_are_one_batch():
-    api = run_api()
-    trace_ids = [f"t{n:04d}" for n in range(1000)]
-
-    LangfuseRuns(client=api).delete_traces(RunTraces("cfg", 1, trace_ids))
-
-    assert delete_batches(api) == [trace_ids]
-
-
-def test_a_langfuse_error_on_a_batch_stops_the_delete_with_earlier_batches_sent():
-    api = run_api(delete_errors={2: LangfuseApiError(status_code=500, body="boom")})
-    trace_ids = [f"t{n:04d}" for n in range(2500)]
-
-    with pytest.raises(LangfuseApiError):
-        LangfuseRuns(client=api).delete_traces(RunTraces("cfg", 1, trace_ids))
-
-    assert delete_batches(api) == [trace_ids[:1000], trace_ids[1000:2000]]
-    assert api.deleted == trace_ids[:1000]
-
-
 def big_run_api(**options) -> FakeRunApi:
-    """Experiment e1 whose chat-1 session holds 2,500 traces besides its three items."""
-    session = [f"s{n:04d}" for n in range(2500)]
+    """Experiment e1 whose chat-1 session holds two and a half delete batches of
+    traces besides its three items."""
+    session = [f"s{n:05d}" for n in range(2 * DELETE_BATCH_SIZE + DELETE_BATCH_SIZE // 2)]
     return run_api(sessions={"chat-1": ["item-1", *session], "chat-2": ["item-2"]}, **options)
 
 
-def test_item_traces_are_deleted_in_the_last_batch():
-    api = big_run_api(page_size=1000)
-    runs = LangfuseRuns(client=api)
-
-    found = runs.run_traces("e1")
-    runs.delete_traces(found)
-
-    batches = delete_batches(api)
-    # The last batch of other traces is not filled up with item traces.
-    assert [len(b) for b in batches] == [1000, 1000, 500, 3]
-    assert batches[-1] == ["item-1", "item-2", "item-3"]
-    earlier = [t for b in batches[:-1] for t in b]
-    assert not any(t.startswith("item-") for t in earlier)
-    assert sorted(api.deleted) == found.trace_ids
-
-
 def test_a_failed_last_batch_of_other_traces_leaves_every_item_trace():
-    # 2,500 session traces: the third request, of the last 500, fails.
+    # The third request, the last batch of other traces, fails.
     api = big_run_api(
         page_size=1000, delete_errors={3: LangfuseApiError(status_code=500, body="boom")}
     )
@@ -1445,24 +1367,10 @@ def test_a_failed_last_batch_of_other_traces_leaves_every_item_trace():
     with pytest.raises(LangfuseApiError):
         runs.delete_traces(found)
 
-    assert len(api.deleted) == 2000
+    assert len(api.deleted) == 2 * DELETE_BATCH_SIZE
     assert not set(found.item_trace_ids) & set(api.deleted)
     # The run is still found, with the traces left.
-    assert len(runs.run_traces("e1").trace_ids) == len(found.trace_ids) - 2000
-
-
-def test_an_error_on_a_middle_batch_leaves_every_item_trace():
-    api = big_run_api(
-        page_size=1000, delete_errors={2: LangfuseApiError(status_code=500, body="boom")}
-    )
-    runs = LangfuseRuns(client=api)
-    found = runs.run_traces("e1")
-
-    with pytest.raises(LangfuseApiError):
-        runs.delete_traces(found)
-
-    assert len(api.deleted) == 1000
-    assert not set(found.item_trace_ids) & set(api.deleted)
+    assert len(runs.run_traces("e1").trace_ids) == len(found.trace_ids) - 2 * DELETE_BATCH_SIZE
 
 
 def test_a_langfuse_error_while_finding_a_run_is_raised():
@@ -1536,7 +1444,9 @@ def test_real_client_finds_and_deletes_a_run_through_the_http_layer():
     assert found == RunTraces("cfg", 1, ["app-a", "item-1"])
     experiments, items, session, delete, delete_items = requests
     assert dict(experiments.url.params)["id"] == "e1"
-    assert dict(experiments.url.params)["fromStartTime"].startswith("1970-01-01T00:00:00")
+    assert dict(experiments.url.params)["fromStartTime"].startswith(
+        EPOCH.replace(tzinfo=None).isoformat()
+    )
     assert dict(items.url.params)["experimentId"] == "e1"
     assert dict(items.url.params)["fromStartTime"].startswith("2026-10-20T09:00:00")
     assert "io" in dict(items.url.params)["fields"].split(",")

@@ -6,6 +6,9 @@ from dataclasses import dataclass
 
 # 8192 cut off judge verdicts on long transcripts; some models allow no more than 16,384.
 DEFAULT_MODEL_MAX_TOKENS = 16384
+DEFAULT_MAX_TURNS = 20
+DEFAULT_POLL_INTERVAL_SECONDS = 2
+DEFAULT_APP_START_TIMEOUT_SECONDS = 600
 
 
 class SettingsError(Exception):
@@ -101,9 +104,11 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         judge_models=_models(environ, "EVAL_JUDGE_MODELS"),
         langfuse_environment=environment,
         docker_network=_required(environ, "EVAL_DOCKER_NETWORK"),
-        app_start_timeout=_number(environ, "EVAL_APP_START_TIMEOUT_SECONDS", 600),
+        app_start_timeout=_number(
+            environ, "EVAL_APP_START_TIMEOUT_SECONDS", DEFAULT_APP_START_TIMEOUT_SECONDS
+        ),
         turn_timeout=_number(environ, "EVAL_TURN_TIMEOUT_SECONDS", 1800),
-        poll_interval=_number(environ, "EVAL_POLL_INTERVAL_SECONDS", 2),
+        poll_interval=_number(environ, "EVAL_POLL_INTERVAL_SECONDS", DEFAULT_POLL_INTERVAL_SECONDS),
         trace_timeout=trace_timeout,
         trace_settle=trace_settle,
         concurrency=_whole(environ, "EVAL_CONCURRENCY", 1, minimum=1),
@@ -113,7 +118,7 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         model_max_tokens=_whole(
             environ, "EVAL_MODEL_MAX_TOKENS", DEFAULT_MODEL_MAX_TOKENS, minimum=1
         ),
-        max_turns=_whole(environ, "EVAL_MAX_TURNS", 20, minimum=1),
+        max_turns=_whole(environ, "EVAL_MAX_TURNS", DEFAULT_MAX_TURNS, minimum=1),
         # Set at image build time from the harness checkout; see compose.yaml.
         harness_commit=environ.get("EVAL_HARNESS_COMMIT", "").strip(),
         # Groups the runs one scripts/run-eval.py invocation starts.

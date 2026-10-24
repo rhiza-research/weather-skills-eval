@@ -76,6 +76,8 @@ EMULATOR_FILES = ("emulator.py", "local_runtime.py")
 EMULATOR_DIR = "/opt/sandbox/emulator"
 EMULATOR_API_PORT = "18080"
 EMULATOR_BIND_PORT = "9090"
+START_DELAY = "0"
+TOKEN_BYTES = 32
 
 
 class AppStartError(Exception):
@@ -189,7 +191,7 @@ class AppInstance:
         self.emulator_source_name = f"weather-skills-eval-emulator-{self.run_id}"
         self.volume_setup_name = f"weather-skills-eval-volume-setup-{self.run_id}"
         self.volume_name = f"weather-skills-eval-data-{self.run_id}"
-        self._bind_token = secrets.token_hex(32)
+        self._bind_token = secrets.token_hex(TOKEN_BYTES)
         self.container = None
         self.runner = None
         self.image_digest: str | None = None
@@ -222,7 +224,7 @@ class AppInstance:
             "SKILL_K8S_EMULATOR_HOST": self.runner_name,
             "SKILL_K8S_EMULATOR_API_PORT": EMULATOR_API_PORT,
             "SKILL_K8S_BIND_PORT": EMULATOR_BIND_PORT,
-            "SKILL_K8S_EMULATOR_START_DELAY": "0",
+            "SKILL_K8S_EMULATOR_START_DELAY": START_DELAY,
             "SKILL_K8S_BIND_TOKEN": self._bind_token,
         }
 

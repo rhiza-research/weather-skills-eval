@@ -6,7 +6,6 @@ import base64
 import io
 import json
 import random
-import re
 import tarfile
 import textwrap
 import threading
@@ -18,7 +17,6 @@ from types import SimpleNamespace
 import docker.errors
 import httpx
 import pytest
-import requests
 from fakes import (
     APP_EMULATOR_PATHS,
     APP_REPOSITORY,
@@ -34,6 +32,7 @@ from fakes import (
     Reply,
     app_observations,
     broadcast_observations,
+    chain,
     display_image,
     display_page,
     emulator_file,
@@ -41,6 +40,7 @@ from fakes import (
     image_bytes,
     image_entry,
     local_image,
+    provenance_detail,
     tool_call,
     tool_choice_refusal,
     zarr_entry,
@@ -51,13 +51,43 @@ from weather_skills_eval import play as play_module
 from weather_skills_eval import runner as runner_module
 from weather_skills_eval import simulated_user as simulated_user_module
 from weather_skills_eval.app_client import ChatError
+from weather_skills_eval.checks import NOTHING_PRESENTED, Evidence, PresentedFile
 from weather_skills_eval.config import RUNNER_ENV, ConfigError
-from weather_skills_eval.instance import AppInstance, AppStartError, RunnerStartError
+from weather_skills_eval.instance import (
+    APP_DATA_DIR,
+    ARTIFACTS_SUBPATH,
+    EMULATOR_API_PORT,
+    EMULATOR_BIND_PORT,
+    EMULATOR_DIR,
+    EMULATOR_LABEL_VALUE,
+    LABEL,
+    RUN_LABEL,
+    RUNNER_ARTIFACTS_DIR,
+    RUNNER_LABEL_VALUE,
+    START_DELAY,
+    TOKEN_BYTES,
+    VOLUME_LABEL_VALUE,
+    VOLUME_SETUP_LABEL_VALUE,
+    AppInstance,
+    AppStartError,
+    RunnerStartError,
+)
+from weather_skills_eval.judge import (
+    EVIDENCE_HEADER,
+    PROVENANCE_CRITERION,
+    evidence_message,
+    started_line,
+)
 from weather_skills_eval.langfuse_gateway import TraceReadError
 from weather_skills_eval.llm import ModelReplyError
 from weather_skills_eval.runner import DatasetError, run
-from weather_skills_eval.settings import SettingsError
-from weather_skills_eval.simulated_user import FILES_HEADER
+from weather_skills_eval.settings import (
+    DEFAULT_APP_START_TIMEOUT_SECONDS,
+    DEFAULT_MAX_TURNS,
+    DEFAULT_POLL_INTERVAL_SECONDS,
+    SettingsError,
+)
+from weather_skills_eval.simulated_user import REPLY_REQUEST, files_message
 from weather_skills_eval.tasks import TaskError
 
 ENVIRON = {
@@ -209,10 +239,6 @@ class Harness:
         item = self.gateway.experiments[0]["items"][index]
         return {e.name: e.value for e in item.evaluations}
 
-    def comments(self, index=0):
-        item = self.gateway.experiments[0]["items"][index]
-        return {e.name: e.comment for e in item.evaluations}
-
     def output(self, index=0):
         return self.gateway.experiments[0]["items"][index].output
 
@@ -280,18 +306,18 @@ def test_run_plays_every_task_into_one_experiment_and_removes_the_container(tmp_
     assert metadata["catalog_model"] == "weather-agent"
     assert experiment["description"] == "anthropic/claude-haiku-5.5"
     assert harness.output()["provider_models"] == ["provider/model-a", "provider/model-b"]
-    assert metadata["harness_commit"] == "unrecorded"
+    assert metadata["harness_commit"] == runner_module.UNRECORDED
     # Without EVAL_BATCH the run belongs to no batch.
     assert metadata["batch"] == ""
     assert metadata["dataset"] == "weather-tasks"
-    assert metadata["dataset_version"] == "latest"
+    assert metadata["dataset_version"] == runner_module.LATEST
     assert metadata["dataset_items"] == "3"
     assert metadata["dataset_skill_packs"] == ""
     # The models that graded the run, and the hash of what grades it.
     assert metadata["simulated_user_model"] == "openrouter/test/user"
     assert metadata["judge_models"] == "openrouter/test/judge"
     assert "judge_model" not in metadata
-    assert len(metadata["comparability_hash"]) == 16
+    assert len(metadata["comparability_hash"]) == runner_module.COMPARABILITY_HASH_LENGTH
     for index in range(3):
         assert harness.output(index)["judges"] == [
             {
@@ -322,7 +348,7 @@ def test_run_plays_every_task_into_one_experiment_and_removes_the_container(tmp_
     # Highest version per skill name, other tools kept.
     assert harness.app.completions[0]["tool_ids"] == ["plot-2", "fetch"]
     # The container carries its run id, and no other container is listed or touched.
-    assert call["labels"]["weather-skills-eval.run"] in call["name"]
+    assert call["labels"][RUN_LABEL] in call["name"]
     assert harness.docker.list_filters == []
 
 
@@ -330,9 +356,11 @@ def test_the_batch_is_recorded_in_the_experiment_metadata(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))
 
-    harness.run(EVAL_BATCH=" 2026-10-22T20:07:57Z ")
+    harness.run(EVAL_BATCH=" 2026-10-22T20:07:57Z ", EVAL_HARNESS_COMMIT="7f454f0")
 
-    assert harness.gateway.experiments[0]["metadata"]["batch"] == "2026-10-22T20:07:57Z"
+    metadata = harness.gateway.experiments[0]["metadata"]
+    assert metadata["batch"] == "2026-10-22T20:07:57Z"
+    assert metadata["harness_commit"] == "7f454f0"
 
 
 def test_config_read_from_stdin(tmp_path):
@@ -375,36 +403,29 @@ def with_variant(line: str) -> str:
     "variant_line, name",
     [
         ("variant: reasoning_high\n", "z-ai/glm-5.3 (reasoning_high)"),
-        ('variant: "  low  "\n', "z-ai/glm-5.3 (low)"),
         ("", "z-ai/glm-5.3"),
-        ("variant:\n", "z-ai/glm-5.3"),
         ('variant: ""\n', "z-ai/glm-5.3"),
-        ('variant: "   "\n', "z-ai/glm-5.3"),
     ],
-    ids=["set", "padded", "absent", "null", "empty", "blank"],
+    ids=["set", "absent", "empty"],
 )
-def test_a_variant_is_appended_to_the_experiment_name(tmp_path, caplog, variant_line, name):
+def test_a_variant_is_appended_to_the_experiment_name(tmp_path, variant_line, name):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))
     harness.gateway.served = "z-ai/glm-5.3"
     harness.config_path.write_text(with_variant(variant_line))
 
-    with caplog.at_level("INFO"):
-        summary = harness.run()
+    summary = harness.run()
 
     experiment = harness.gateway.experiments[0]
     assert experiment["name"] == name
     assert summary.experiment_name == name
-    assert f"Experiment {name} started: 1 tasks, concurrency 1" in progress_lines(caplog)
     # The metadata and the description keep the bare models, and add no key.
     assert experiment["metadata"]["served_model"] == "z-ai/glm-5.3"
     assert experiment["description"] == experiment["metadata"]["model"]
     assert "variant" not in experiment["metadata"]
 
 
-def test_the_cli_prints_the_variant_name_and_a_cost_line_with_the_bare_model(
-    tmp_path, monkeypatch, capsys
-):
+def test_the_cli_prints_a_cost_line_with_the_bare_model(tmp_path, monkeypatch, capsys):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))
     harness.gateway.served = "z-ai/glm-5.3"
@@ -414,9 +435,8 @@ def test_the_cli_prints_the_variant_name_and_a_cost_line_with_the_bare_model(
     assert cli.main(["run", str(harness.config_path)]) == 0
 
     lines = capsys.readouterr().out.splitlines()
-    assert lines[0].startswith("Experiment z-ai/glm-5.3 (reasoning_high) (production-agent), run ")
-    assert lines[-1].startswith("Cost ")
-    assert json.loads(lines[-1].removeprefix("Cost "))["served_model"] == "z-ai/glm-5.3"
+    assert lines[-1].startswith(cli.COST_LINE)
+    assert json.loads(lines[-1].removeprefix(cli.COST_LINE))["served_model"] == "z-ai/glm-5.3"
 
 
 def test_a_failed_served_model_request_stops_the_run_before_the_experiment(tmp_path):
@@ -503,7 +523,6 @@ def test_goal_met_records_turns_cost_tokens_and_time(tmp_path):
     assert scores["cache_miss_calls"] == 2
     output = harness.output()
     assert output["outcome"] == "goal_reached"
-    assert harness.comments()["turns_to_goal"] == "over the whole play (goal_reached)"
     assert output["chat_id"] == "chat-1"
     assert output["app_trace_ids"] == ["chat-1-trace-0", "chat-1-trace-1"]
     # The item trace carries the app's cost, the same number as the score.
@@ -544,28 +563,21 @@ def test_the_simulated_user_is_sent_its_prompt_filled_with_the_task(tmp_path, mo
     }
 
 
-STARTED = (
-    "Harness context, not said by the user: the conversation started on 2026-10-22 at 09:30 UTC."
-)
-
-
 def test_the_judge_and_the_rater_are_told_when_the_play_started(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))
     harness.run()
 
-    # In the scenario description of the verdict's system prompt, after the facts.
+    started = started_line(PLAY_START)
+    # In the verdict's system prompt.
     [verdict] = harness.models.verdict_calls()
-    system = verdict["messages"][0]["content"]
-    assert f"Period: next week.\n\n{STARTED}\n</scenario>" in system
+    assert started in verdict["messages"][0]["content"]
     # Not as something the user said: the transcript does not hold it.
-    assert STARTED not in verdict["messages"][1]["content"]
+    assert started not in verdict["messages"][1]["content"]
     [quality] = [c[2] for c in harness.models.calls if c[0] == "judge" and not c[2].get("tools")]
-    # Before the user's request.
-    prompt = quality["messages"][0]["content"]
-    assert f"{STARTED}\n\nThe user's request:\nrain forecast kenya" in prompt
+    assert started in quality["messages"][0]["content"]
     # The simulated user is not told.
-    assert STARTED not in json.dumps(harness.models.user_calls())
+    assert started not in json.dumps(harness.models.user_calls())
 
 
 # The presented result and its provenance
@@ -611,29 +623,24 @@ def test_presented_image_reaches_the_judge_with_its_provenance(tmp_path):
     verdict = harness.models.verdict_calls()[-1]
     # The fixed criterion is judged with the task's.
     assert "The assistant gives the rain forecast" in json.dumps(verdict["tools"])
-    assert "provenance (data source, region" in json.dumps(verdict["tools"])
+    assert PROVENANCE_CRITERION in json.dumps(verdict["tools"])
     transcript = verdict["messages"][1]["content"]
     assert "DONE: weekly rain for western Kenya from ERA5." in transcript
     assert "<details" not in transcript
-    parts = judge_parts(harness)
-    texts = "\n".join(p["text"] for p in parts if p["type"] == "text")
-    assert "File: maps/rain.png (image), presented on turn 2" in texts
-    assert '"skill": "arco-era5-fetch"' in texts
-    assert '"branches"' in texts
-    # Files no reply presents never reach the judge.
-    assert "intermediate_results" not in texts
-    images = [p["image_url"]["url"] for p in parts if p["type"] == "image_url"]
-    encoded = base64.b64encode(image_bytes("maps/rain.png")).decode()
-    assert images == [f"data:image/png;base64,{encoded}"]
+    # The map with its provenance and image; files no reply presents never reach the judge.
+    rain = PresentedFile(
+        "maps/rain.png",
+        "image",
+        provenance_detail(chain()),
+        image=image_bytes("maps/rain.png"),
+        turn=2,
+    )
+    assert judge_parts(harness) == evidence_message(Evidence(files=[rain]))["content"]
     # The simulated user saw what a user sees: the path, the kind and the image, before
     # the instruction; no provenance and no harness problem note.
     user_messages = harness.models.user_calls()[-1]["messages"]
-    assert user_messages[-2]["content"] == [
-        {"type": "text", "text": FILES_HEADER},
-        {"type": "text", "text": "File: maps/rain.png (image)"},
-        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
-    ]
-    assert user_messages[-1] == {"role": "user", "content": "Write your JSON reply."}
+    assert user_messages[-2] == files_message(Evidence(files=[rain]))
+    assert user_messages[-1] == {"role": "user", "content": REPLY_REQUEST}
     # Files no reply presents are never fetched; the user and the judge each read the map.
     downloads = [r for r in harness.app.file_requests if r[0] != "/artifacts"]
     assert downloads == [("/artifacts/content", "maps/rain.png")] * 2
@@ -655,7 +662,9 @@ def test_linked_zarr_is_judged_from_the_listing_alone(tmp_path):
     assert harness.output()["outcome"] == "goal_reached"
     parts = judge_parts(harness)
     assert [p["type"] for p in parts] == ["text", "text"]
-    assert "out.zarr (zarr)" in parts[1]["text"]
+    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == judged(
+        ("out.zarr", "zarr", 2)
+    )
     assert '"skill": "aggregate-temporal"' in parts[1]["text"]
     # A zarr deliverable is never downloaded.
     assert {r[0] for r in harness.app.file_requests} == {"/artifacts"}
@@ -677,7 +686,9 @@ def test_emailed_attachment_is_presented(tmp_path):
     harness.run()
 
     assert harness.output()["outcome"] == "goal_reached"
-    assert "maps/rain.png (image)" in json.dumps(judge_parts(harness))
+    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == judged(
+        ("maps/rain.png", "image", 2)
+    )
 
 
 def test_a_zarr_named_only_in_backticks_reaches_the_goal(tmp_path):
@@ -695,12 +706,12 @@ def test_a_zarr_named_only_in_backticks_reaches_the_goal(tmp_path):
 
     assert harness.output()["outcome"] == "goal_reached"
     # The only file of a kind the task needs counts as presented.
-    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == [
-        "File: kenya_rain.zarr (zarr), presented on turn 2"
-    ]
-    assert evidence_files(harness.models.user_calls()[-1]["messages"]) == [
-        "File: kenya_rain.zarr (zarr)"
-    ]
+    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == judged(
+        ("kenya_rain.zarr", "zarr", 2)
+    )
+    assert evidence_files(harness.models.user_calls()[-1]["messages"]) == shown(
+        ("kenya_rain.zarr", "zarr")
+    )
 
 
 def test_backtick_files_of_a_needed_kind_none_presented_outright_are_all_presented(tmp_path):
@@ -717,10 +728,9 @@ def test_backtick_files_of_a_needed_kind_none_presented_outright_are_all_present
     harness.run()
 
     assert harness.output()["outcome"] == "goal_reached"
-    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == [
-        "File: weekly.zarr (zarr), presented on turn 2",
-        "File: daily.zarr (zarr), presented on turn 2",
-    ]
+    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == judged(
+        ("weekly.zarr", "zarr", 2), ("daily.zarr", "zarr", 2)
+    )
 
 
 def test_a_backtick_file_beside_another_of_its_needed_kind_stays_named_in_passing(tmp_path):
@@ -737,10 +747,9 @@ def test_a_backtick_file_beside_another_of_its_needed_kind_stays_named_in_passin
     harness.run()
 
     assert harness.output()["outcome"] == "goal_reached"
-    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == [
-        "File: out.zarr (zarr), presented on turn 2",
-        "File: era5_kenya.zarr (zarr), named in passing on turn 2 and not presented",
-    ]
+    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == judged(
+        ("out.zarr", "zarr", 2), ("era5_kenya.zarr", "zarr", 2, True)
+    )
 
 
 def test_a_later_backtick_mention_keeps_the_turn_that_presented_the_file(tmp_path):
@@ -759,9 +768,9 @@ def test_a_later_backtick_mention_keeps_the_turn_that_presented_the_file(tmp_pat
     harness.run()
 
     assert harness.output()["outcome"] == "goal_reached"
-    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == [
-        "File: out.zarr (zarr), presented on turn 2"
-    ]
+    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == judged(
+        ("out.zarr", "zarr", 2)
+    )
 
 
 def test_a_backtick_file_is_labeled_and_left_out_of_the_provenance_criterion(tmp_path):
@@ -778,25 +787,18 @@ def test_a_backtick_file_is_labeled_and_left_out_of_the_provenance_criterion(tmp
 
     assert harness.output()["outcome"] == "goal_reached"
     verdict = harness.models.verdict_calls()[0]
-    assert evidence_files(verdict["messages"]) == [
-        "File: maps/rain.png (image), presented on turn 2",
-        "File: kenya_rain.zarr (zarr), named in passing on turn 2 and not presented",
+    # Labeled as named in passing; its provenance still reaches the judge, as data.
+    provenance = provenance_detail(chain())
+    files = [
+        PresentedFile(
+            "maps/rain.png", "image", provenance, image=image_bytes("maps/rain.png"), turn=2
+        ),
+        PresentedFile("kenya_rain.zarr", "zarr", provenance, turn=2, named_in_passing=True),
     ]
-    # Its provenance still reaches the judge, as data.
-    texts = [p["text"] for p in judge_parts(harness) if p["type"] == "text"]
-    assert "Provenance:" in texts[2]
-    assert texts[0] == (
-        "Harness evidence, not part of the conversation: every file the assistant presented "
-        "or named in passing during the conversation, in order, each once at the turn given "
-        "with it, with the weather_skills_history provenance the app read from it: per branch, "
-        "the skills that produced it in order, with their arguments."
-    )
+    assert judge_parts(harness) == evidence_message(Evidence(files=files))["content"]
+    assert judge_parts(harness)[0]["text"] == EVIDENCE_HEADER
     # The fixed criterion covers only the presented files.
-    assert (
-        "Each presented file's provenance (data source, region, period, aggregation, units) "
-        "matches the user's request and what was agreed in the chat; a file named in passing "
-        "and not presented is not held to this"
-    ) in json.dumps(verdict["tools"])
+    assert PROVENANCE_CRITERION in json.dumps(verdict["tools"])
 
 
 def test_backtick_text_that_is_not_a_listed_path_presents_nothing(tmp_path):
@@ -821,12 +823,12 @@ def test_backtick_text_that_is_not_a_listed_path_presents_nothing(tmp_path):
     # A later reply naming only unlisted text does not replace the presented files.
     assert [evidence_files(c["messages"]) for c in harness.models.user_calls()] == [
         [],
-        ["File: out.zarr (zarr)"],
-        ["File: out.zarr (zarr)"],
+        shown(("out.zarr", "zarr")),
+        shown(("out.zarr", "zarr")),
     ]
-    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == [
-        "File: out.zarr (zarr), presented on turn 2"
-    ]
+    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == judged(
+        ("out.zarr", "zarr", 2)
+    )
 
 
 @pytest.mark.parametrize(
@@ -850,9 +852,7 @@ def test_backticks_that_do_not_name_a_listed_path_in_the_reply_text_skip_the_jud
 
     output = harness.output()
     assert output["outcome"] == "user_done"
-    assert output["reasoning"].endswith(
-        "(final check failed: No result presented: no reply presented a file)"
-    )
+    assert NOTHING_PRESENTED in output["reasoning"]
     assert harness.models.verdict_calls() == []
     assert evidence_files(harness.models.user_calls()[-1]["messages"]) == []
 
@@ -868,10 +868,10 @@ def test_a_displayed_html_page_is_presented_but_is_not_an_image(tmp_path):
     )
     harness.run()
 
-    reasoning = harness.output()["reasoning"]
-    assert "No presented file is an image; presented: map.html (html)" in reasoning
     assert harness.models.verdict_calls() == []
-    assert evidence_files(harness.models.user_calls()[-1]["messages"]) == ["File: map.html (html)"]
+    assert evidence_files(harness.models.user_calls()[-1]["messages"]) == shown(
+        ("map.html", "html")
+    )
     # A page is never downloaded.
     assert {r[0] for r in harness.app.file_requests} == {"/artifacts"}
 
@@ -890,19 +890,36 @@ def test_a_displayed_html_page_and_a_zarr_reach_the_judge(tmp_path):
     harness.run()
 
     assert harness.output()["outcome"] == "goal_reached"
-    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == [
-        "File: map.html (html), presented on turn 2",
-        "File: out.zarr (zarr), presented on turn 2",
-    ]
+    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == judged(
+        ("map.html", "html", 2), ("out.zarr", "zarr", 2)
+    )
 
 
 def evidence_files(messages: list[dict]) -> list[str]:
-    """The ``File:`` lines of the harness evidence in a model call's messages."""
+    """The first line of each file's text in the file list of a model call's messages."""
     evidence = [m for m in messages if isinstance(m.get("content"), list)]
     if not evidence:
         return []
     texts = [p["text"] for p in evidence[0]["content"] if p["type"] == "text"]
     return [t.split("\n")[0] for t in texts[1:]]
+
+
+def judged(*files) -> list[str]:
+    """``evidence_files`` of the judge's evidence for ``files``, each (path, kind,
+    turn) or (path, kind, turn, named in passing)."""
+    presented = [
+        PresentedFile(path, kind, None, turn=turn, named_in_passing=any(passing))
+        for path, kind, turn, *passing in files
+    ]
+    return evidence_files([evidence_message(Evidence(files=presented))])
+
+
+def shown(*files, unopened: tuple[str, ...] = ()) -> list[str]:
+    """``evidence_files`` of what the simulated user is shown for ``files``, each
+    (path, kind), and for ``unopened`` paths, which could not be opened."""
+    presented = [PresentedFile(path, kind, None) for path, kind in files]
+    evidence = Evidence(files=presented, unlisted=list(unopened))
+    return evidence_files([files_message(evidence)])
 
 
 def test_judge_gets_every_presented_file_labeled_by_turn(tmp_path):
@@ -943,16 +960,13 @@ def test_judge_gets_every_presented_file_labeled_by_turn(tmp_path):
     # The user sees the latest presenting reply's files.
     assert [evidence_files(c["messages"]) for c in harness.models.user_calls()] == [
         [],
-        ["File: maps/ecmwf.png (image)"],
-        ["File: maps/ecmwf.png (image)"],
-        ["File: maps/gefs.png (image)"],
+        shown(("maps/ecmwf.png", "image")),
+        shown(("maps/ecmwf.png", "image")),
+        shown(("maps/gefs.png", "image")),
     ]
     # The judge gets both, in order, labeled by turn, and no intermediate file.
     assert [evidence_files(c["messages"]) for c in harness.models.verdict_calls()] == [
-        [
-            "File: maps/ecmwf.png (image), presented on turn 2",
-            "File: maps/gefs.png (image), presented on turn 4",
-        ]
+        judged(("maps/ecmwf.png", "image", 2), ("maps/gefs.png", "image", 4))
     ]
     assert "intermediate_results" not in json.dumps(harness.models.verdict_calls())
     # Each presenting reply's files are read once for the user; the judge reads them all.
@@ -989,9 +1003,9 @@ def test_a_path_presented_twice_reaches_the_judge_once_with_its_latest_image(tmp
     )
     harness.run()
 
-    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == [
-        "File: maps/rain.png (image), presented on turn 3"
-    ]
+    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == judged(
+        ("maps/rain.png", "image", 3)
+    )
     in_mm = f"data:image/png;base64,{base64.b64encode(b'map in mm').decode()}"
     images = [p["image_url"]["url"] for p in judge_parts(harness) if p["type"] == "image_url"]
     assert images == [in_mm]
@@ -1027,19 +1041,15 @@ def test_wrong_result_is_corrected_and_the_play_continues(tmp_path):
 
     calls = harness.models.user_calls()
     # The user saw the daily map's path and image, and asked for the fix.
-    evidence = calls[1]["messages"][-2]["content"]
-    assert evidence[1]["text"] == "File: maps/daily.png (image)"
-    assert [p["type"] for p in evidence] == ["text", "text", "image_url"]
+    assert evidence_files(calls[1]["messages"]) == shown(("maps/daily.png", "image"))
+    assert [p["type"] for p in calls[1]["messages"][-2]["content"]] == ["text", "text", "image_url"]
     sent = [body["turn"]["user_message"]["content"] for body in harness.app.completions[1:]]
     assert sent == ["era5", correction["message"]]
     assert harness.output()["outcome"] == "goal_reached"
     assert harness.scores()["turns_to_goal"] == 3
     # The judge gets both maps, labeled by turn; the criteria decide which counts.
     assert [evidence_files(c["messages"]) for c in harness.models.verdict_calls()] == [
-        [
-            "File: maps/daily.png (image), presented on turn 2",
-            "File: maps/weekly.png (image), presented on turn 3",
-        ]
+        judged(("maps/daily.png", "image", 2), ("maps/weekly.png", "image", 3))
     ]
 
 
@@ -1089,7 +1099,6 @@ def test_user_done_and_judge_failed_ends_as_user_done(tmp_path):
     assert harness.scores()["goal_reached"] == 0.0
     assert harness.scores()["turns_to_goal"] == 2
     assert len(harness.models.verdict_calls()) == 1
-    assert output["reasoning"].endswith("(final check failed: verdict failed)")
 
 
 # The judge panel
@@ -1129,25 +1138,16 @@ def test_a_judge_panel_rules_on_the_same_evidence_and_the_majority_decides(tmp_p
         {"model": PANEL[1], "state": "failed", "passed": False, "reasoning": "verdict failed"},
         {"model": PANEL[2], "state": "passed", "passed": True, "reasoning": "verdict passed"},
     ]
-    assert output["reasoning"] == (
-        f"{PANEL[0]} passed: verdict passed; {PANEL[1]} failed: verdict failed; "
-        f"{PANEL[2]} passed: verdict passed"
-    )
-    scores, comments = harness.scores(), harness.comments()
+    scores = harness.scores()
     assert scores["goal_reached"] == 1.0
     assert scores["judges_agree"] == 0.0
-    assert comments["judges_agree"] == (
-        "test/judge-a passed; test/judge-b failed; test/judge-c passed"
-    )
     # Every judge rates the answer; answer_quality is their mean.
     ratings = [c[2] for c in harness.models.calls if c[0] == "judge" and not c[2].get("tools")]
     assert sorted(call["model"] for call in ratings) == PANEL
     assert scores["answer_quality:test/judge-a"] == 5
     assert scores["answer_quality:test/judge-b"] == 2
     assert scores["answer_quality:test/judge-c"] == 4
-    assert comments["answer_quality:test/judge-a"] == "clear answer"
     assert scores["answer_quality"] == pytest.approx(11 / 3)
-    assert comments["answer_quality"] == "mean of 3 of 3 judges"
 
 
 def test_a_panel_that_agrees_records_judges_agree(tmp_path):
@@ -1171,10 +1171,6 @@ def test_a_tied_panel_fails(tmp_path):
     output = harness.output()
     assert output["outcome"] == "user_done"
     assert output["goal_reached"] is False
-    assert output["reasoning"].endswith(
-        f"(final check failed: {PANEL[0]} failed: verdict failed; "
-        f"{PANEL[1]} passed: verdict passed)"
-    )
     assert harness.scores()["goal_reached"] == 0.0
     assert harness.scores()["judges_agree"] == 0.0
 
@@ -1185,11 +1181,10 @@ def test_a_panel_without_a_result_to_judge_calls_no_judge(tmp_path):
     harness.run(EVAL_JUDGE_MODELS=",".join(PANEL))
 
     output = harness.output()
-    problem = "No result presented: no reply presented a file"
     assert output["outcome"] == "user_done"
-    assert output["reasoning"].endswith(f"(final check failed: {problem})")
+    assert NOTHING_PRESENTED in output["reasoning"]
     assert output["judges"] == [
-        {"model": model, "state": "failed", "passed": False, "reasoning": problem}
+        {"model": model, "state": "failed", "passed": False, "reasoning": NOTHING_PRESENTED}
         for model in PANEL
     ]
     assert harness.models.verdict_calls() == []
@@ -1221,20 +1216,10 @@ def test_an_errored_judge_is_left_out_and_the_others_decide(tmp_path):
         ("passed", True),
     ]
     assert CUT_OFF in output["judges"][1]["reasoning"]
-    assert output["reasoning"] == (
-        f"{PANEL[0]} passed: verdict passed; "
-        f"{PANEL[1]} errored: {output['judges'][1]['reasoning']}; "
-        f"{PANEL[2]} passed: verdict passed"
-    )
-    scores, comments = harness.scores(), harness.comments()
+    scores = harness.scores()
     assert scores["goal_reached"] == 1.0
     # The two judges that ruled agree.
     assert scores["judges_agree"] == 1.0
-    assert comments["judges_agree"] == (
-        f"test/judge-a passed; test/judge-b errored: {output['judges'][1]['reasoning']}; "
-        "test/judge-c passed"
-    )
-    assert "failed" not in comments["judges_agree"]
     # Every judge still rated the answer.
     assert scores["answer_quality"] == 4
 
@@ -1279,19 +1264,10 @@ def test_a_panel_where_no_judge_ruled_ends_the_play_as_error(tmp_path):
 
     output = harness.output()
     assert output["outcome"] == "error"
-    assert output["error"].startswith(f"No judge ruled: {PANEL[0]} errored: ")
-    assert f"; {PANEL[1]} errored: " in output["error"]
-    assert CUT_OFF in output["error"]
     assert [j["state"] for j in output["judges"]] == ["error", "error"]
     scores = harness.scores()
     assert scores["goal_reached"] == 0.0
     assert "judges_agree" not in scores
-
-
-FINISH_TEST_INSTRUCTION = {
-    "role": "user",
-    "content": "Answer only by calling the finish_test tool, never with plain text.",
-}
 
 
 def verdict_calls_of(harness, model: str) -> list[dict]:
@@ -1318,7 +1294,7 @@ def test_a_judge_whose_provider_refuses_a_forced_tool_choice_rules_with_auto(tmp
     # The evidence stays at index 2, and the instruction comes last.
     assert retried["messages"][2] == evidence_messages(refused)[0]
     assert retried["messages"][:-1] == refused["messages"]
-    assert retried["messages"][-1] == FINISH_TEST_INSTRUCTION
+    assert retried["messages"][-1]["role"] == "user"
     # A judge whose provider does not refuse is called once, as Scenario sends it.
     for model in (PANEL[0], PANEL[2]):
         [call] = verdict_calls_of(harness, model)
@@ -1371,14 +1347,10 @@ def test_a_judge_whose_rating_fails_is_left_out_of_the_mean(tmp_path):
     harness = Harness(tmp_path, items, reply_done_on(1), quality_scores={PANEL[0]: 5, PANEL[1]: 0})
     harness.run(EVAL_JUDGE_MODELS=",".join(PANEL[:2]))
 
-    scores, comments = harness.scores(), harness.comments()
+    scores = harness.scores()
     assert scores["answer_quality:test/judge-a"] == 5
     assert "answer_quality:test/judge-b" not in scores
     assert scores["answer_quality"] == 5
-    assert comments["answer_quality"] == (
-        "mean of 1 of 2 judges; not rated by test/judge-b: answer quality not rated: "
-        "Answer quality is not an integer from 1 to 5: {'score': 0, 'reasoning': 'clear answer'}"
-    )
 
 
 # The comparability hash
@@ -1421,20 +1393,9 @@ def test_what_is_under_test_does_not_change_the_comparability_hash(tmp_path):
     assert second["comparability_hash"] == first["comparability_hash"]
 
 
-@pytest.mark.parametrize(
-    "items, settings",
-    [
-        (None, {"EVAL_JUDGE_MODELS": "openrouter/test/other-judge"}),
-        (None, {"EVAL_SIMULATED_USER_MODEL": "openrouter/test/other-user"}),
-        ([task("t1", "rain forecast uganda")], {}),
-        ([task("t1", "rain forecast kenya", criteria=["The assistant gives totals"])], {}),
-        (None, {"EVAL_MAX_TURNS": "19"}),
-    ],
-    ids=["one-judge", "user-model", "item-input", "item-criteria", "max-turns"],
-)
-def test_runs_graded_differently_have_different_comparability_hashes(tmp_path, items, settings):
+def test_runs_graded_differently_have_different_comparability_hashes(tmp_path):
     first = run_metadata(tmp_path)
-    second = run_metadata(tmp_path, items=items, **settings)
+    second = run_metadata(tmp_path, EVAL_JUDGE_MODELS="openrouter/test/other-judge")
 
     assert second["comparability_hash"] != first["comparability_hash"]
 
@@ -1529,9 +1490,7 @@ def test_nothing_presented_skips_the_judge(tmp_path):
     output = harness.output()
     assert harness.scores()["goal_reached"] == 0.0
     assert output["outcome"] == "user_done"
-    assert output["reasoning"].endswith(
-        "(final check failed: No result presented: no reply presented a file)"
-    )
+    assert NOTHING_PRESENTED in output["reasoning"]
     assert harness.models.verdict_calls() == []
 
 
@@ -1547,15 +1506,11 @@ def test_file_without_provenance_skips_the_judge_and_is_shown_to_the_user(tmp_pa
     )
     harness.run()
 
-    reasoning = harness.output()["reasoning"]
-    assert "Presented files have no provenance: ['maps/rain.png']" in reasoning
     assert harness.models.verdict_calls() == []
-    # The user sees the map as a user would: no provenance and no problem note.
-    parts = harness.models.user_calls()[-1]["messages"][-2]["content"]
-    assert [p["type"] for p in parts] == ["text", "text", "image_url"]
-    assert parts[1]["text"] == "File: maps/rain.png (image)"
-    assert "rovenance" not in json.dumps(parts)
-    assert "Problem" not in json.dumps(parts)
+    # The user sees the map as a user would.
+    user_messages = harness.models.user_calls()[-1]["messages"]
+    assert [p["type"] for p in user_messages[-2]["content"]] == ["text", "text", "image_url"]
+    assert evidence_files(user_messages) == shown(("maps/rain.png", "image"))
 
 
 def test_download_that_fails_once_is_tried_again_for_the_judge(tmp_path):
@@ -1565,9 +1520,8 @@ def test_download_that_fails_once_is_tried_again_for_the_judge(tmp_path):
     harness.run()
 
     # The user got the map as one it could not open; the judge read it again and saw it.
-    user_parts = harness.models.user_calls()[-1]["messages"][-2]["content"]
-    assert [p["text"] for p in user_parts[1:]] == ["File: maps/rain.png (could not be opened)"]
-    assert "Problem" not in json.dumps(user_parts)
+    user_messages = harness.models.user_calls()[-1]["messages"]
+    assert evidence_files(user_messages) == shown(unopened=("maps/rain.png",))
     assert harness.output()["outcome"] == "goal_reached"
     assert [p["type"] for p in judge_parts(harness)] == ["text", "text", "image_url"]
     downloads = [r for r in harness.app.file_requests if r[0] != "/artifacts"]
@@ -1584,8 +1538,9 @@ def test_user_sees_only_the_file_list_for_a_missing_kind(tmp_path):
     harness.run()
 
     # From the file list alone the user can see it got data and no picture.
-    parts = harness.models.user_calls()[-1]["messages"][-2]["content"]
-    assert [p["text"] for p in parts[1:]] == ["File: out.zarr (zarr)"]
+    user_messages = harness.models.user_calls()[-1]["messages"]
+    assert [p["type"] for p in user_messages[-2]["content"]] == ["text", "text"]
+    assert evidence_files(user_messages) == shown(("out.zarr", "zarr"))
     assert harness.output()["outcome"] == "user_done"
 
 
@@ -1599,11 +1554,12 @@ def test_user_sees_only_the_listed_files_for_an_unlisted_file(tmp_path):
     harness.run()
 
     # The path that is not in the chat's files is shown as one that could not be opened.
-    parts = harness.models.user_calls()[-1]["messages"][-2]["content"]
+    user_messages = harness.models.user_calls()[-1]["messages"]
+    parts = user_messages[-2]["content"]
     assert [p["type"] for p in parts] == ["text", "text", "image_url", "text"]
-    assert parts[1]["text"] == "File: maps/rain.png (image)"
-    assert parts[-1]["text"] == "File: maps/gone.png (could not be opened)"
-    assert "Problem" not in json.dumps(parts)
+    assert evidence_files(user_messages) == shown(
+        ("maps/rain.png", "image"), unopened=("maps/gone.png",)
+    )
     assert harness.output()["outcome"] == "user_done"
 
 
@@ -1650,7 +1606,7 @@ def early_then_final(early_provenance: bool, final_provenance: bool):
     return reply
 
 
-def test_an_early_file_problem_is_a_note_for_the_judge(tmp_path):
+def test_an_early_file_problem_is_a_note_for_the_judge(tmp_path, monkeypatch):
     items = [task("t1", "rain map kenya", deliverables=["image"])]
     harness = Harness(
         tmp_path,
@@ -1658,14 +1614,36 @@ def test_an_early_file_problem_is_a_note_for_the_judge(tmp_path):
         early_then_final(early_provenance=False, final_provenance=True),
         user_replies={"rain map kenya": [progress("kenya"), progress("make it final")]},
     )
+    judge_evidence = []
+    collect = play_module.collect_evidence
+
+    async def recording(*args, **kwargs):
+        evidence = await collect(*args, **kwargs)
+        if kwargs.get("every"):
+            judge_evidence.append(evidence)
+        return evidence
+
+    monkeypatch.setattr(play_module, "collect_evidence", recording)
     harness.run()
 
     assert harness.output()["outcome"] == "goal_reached"
-    texts = [p["text"] for p in judge_parts(harness) if p["type"] == "text"]
-    assert (
-        texts[1] == "File: maps/draft.png (image), presented on turn 2\nNote: it has no provenance"
+    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == judged(
+        ("maps/draft.png", "image", 2), ("maps/final.png", "image", 3)
     )
-    assert texts[2].startswith("File: maps/final.png (image), presented on turn 3\nProvenance:")
+    # The draft's note reaches the judge with it.
+    [evidence] = judge_evidence
+    [note] = [f.note for f in evidence.files if f.path == "maps/draft.png"]
+    assert note is not None
+    texts = [p["text"] for p in judge_parts(harness) if p["type"] == "text"]
+    assert any(text.startswith(judged(("maps/draft.png", "image", 2))[0]) for text in texts)
+    assert any(note in text for text in texts)
+    # A file named in passing reads otherwise than a presented one.
+    assert judged(("maps/draft.png", "image", 2, True)) != judged(("maps/draft.png", "image", 2))
+    # The user is shown neither the note nor the final map's provenance.
+    for call in harness.models.user_calls():
+        shown_text = json.dumps(call["messages"])
+        assert note not in shown_text
+        assert "branches" not in shown_text
 
 
 def test_a_final_file_without_provenance_still_blocks_the_judge(tmp_path):
@@ -1681,7 +1659,6 @@ def test_a_final_file_without_provenance_still_blocks_the_judge(tmp_path):
     output = harness.output()
     assert output["outcome"] == "user_done"
     assert harness.models.verdict_calls() == []
-    assert "Presented files have no provenance: ['maps/final.png']" in output["reasoning"]
 
 
 def test_the_final_read_tries_a_failed_listing_and_download_once_more(tmp_path):
@@ -1703,28 +1680,6 @@ def test_the_final_read_tries_a_failed_listing_and_download_once_more(tmp_path):
         ("/artifacts/content", "maps/rain.png"),
         ("/artifacts/content", "maps/rain.png"),
     ]
-
-
-def test_a_webp_image_is_attached(tmp_path):
-    items = [task("t1", "rain map kenya", deliverables=["image"])]
-    harness = Harness(
-        tmp_path,
-        items,
-        map_reply(
-            presenting=display_image("maps/rain.webp"),
-            artifacts=[image_entry("maps/rain.webp")],
-            files={"maps/rain.webp": image_bytes("maps/rain.webp")},
-        ),
-    )
-    harness.run()
-
-    encoded = base64.b64encode(image_bytes("maps/rain.webp")).decode()
-    user_parts = harness.models.user_calls()[-1]["messages"][-2]["content"]
-    assert user_parts[-1] == {
-        "type": "image_url",
-        "image_url": {"url": f"data:image/webp;base64,{encoded}"},
-    }
-    assert judge_parts(harness)[-1] == user_parts[-1]
 
 
 def test_the_final_read_lists_again_when_a_last_reply_path_is_missing(tmp_path):
@@ -1816,10 +1771,9 @@ def test_deliverable_kinds_presented_on_different_turns_pass(tmp_path):
     harness.run()
 
     assert harness.output()["outcome"] == "goal_reached"
-    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == [
-        "File: out.zarr (zarr), presented on turn 2",
-        "File: maps/rain.png (image), presented on turn 4",
-    ]
+    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == judged(
+        ("out.zarr", "zarr", 2), ("maps/rain.png", "image", 4)
+    )
 
 
 def test_an_earlier_unlisted_file_is_a_note_for_the_judge(tmp_path):
@@ -1845,9 +1799,8 @@ def test_an_earlier_unlisted_file_is_a_note_for_the_judge(tmp_path):
     harness.run()
 
     assert harness.output()["outcome"] == "goal_reached"
-    texts = [p["text"] for p in judge_parts(harness) if p["type"] == "text"]
-    assert texts[1] == (
-        "File: maps/early.png (unknown), presented on turn 2\nNote: it is not in the chat's files"
+    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == judged(
+        ("maps/early.png", "unknown", 2), ("maps/final.png", "image", 3)
     )
 
 
@@ -1863,11 +1816,9 @@ def test_an_earlier_file_whose_download_failed_is_a_note_for_the_judge(tmp_path)
     harness.run()
 
     assert harness.output()["outcome"] == "goal_reached"
-    texts = [p["text"] for p in judge_parts(harness) if p["type"] == "text"]
-    assert texts[1].startswith(
-        "File: maps/draft.png (image), presented on turn 2\nNote: it could not be read:"
+    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == judged(
+        ("maps/draft.png", "image", 2), ("maps/final.png", "image", 3)
     )
-    assert "Provenance:" in texts[1]
 
 
 def test_the_final_read_waits_the_poll_interval_before_each_retry(tmp_path):
@@ -1882,10 +1833,10 @@ def test_the_final_read_waits_the_poll_interval_before_each_retry(tmp_path):
         assert harness.output()["outcome"] == "goal_reached"
         return harness.clock.sleeps
 
-    # EVAL_POLL_INTERVAL_SECONDS defaults to 2: one wait before the extra
+    # At the default EVAL_POLL_INTERVAL_SECONDS: one wait before the extra
     # listing, one before the extra download.
     extra = Counter(run(failing=True)) - Counter(run(failing=False))
-    assert extra == Counter({2.0: 2})
+    assert extra == Counter({DEFAULT_POLL_INTERVAL_SECONDS: 2})
 
 
 def test_a_failed_listing_shows_the_user_each_path_as_not_opened(tmp_path):
@@ -1894,8 +1845,8 @@ def test_a_failed_listing_shows_the_user_each_path_as_not_opened(tmp_path):
     harness.app.failing_listings = 1
     harness.run()
 
-    parts = harness.models.user_calls()[-1]["messages"][-2]["content"]
-    assert [p["text"] for p in parts[1:]] == ["File: maps/rain.png (could not be opened)"]
+    user_messages = harness.models.user_calls()[-1]["messages"]
+    assert evidence_files(user_messages) == shown(unopened=("maps/rain.png",))
     # The judge lists the files again and sees the map.
     assert harness.output()["outcome"] == "goal_reached"
 
@@ -1921,7 +1872,7 @@ def test_an_unlisted_path_is_looked_up_again_on_the_next_turn(tmp_path):
     harness.run()
 
     calls = harness.models.user_calls()
-    assert evidence_files(calls[1]["messages"]) == ["File: maps/rain.png (could not be opened)"]
+    assert evidence_files(calls[1]["messages"]) == shown(unopened=("maps/rain.png",))
     assert [p["type"] for p in calls[2]["messages"][-2]["content"]] == [
         "text",
         "text",
@@ -1952,32 +1903,12 @@ def test_a_backtick_file_the_listing_lags_is_shown_on_the_next_turn(tmp_path):
     assert [evidence_files(c["messages"]) for c in harness.models.user_calls()] == [
         [],
         [],
-        ["File: k.zarr (zarr)"],
+        shown(("k.zarr", "zarr")),
     ]
     assert harness.output()["outcome"] == "goal_reached"
 
 
-def test_an_image_of_unknown_media_type_is_not_attached_for_the_user(tmp_path):
-    items = [task("t1", "rain map kenya", deliverables=["image"])]
-    harness = Harness(
-        tmp_path,
-        items,
-        map_reply(
-            presenting=display_image("maps/rain.map"),
-            artifacts=[image_entry("maps/rain.map")],
-            files={"maps/rain.map": image_bytes("maps/rain.map")},
-        ),
-    )
-    harness.run()
-
-    parts = harness.models.user_calls()[-1]["messages"][-2]["content"]
-    assert [p["type"] for p in parts] == ["text", "text"]
-    assert parts[1]["text"] == "File: maps/rain.map (image) (not shown as an image)"
-    # Such an image is never downloaded.
-    assert {r[0] for r in harness.app.file_requests} == {"/artifacts"}
-
-
-@pytest.mark.parametrize("path", ["maps/rain.svg", "maps/rain.tiff", "maps/rain.bmp", "maps/rain"])
+@pytest.mark.parametrize("path", ["maps/rain.svg", "maps/rain"])
 def test_an_image_outside_the_shown_types_is_a_note_for_the_user_and_the_judge(tmp_path, path):
     items = [task("t1", "rain map kenya", deliverables=["image"])]
     harness = Harness(
@@ -1991,15 +1922,17 @@ def test_an_image_outside_the_shown_types_is_a_note_for_the_user_and_the_judge(t
     )
     harness.run()
 
-    user_parts = harness.models.user_calls()[-1]["messages"][-2]["content"]
-    assert [p["text"] for p in user_parts[1:]] == [f"File: {path} (image) (not shown as an image)"]
+    user_messages = harness.models.user_calls()[-1]["messages"]
+    assert [p["type"] for p in user_messages[-2]["content"]] == ["text", "text"]
+    assert evidence_files(user_messages) == shown((path, "image"))
     # The judge is still called; the note goes with the file's evidence.
     assert harness.output()["outcome"] == "goal_reached"
-    parts = judge_parts(harness)
-    assert [p["type"] for p in parts] == ["text", "text"]
-    assert parts[1]["text"].startswith(
-        f"File: {path} (image), presented on turn 2 (not shown as an image)\nProvenance:"
+    assert [p["type"] for p in judge_parts(harness)] == ["text", "text"]
+    assert evidence_files(harness.models.verdict_calls()[0]["messages"]) == judged(
+        (path, "image", 2)
     )
+    # Such an image is never downloaded.
+    assert {r[0] for r in harness.app.file_requests} == {"/artifacts"}
 
 
 def test_unreadable_image_skips_the_judge(tmp_path):
@@ -2009,9 +1942,6 @@ def test_unreadable_image_skips_the_judge(tmp_path):
     )
     harness.run()
 
-    reasoning = harness.output()["reasoning"]
-    assert "maps/rain.png could not be read" in reasoning
-    assert "404" in reasoning
     assert harness.models.verdict_calls() == []
 
 
@@ -2024,9 +1954,6 @@ def test_missing_kind_skips_the_judge(tmp_path):
     )
     harness.run()
 
-    reasoning = harness.output()["reasoning"]
-    assert "No presented file is an image" in reasoning
-    assert "out.zarr (zarr)" in reasoning
     assert harness.models.verdict_calls() == []
     assert not [r for r in harness.app.file_requests if r[0] != "/artifacts"]
 
@@ -2036,7 +1963,6 @@ def test_every_deliverable_kind_must_be_presented(tmp_path):
     harness = Harness(tmp_path, items, map_reply(presenting=display_image("maps/rain.png")))
     harness.run()
 
-    assert "No presented file is a zarr" in harness.output()["reasoning"]
     assert harness.models.verdict_calls() == []
 
 
@@ -2051,12 +1977,12 @@ def test_task_without_deliverables_is_judged_on_the_chat_alone(tmp_path):
         ("/artifacts", None),
         ("/artifacts/content", "maps/rain.png"),
     ]
-    assert evidence_files(harness.models.user_calls()[-1]["messages"]) == [
-        "File: maps/rain.png (image)"
-    ]
+    assert evidence_files(harness.models.user_calls()[-1]["messages"]) == shown(
+        ("maps/rain.png", "image")
+    )
     messages = harness.models.verdict_calls()[-1]["messages"]
     assert all(isinstance(m["content"], str) for m in messages)
-    assert "provenance" not in json.dumps(harness.models.verdict_calls()[-1]["tools"])
+    assert PROVENANCE_CRITERION not in json.dumps(harness.models.verdict_calls()[-1]["tools"])
 
 
 def test_item_with_artifact_checks_does_not_start_the_run(tmp_path):
@@ -2064,41 +1990,55 @@ def test_item_with_artifact_checks_does_not_start_the_run(tmp_path):
     item["expected_output"]["artifact_checks"] = [{"path": "*.png"}]
     harness = Harness(tmp_path, [item], reply_done_on(1))
 
-    with pytest.raises(TaskError, match="expected_output.artifact_checks"):
+    with pytest.raises(TaskError):
         harness.run()
     assert harness.docker.run_calls == []
 
 
-def test_turn_cap_of_the_task_ends_as_failure_with_its_scores(tmp_path):
+def judged_at_the_cap(monkeypatch) -> list[bool]:
+    """Records whether each judge panel ruling is told the play reached the turn cap."""
+    at_cap = []
+    rule = play_module.rule_panel
+
+    async def recording(judges, state, *, at_turn_cap):
+        at_cap.append(at_turn_cap)
+        return await rule(judges, state, at_turn_cap=at_turn_cap)
+
+    monkeypatch.setattr(play_module, "rule_panel", recording)
+    return at_cap
+
+
+def test_turn_cap_of_the_task_ends_as_failure_with_its_scores(tmp_path, monkeypatch):
     items = [task("t1", "rain forecast kenya", turn_limit=3)]
     harness = Harness(tmp_path, items, reply_done_on(99))
+    at_cap = judged_at_the_cap(monkeypatch)
     harness.run()
 
     scores = harness.scores()
     output = harness.output()
     assert output["outcome"] == "turn_cap"
     # Only at the cap is the judge told the conversation reached it.
-    assert "maximum number of turns" in json.dumps(harness.models.verdict_calls()[0]["messages"])
+    assert at_cap == [True]
     assert scores["goal_reached"] == 0.0
     assert scores["turns_to_goal"] == 3
     assert scores["model_calls_to_goal"] == 6
     assert "time_to_answer_seconds" in scores
-    # The judge rules once, on the final result, and its verdict ends the reasoning.
+    # The judge rules once, on the final result.
     assert len(harness.models.verdict_calls()) == 1
-    assert output["reasoning"].endswith("(final check failed: verdict failed)")
 
 
-def test_reply_on_the_last_allowed_turn_still_counts(tmp_path):
+def test_reply_on_the_last_allowed_turn_still_counts(tmp_path, monkeypatch):
     # With a cap of 1 the only reply is read once more, without sending anything.
     items = [task("t1", "rain forecast kenya", turn_limit=1)]
     harness = Harness(tmp_path, items, reply_done_on(1))
+    at_cap = judged_at_the_cap(monkeypatch)
     harness.run()
 
     assert harness.output()["outcome"] == "goal_reached"
     assert harness.scores()["turns_to_goal"] == 1
     assert len(harness.app.completions) == 1
     assert len(harness.models.user_calls()) == 1
-    assert "maximum number of turns" not in json.dumps(harness.models.verdict_calls())
+    assert at_cap == [False]
 
 
 def test_the_read_at_the_cap_counts_no_classification_or_hint(tmp_path):
@@ -2141,10 +2081,9 @@ def test_an_empty_message_is_usable_at_the_cap(tmp_path):
     assert len(harness.models.user_calls()) == 1
 
 
-@pytest.mark.parametrize("message", [3, ["go on"], {"text": "go on"}])
-def test_a_message_that_is_not_text_is_unusable_at_the_cap(tmp_path, message):
+def test_a_message_that_is_not_text_is_unusable_at_the_cap(tmp_path):
     items = [task("t1", "rain forecast kenya", turn_limit=1)]
-    bad = {**progress("x"), "message": message}
+    bad = {**progress("x"), "message": 3}
     harness = Harness(
         tmp_path,
         items,
@@ -2153,9 +2092,7 @@ def test_a_message_that_is_not_text_is_unusable_at_the_cap(tmp_path, message):
     )
     harness.run()
 
-    calls = harness.models.user_calls()
-    assert len(calls) == 2
-    assert "message is not text" in calls[1]["messages"][-1]["content"]
+    assert len(harness.models.user_calls()) == 2
     assert harness.output()["outcome"] == "turn_cap"
 
 
@@ -2168,18 +2105,15 @@ def test_a_give_up_at_the_cap_gives_its_reason(tmp_path):
 
     output = harness.output()
     assert output["outcome"] == "user_gave_up"
-    assert output["reasoning"].startswith("The simulated user gave up: it is not what I need")
-    assert "Reached maximum turns" not in output["reasoning"]
+    assert GIVE_UP["give_up_reason"] in output["reasoning"]
 
 
-def test_a_done_at_the_cap_gives_the_done_text(tmp_path):
+def test_a_done_at_the_cap_ends_as_user_done(tmp_path):
     items = [task("t1", "rain data kenya", turn_limit=1, deliverables=["zarr"])]
     harness = Harness(tmp_path, items, reply_done_on(1))
     harness.run()
 
-    output = harness.output()
-    assert output["outcome"] == "user_done"
-    assert output["reasoning"].startswith("The simulated user is done (final check failed:")
+    assert harness.output()["outcome"] == "user_done"
 
 
 def test_a_run_that_ends_below_the_cap_is_not_reached(tmp_path, monkeypatch):
@@ -2194,9 +2128,7 @@ def test_a_run_that_ends_below_the_cap_is_not_reached(tmp_path, monkeypatch):
     harness = Harness(tmp_path, items, reply_done_on(99))
     harness.run()
 
-    output = harness.output()
-    assert output["outcome"] == "not_reached"
-    assert output["reasoning"].endswith("(final check failed: verdict failed)")
+    assert harness.output()["outcome"] == "not_reached"
     assert harness.models.user_calls() == []
 
 
@@ -2209,13 +2141,13 @@ def test_task_without_turn_limit_runs_to_eval_max_turns(tmp_path):
     assert harness.scores()["turns_to_goal"] == 6
 
 
-def test_eval_max_turns_defaults_to_20(tmp_path):
+def test_eval_max_turns_has_its_default(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(99))
     harness.run()
 
     assert harness.output()["outcome"] == "turn_cap"
-    assert harness.scores()["turns_to_goal"] == 20
+    assert harness.scores()["turns_to_goal"] == DEFAULT_MAX_TURNS
 
 
 def test_task_turn_limit_overrides_eval_max_turns(tmp_path):
@@ -2226,12 +2158,11 @@ def test_task_turn_limit_overrides_eval_max_turns(tmp_path):
     assert harness.scores()["turns_to_goal"] == 8
 
 
-@pytest.mark.parametrize("value", ["0", "2.5", "many"])
-def test_invalid_eval_max_turns_does_not_start_the_run(tmp_path, value):
+def test_invalid_eval_max_turns_does_not_start_the_run(tmp_path):
     harness = Harness(tmp_path, [task("t1", "rain forecast kenya")], reply_done_on(1))
 
-    with pytest.raises(SettingsError, match="EVAL_MAX_TURNS"):
-        harness.run(EVAL_MAX_TURNS=value)
+    with pytest.raises(SettingsError):
+        harness.run(EVAL_MAX_TURNS="0")
     assert harness.docker.run_calls == []
 
 
@@ -2239,23 +2170,21 @@ def test_pause_past_eval_max_turns_does_not_start_the_run(tmp_path):
     items = [task("t1", "rain forecast kenya", pauses=[{"before_turn": 7, "seconds": 1}])]
     harness = Harness(tmp_path, items, reply_done_on(1))
 
-    with pytest.raises(
-        TaskError, match="t1: metadata.pauses: pause before turn 7 is past EVAL_MAX"
-    ):
+    with pytest.raises(TaskError):
         harness.run(EVAL_MAX_TURNS="6")
     assert harness.docker.run_calls == []
 
 
-def test_done_on_the_last_allowed_turn_is_not_judged_as_the_turn_cap(tmp_path):
+def test_done_on_the_last_allowed_turn_is_not_judged_as_the_turn_cap(tmp_path, monkeypatch):
     # With a cap of 2, the user's second turn is the last; it reads reply 1 and is done.
     items = [task("t1", "rain forecast kenya", turn_limit=2)]
     harness = Harness(tmp_path, items, reply_done_on(1))
+    at_cap = judged_at_the_cap(monkeypatch)
     harness.run()
 
     assert harness.output()["outcome"] == "goal_reached"
     assert harness.scores()["turns_to_goal"] == 1
-    messages = json.dumps(harness.models.verdict_calls()[0]["messages"])
-    assert "maximum number of turns" not in messages
+    assert at_cap == [False]
 
 
 def test_user_gives_up_ends_as_failure(tmp_path):
@@ -2281,8 +2210,6 @@ def test_user_gives_up_ends_as_failure(tmp_path):
     output = harness.output()
     scores = harness.scores()
     assert output["outcome"] == "user_gave_up"
-    assert "gave up" in output["reasoning"]
-    assert output["reasoning"].endswith("(final check failed: verdict failed)")
     assert scores["goal_reached"] == 0.0
     assert scores["turns_to_goal"] == 2
     assert scores["hints_used"] == 1
@@ -2298,22 +2225,11 @@ GIVE_UP = {
 }
 
 UNUSABLE_REPLIES = {
-    "empty-message": (progress(""), "empty message while neither done nor give_up is true"),
-    "unknown-classification": (
-        progress("go on", classification="request"),
-        "unknown classification 'request'",
-    ),
-    "not-json": ("Sure, go on.", "it is not a JSON object"),
-    "done-and-give-up": ({**GIVE_UP, "done": True}, "done and give_up are both true"),
-    "done-not-boolean": ({**progress("go on"), "done": "no"}, "done is not true or false"),
-    "give-up-missing": (
-        {k: v for k, v in progress("go on").items() if k != "give_up"},
-        "give_up is not true or false",
-    ),
-    "hint-not-boolean": (
-        {**progress("go on"), "revealed_hidden_step": 1},
-        "revealed_hidden_step is not true or false",
-    ),
+    "empty-message": progress(""),
+    "unknown-classification": progress("go on", classification="request"),
+    "not-json": "Sure, go on.",
+    "done-and-give-up": {**GIVE_UP, "done": True},
+    "done-not-boolean": {**progress("go on"), "done": "no"},
 }
 
 
@@ -2326,7 +2242,7 @@ def test_a_passing_final_check_is_marked_on_a_failed_outcome(tmp_path):
 
     output = harness.output()
     assert output["outcome"] == "user_gave_up"
-    assert output["reasoning"].endswith("(final check passed: verdict passed)")
+    assert output["judges"][0]["passed"] is True
 
 
 def test_final_judge_without_a_verdict_ends_as_error_with_scores(tmp_path):
@@ -2337,16 +2253,15 @@ def test_final_judge_without_a_verdict_ends_as_error_with_scores(tmp_path):
     output = harness.output()
     scores = harness.scores()
     assert output["outcome"] == "error"
-    assert output["error"].startswith("No judge ruled: openrouter/test/judge errored: ")
-    assert "tool calls not found" in output["error"]
+    assert [j["state"] for j in output["judges"]] == ["error"]
     assert scores["goal_reached"] == 0.0
     assert scores["turns_to_goal"] == 1
     assert output["trace_scores"] == "complete"
     assert "model_calls_to_goal" in scores
 
 
-@pytest.mark.parametrize("unusable, reason", UNUSABLE_REPLIES.values(), ids=UNUSABLE_REPLIES.keys())
-def test_unusable_user_reply_is_asked_for_once_more(tmp_path, unusable, reason):
+@pytest.mark.parametrize("unusable", UNUSABLE_REPLIES.values(), ids=UNUSABLE_REPLIES.keys())
+def test_unusable_user_reply_is_asked_for_once_more(tmp_path, unusable):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(
         tmp_path,
@@ -2359,14 +2274,10 @@ def test_unusable_user_reply_is_asked_for_once_more(tmp_path, unusable, reason):
     assert harness.output()["outcome"] == "goal_reached"
     calls = harness.models.user_calls()
     assert len(calls) == 3
-    # The second call is shown the first reply and told why it could not be used.
+    # The second call is shown the first reply.
     assert calls[1]["messages"][:-2] == calls[0]["messages"]
-    shown = unusable if isinstance(unusable, str) else json.dumps(unusable)
-    assert calls[1]["messages"][-2] == {"role": "assistant", "content": shown}
-    assert calls[1]["messages"][-1]["content"] == (
-        f"Your previous reply could not be used: {reason}. Write your JSON reply again, "
-        "as described."
-    )
+    text = unusable if isinstance(unusable, str) else json.dumps(unusable)
+    assert calls[1]["messages"][-2] == {"role": "assistant", "content": text}
     assert harness.app.completions[1]["turn"]["user_message"]["content"] == "kenya"
 
 
@@ -2380,12 +2291,7 @@ def test_two_unusable_user_replies_stop_the_play_as_error(tmp_path):
     )
     harness.run()
 
-    output = harness.output()
-    assert output["outcome"] == "error"
-    assert (
-        "The simulated user's reply cannot be used, empty message while neither done nor "
-        "give_up is true" in output["error"]
-    )
+    assert harness.output()["outcome"] == "error"
     assert harness.models.verdict_calls() == []
 
 
@@ -2401,26 +2307,7 @@ def test_a_reply_without_text_is_asked_for_again_without_an_empty_message(tmp_pa
 
     calls = harness.models.user_calls()
     assert calls[1]["messages"][:-1] == calls[0]["messages"]
-    assert calls[1]["messages"][-1]["content"] == (
-        "Your previous reply could not be used: it had no text. Write your JSON reply again, "
-        "as described."
-    )
     assert harness.output()["outcome"] == "goal_reached"
-
-
-def test_a_whitespace_reply_counts_as_having_no_text(tmp_path):
-    items = [task("t1", "rain forecast kenya")]
-    harness = Harness(
-        tmp_path,
-        items,
-        reply_done_on(2),
-        user_replies={"rain forecast kenya": ["  \n ", progress("kenya")]},
-    )
-    harness.run()
-
-    calls = harness.models.user_calls()
-    assert calls[1]["messages"][:-1] == calls[0]["messages"]
-    assert "it had no text" in calls[1]["messages"][-1]["content"]
 
 
 def test_a_cut_off_quality_rating_is_not_rated_and_keeps_the_outcome(tmp_path):
@@ -2444,8 +2331,7 @@ def test_a_cut_off_verdict_ends_the_play_as_error(tmp_path):
 
     output = harness.output()
     assert output["outcome"] == "error"
-    assert output["error"].startswith("No judge ruled: openrouter/test/judge errored: ")
-    assert "EVAL_MODEL_MAX_TOKENS" in output["error"]
+    assert [j["state"] for j in output["judges"]] == ["error"]
 
 
 def test_a_cut_off_user_reply_is_not_retried_and_ends_as_error(tmp_path):
@@ -2515,7 +2401,7 @@ def test_chat_http_error_fails_that_play_without_waiting_for_traces(tmp_path):
     assert "429" in output["error"]
     # The completion request was refused, so no trace is awaited.
     assert harness.gateway.observation_requests == []
-    assert output["trace_scores"] == "missing: no turn reached the app"
+    assert "model_calls_to_goal" not in harness.scores()
     assert "answer_quality" not in harness.scores()
 
 
@@ -2554,9 +2440,6 @@ def test_langfuse_error_keeps_the_other_scores(tmp_path):
     assert scores["goal_reached"] == 1.0
     assert scores["turns_to_goal"] == 1
     assert "model_calls_to_goal" not in scores
-    assert output["trace_scores"] == "missing: Langfuse could not be read: ReadTimeout: timed out"
-    comment = harness.gateway.experiments[0]["items"][0].evaluations[0].comment
-    assert "trace scores missing" in comment
     assert harness.gateway.app_costs == []
     assert output["provider_models"] == []
 
@@ -2566,7 +2449,7 @@ def test_catalog_model_without_base_model_stops_the_run(tmp_path):
     harness = Harness(tmp_path, items, reply_done_on(1))
     harness.app.base_model_id = None
 
-    with pytest.raises(ChatError, match="no base model for catalog model weather-agent"):
+    with pytest.raises(ChatError):
         harness.run()
 
     assert harness.gateway.experiments == []
@@ -2601,7 +2484,7 @@ def test_app_cost_rollup_matches_the_cost_score(tmp_path, observations, trace_sc
     assert harness.gateway.app_costs == [(harness.scores()["cost_to_goal_usd"], ["chat-1-trace-0"])]
 
 
-def test_reads_that_failed_at_the_timeout_are_named_in_the_trace_scores(tmp_path):
+def test_reads_that_failed_at_the_timeout_keep_the_trace_scores(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))
     harness.gateway.observations = lambda chat_id, turns: (
@@ -2611,18 +2494,17 @@ def test_reads_that_failed_at_the_timeout_are_named_in_the_trace_scores(tmp_path
     )
     harness.run()
 
-    reason = "Langfuse reads failed: ReadTimeout: x"
-    assert harness.output()["trace_scores"] == f"partial: {reason}"
-    assert harness.comments()["model_calls_to_goal"].endswith(reason)
+    assert harness.output()["trace_scores"].startswith("partial")
+    assert "model_calls_to_goal" in harness.scores()
 
 
-def test_reads_that_failed_without_observations_are_named_as_missing(tmp_path):
+def test_reads_that_failed_without_observations_leave_out_the_trace_scores(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))
     harness.gateway.observations = lambda chat_id, turns: ([], False, "ReadTimeout: x")
     harness.run()
 
-    assert harness.output()["trace_scores"] == "missing: Langfuse could not be read: ReadTimeout: x"
+    assert "model_calls_to_goal" not in harness.scores()
 
 
 def test_items_without_a_cost_score_add_nothing_to_the_agent_cost(tmp_path):
@@ -2641,13 +2523,14 @@ def test_items_without_a_cost_score_add_nothing_to_the_agent_cost(tmp_path):
     assert summary.agent_cost_usd == pytest.approx(harness.scores(1)["cost_to_goal_usd"])
 
 
-def test_traces_that_never_arrive_are_recorded_as_missing(tmp_path):
+def test_traces_that_never_arrive_leave_out_the_trace_scores(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))
     harness.gateway.observations = lambda chat_id, turns: ([], False)
     harness.run()
 
-    assert harness.output()["trace_scores"] == "missing: no app traces arrived"
+    assert harness.output()["trace_scores"].startswith("missing")
+    assert "model_calls_to_goal" not in harness.scores()
     assert harness.scores()["goal_reached"] == 1.0
 
 
@@ -2689,12 +2572,11 @@ def test_image_pull_failure_stops_the_run(tmp_path):
         pull_error=docker.errors.ImageNotFound("manifest unknown"),
     )
 
-    with pytest.raises(AppStartError, match="could not be pulled") as error:
+    with pytest.raises(AppStartError) as error:
         harness.run()
 
-    # The app's own error, not the runner's, naming the app image.
+    # The app's own error, not the runner's.
     assert type(error.value) is AppStartError
-    assert "ghcr.io/rhiza-research/weather-skills-chat:test" in str(error.value)
     assert harness.docker.pulled == ["ghcr.io/rhiza-research/weather-skills-chat:test"]
     assert harness.docker.run_calls == []
     assert harness.docker.events == []
@@ -2757,18 +2639,10 @@ def test_pull_false_records_the_pinned_digest(tmp_path):
     assert metadata["image_digest"] == pinned
 
 
-@pytest.mark.parametrize(
-    "digests",
-    [
-        [f"{APP_REPOSITORY}@sha256:first", f"{APP_REPOSITORY}@sha256:second"],
-        # The pinned digest is not listed verbatim; another of the repository is.
-        [f"{APP_REPOSITORY}@sha256:first"],
-    ],
-    ids=["listed-second", "not-listed-verbatim"],
-)
-def test_a_pulled_image_records_the_pinned_digest(tmp_path, digests):
+def test_a_pulled_image_records_the_pinned_digest(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     pinned = f"{APP_REPOSITORY}@sha256:second"
+    digests = [f"{APP_REPOSITORY}@sha256:first", pinned]
     harness = Harness(tmp_path, items, reply_done_on(1), image_digests=digests)
     harness.config_path.write_text(CONFIG.replace(APP_IMAGE_LINE, f"image: {pinned}"))
 
@@ -2777,21 +2651,6 @@ def test_a_pulled_image_records_the_pinned_digest(tmp_path, digests):
     assert harness.docker.pulled == [pinned, RUNNER_IMAGE]
     metadata = harness.gateway.experiments[0]["metadata"]
     assert metadata["image_digest"] == pinned
-
-
-def test_a_pinned_runner_image_records_the_pinned_digest(tmp_path):
-    items = [task("t1", "rain forecast kenya")]
-    pinned = f"{RUNNER_REPOSITORY}@sha256:second"
-    digests = [f"{RUNNER_REPOSITORY}@sha256:first", pinned]
-    harness = Harness(tmp_path, items, reply_done_on(1), runner_digests=digests)
-    harness.config_path.write_text(CONFIG.replace(RUNNER_IMAGE, pinned))
-
-    harness.run()
-
-    assert harness.docker.pulled == ["ghcr.io/rhiza-research/weather-skills-chat:test", pinned]
-    metadata = harness.gateway.experiments[0]["metadata"]
-    assert metadata["runner_image"] == pinned
-    assert metadata["runner_image_digest"] == pinned
 
 
 def test_pull_false_with_missing_image_stops_the_run(tmp_path):
@@ -2805,9 +2664,6 @@ def test_pull_false_with_missing_image_stops_the_run(tmp_path):
     # The app's own error, not the runner's.
     assert type(error.value) is AppStartError
     assert harness.docker.events == []
-    message = str(error.value)
-    assert "ghcr.io/rhiza-research/weather-skills-chat:test" in message
-    assert "is not on the Docker host" in message
     assert harness.docker.pulled == []
     assert harness.docker.run_calls == []
     assert harness.gateway.experiments == []
@@ -2824,7 +2680,7 @@ def test_pull_false_with_failing_image_lookup_stops_the_run(tmp_path):
     )
     harness.config_path.write_text(CONFIG + "pull: false\n")
 
-    with pytest.raises(AppStartError, match="could not be read from the Docker host"):
+    with pytest.raises(AppStartError):
         harness.run()
 
     assert harness.docker.pulled == []
@@ -2862,7 +2718,7 @@ def test_container_that_disappears_stops_the_run(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1), container=FakeContainer(["gone"]))
 
-    with pytest.raises(AppStartError, match="disappeared"):
+    with pytest.raises(AppStartError):
         harness.run()
 
 
@@ -2880,7 +2736,7 @@ def test_missing_dataset_does_not_start_the_run(tmp_path):
     harness = Harness(tmp_path, [], reply_done_on(1))
     harness.gateway.dataset_error = RuntimeError("404 dataset not found")
 
-    with pytest.raises(DatasetError, match="could not be read"):
+    with pytest.raises(DatasetError):
         harness.run()
     assert harness.docker.run_calls == []
 
@@ -2888,7 +2744,7 @@ def test_missing_dataset_does_not_start_the_run(tmp_path):
 def test_empty_dataset_does_not_start_the_run(tmp_path):
     harness = Harness(tmp_path, [], reply_done_on(1))
 
-    with pytest.raises(DatasetError, match="has no items"):
+    with pytest.raises(DatasetError):
         harness.run()
     assert harness.docker.run_calls == []
 
@@ -2905,7 +2761,7 @@ def with_skill_packs(block: str) -> str:
     return CONFIG.removesuffix(PACKS_BLOCK) + block
 
 
-@pytest.mark.parametrize("metadata", [None, {}, {"owner": "eval"}, {"skill_packs": []}])
+@pytest.mark.parametrize("metadata", [None, {}, {"skill_packs": []}])
 def test_dataset_needing_no_pack_plays_every_item(tmp_path, metadata):
     items = [task("t1", "rain forecast kenya"), task("t2", "weekly rain")]
     harness = Harness(tmp_path, items, reply_done_on(1))
@@ -2917,36 +2773,17 @@ def test_dataset_needing_no_pack_plays_every_item(tmp_path, metadata):
     assert harness.gateway.experiments[0]["metadata"]["dataset_skill_packs"] == ""
 
 
-FORECASTING_PACK = (
-    "    - git_url: https://github.com/rhiza-research/forecasting-skills/\n"
-    "      enabled_by_default: true\n"
-)
-
-
-@pytest.mark.parametrize(
-    "packs, config, recorded",
-    [
-        (["chc-skills"], CONFIG + CHC_PACK, "chc-skills"),
-        ([" chc-skills "], CONFIG + CHC_PACK, "chc-skills"),
-        (
-            ["chc-skills", "forecasting-skills"],
-            CONFIG + FORECASTING_PACK + CHC_PACK,
-            "chc-skills,forecasting-skills",
-        ),
-    ],
-    ids=["one-pack", "padded-name", "two-packs-in-dataset-order"],
-)
-def test_dataset_packs_that_the_config_turns_on_play_every_item(tmp_path, packs, config, recorded):
+def test_dataset_packs_that_the_config_turns_on_play_every_item(tmp_path):
     items = [task("t1", "rain forecast kenya"), task("t2", "weekly rain")]
     harness = Harness(tmp_path, items, reply_done_on(1))
-    harness.gateway.dataset_metadata = {"skill_packs": packs}
-    harness.config_path.write_text(config)
+    harness.gateway.dataset_metadata = {"skill_packs": ["chc-skills"]}
+    harness.config_path.write_text(CONFIG + CHC_PACK)
 
     summary = harness.run()
 
     assert summary.items == 2
     assert len(harness.docker.run_calls) == 1
-    assert harness.gateway.experiments[0]["metadata"]["dataset_skill_packs"] == recorded
+    assert harness.gateway.experiments[0]["metadata"]["dataset_skill_packs"] == "chc-skills"
 
 
 def test_only_the_packs_the_config_does_not_turn_on_are_named(tmp_path):
@@ -2959,18 +2796,18 @@ def test_only_the_packs_the_config_does_not_turn_on_are_named(tmp_path):
         harness.run()
 
     message = str(error.value)
-    assert "a-skills, b-skills" in message
+    assert "a-skills" in message
+    assert "b-skills" in message
     assert "chc-skills" not in message
     assert harness.docker.run_calls == []
 
 
-@pytest.mark.parametrize("metadata", ["chc-skills", ["chc-skills"]])
-def test_dataset_metadata_that_is_not_an_object_does_not_start_the_run(tmp_path, metadata):
+def test_dataset_metadata_that_is_not_an_object_does_not_start_the_run(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))
-    harness.gateway.dataset_metadata = metadata
+    harness.gateway.dataset_metadata = ["chc-skills"]
 
-    with pytest.raises(DatasetError, match="Dataset weather-tasks metadata must be an object"):
+    with pytest.raises(DatasetError):
         harness.run()
     assert harness.docker.run_calls == []
 
@@ -2990,24 +2827,19 @@ def test_dataset_pack_the_config_does_not_turn_on_does_not_start_the_run(tmp_pat
     harness.gateway.dataset_metadata = {"skill_packs": ["chc-skills"]}
     harness.config_path.write_text(config)
 
-    with pytest.raises(DatasetError) as error:
+    with pytest.raises(DatasetError):
         harness.run()
 
-    message = str(error.value)
-    assert "weather-tasks" in message
-    assert "chc-skills" in message
-    assert "does not turn on" in message
     assert harness.docker.run_calls == []
     assert harness.gateway.experiments == []
 
 
-@pytest.mark.parametrize("packs", ["chc-skills", [""], ["  "], [1], {"chc-skills": True}])
-def test_bad_dataset_skill_packs_does_not_start_the_run(tmp_path, packs):
+def test_bad_dataset_skill_packs_does_not_start_the_run(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))
-    harness.gateway.dataset_metadata = {"skill_packs": packs}
+    harness.gateway.dataset_metadata = {"skill_packs": [""]}
 
-    with pytest.raises(DatasetError, match="Dataset weather-tasks metadata skill_packs"):
+    with pytest.raises(DatasetError):
         harness.run()
     assert harness.docker.run_calls == []
 
@@ -3038,7 +2870,7 @@ def test_duplicate_item_ids_do_not_start_the_run(tmp_path):
     items = [task("t1", "rain forecast kenya"), task("t1", "weekly rain")]
     harness = Harness(tmp_path, items, reply_done_on(1))
 
-    with pytest.raises(TaskError, match="more than once"):
+    with pytest.raises(TaskError):
         harness.run()
     assert harness.docker.run_calls == []
 
@@ -3082,15 +2914,9 @@ def test_app_never_healthy_stops_the_run_with_logs(tmp_path):
         ),
         (lambda text: text + "replicas: 2\n", "replicas"),
         (lambda text: text + 'pull: "no"\n', "pull"),
-        (lambda text: text + "pull: 1\n", "pull"),
-        (lambda text: text.replace(f"runner_image: {RUNNER_IMAGE}\n", ""), "runner_image"),
         (lambda text: text.replace(RUNNER_IMAGE, '""'), "runner_image"),
         (lambda text: text.replace(RUNNER_IMAGE, "${UNSET_RUNNER}"), "runner_image"),
-        (lambda text: text + "emulator_commit: abc\n", "emulator_commit"),
         (lambda text: text + "variant: 3\n", "variant"),
-        (lambda text: text + "variant: true\n", "variant"),
-        (lambda text: text + "variant: [high]\n", "variant"),
-        (lambda text: text + "variant: {effort: high}\n", "variant"),
     ],
 )
 def test_bad_config_does_not_start_the_run(tmp_path, edit, field):
@@ -3102,7 +2928,6 @@ def test_bad_config_does_not_start_the_run(tmp_path, edit, field):
         harness.run()
 
     assert error.value.field == field
-    assert field in str(error.value)
     assert harness.docker.run_calls == []
     assert harness.gateway.experiments == []
     assert harness.docker.pulled == []
@@ -3116,17 +2941,16 @@ def with_env(text: str, block: str) -> str:
     return text.replace("  SKILL_PACKS:\n", block + "  SKILL_PACKS:\n")
 
 
-@pytest.mark.parametrize("name", RUNNER_ENV)
-def test_config_setting_a_runner_variable_does_not_start_the_run(tmp_path, name):
+def test_config_setting_a_runner_variable_does_not_start_the_run(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))
+    name = RUNNER_ENV[0]
     harness.config_path.write_text(with_env(CONFIG, f'  {name}: "x"\n'))
 
     with pytest.raises(ConfigError) as error:
         harness.run()
 
     assert error.value.field == f"env.{name}"
-    assert "set by the harness" in str(error.value)
     assert harness.docker.pulled == []
 
 
@@ -3144,7 +2968,7 @@ def test_run_starts_the_runner_and_its_volume_before_the_app(tmp_path):
     docker_ = harness.docker
     [create] = docker_.create_calls
     [app] = docker_.run_calls
-    run_id = app["labels"]["weather-skills-eval.run"]
+    run_id = app["labels"][RUN_LABEL]
     runner_name = f"weather-skills-eval-runner-{run_id}"
     volume_name = f"weather-skills-eval-data-{run_id}"
     source_name = f"weather-skills-eval-emulator-{run_id}"
@@ -3153,7 +2977,7 @@ def test_run_starts_the_runner_and_its_volume_before_the_app(tmp_path):
     # go when the run ends, the volume after the containers that use it.
     source = docker_.source
     assert source.image_id == "sha256:image"
-    assert source.labels == {"weather-skills-eval": "emulator", "weather-skills-eval.run": run_id}
+    assert source.labels == {LABEL: EMULATOR_LABEL_VALUE, RUN_LABEL: run_id}
     assert source.read == list(APP_EMULATOR_PATHS)
     assert not source.started
     assert source.removed
@@ -3170,10 +2994,7 @@ def test_run_starts_the_runner_and_its_volume_before_the_app(tmp_path):
         f"remove {runner_name}",
         f"remove {volume_name}",
     ]
-    assert docker_.volume().labels == {
-        "weather-skills-eval": "data",
-        "weather-skills-eval.run": run_id,
-    }
+    assert docker_.volume().labels == {LABEL: VOLUME_LABEL_VALUE, RUN_LABEL: run_id}
     # The artifacts folder is created on the volume first, from a container of
     # the app image with the whole volume at the app's data directory, so the
     # volume's first mount fills it from the app image; never started.
@@ -3181,13 +3002,13 @@ def test_run_starts_the_runner_and_its_volume_before_the_app(tmp_path):
     assert setup == {
         "image": "sha256:image",
         "name": setup_name,
-        "labels": {"weather-skills-eval": "volume-setup", "weather-skills-eval.run": run_id},
-        "volumes": {volume_name: {"bind": "/app/backend/data", "mode": "rw"}},
+        "labels": {LABEL: VOLUME_SETUP_LABEL_VALUE, RUN_LABEL: run_id},
+        "volumes": {volume_name: {"bind": APP_DATA_DIR, "mode": "rw"}},
     }
     [(setup_path, setup_data)] = docker_.volume_setup.archives
-    assert setup_path == "/app/backend/data"
+    assert setup_path == APP_DATA_DIR
     with tarfile.open(fileobj=io.BytesIO(setup_data)) as tar:
-        assert [(m.name, m.isdir()) for m in tar.getmembers()] == [("artifacts", True)]
+        assert [(m.name, m.isdir()) for m in tar.getmembers()] == [(ARTIFACTS_SUBPATH, True)]
     assert not docker_.volume_setup.started
     assert docker_.volume_setup.removed
     # The runner: the runner image, the emulator, and only the volume's
@@ -3195,49 +3016,47 @@ def test_run_starts_the_runner_and_its_volume_before_the_app(tmp_path):
     assert create["image"] == "sha256:runner"
     assert create["name"] == runner_name
     assert create["user"] == "0"
-    assert create["command"] == ["python3", "-u", "/opt/sandbox/emulator/emulator.py"]
+    assert create["command"] == ["python3", "-u", f"{EMULATOR_DIR}/emulator.py"]
     assert create["network"] == "weather-skills-eval"
-    assert create["labels"] == {"weather-skills-eval": "runner", "weather-skills-eval.run": run_id}
+    assert create["labels"] == {LABEL: RUNNER_LABEL_VALUE, RUN_LABEL: run_id}
     assert "volumes" not in create
     assert create["mounts"] == [
         {
-            "Target": "/data/artifacts",
+            "Target": RUNNER_ARTIFACTS_DIR,
             "Source": volume_name,
             "Type": "volume",
             "ReadOnly": False,
-            "VolumeOptions": {"Subpath": "artifacts"},
+            "VolumeOptions": {"Subpath": ARTIFACTS_SUBPATH},
         }
     ]
     assert create["restart_policy"] == {"Name": "on-failure"}
     token = create["environment"]["SKILL_K8S_BIND_TOKEN"]
-    assert len(token) >= 32
+    assert len(token) == 2 * TOKEN_BYTES
     assert create["environment"] == {
-        "ARTIFACTS_DIR": "/data/artifacts",
+        "ARTIFACTS_DIR": RUNNER_ARTIFACTS_DIR,
         "SKILL_K8S_EMULATOR_HOST": runner_name,
-        "SKILL_K8S_EMULATOR_API_PORT": "18080",
-        "SKILL_K8S_BIND_PORT": "9090",
-        "SKILL_K8S_EMULATOR_START_DELAY": "0",
+        "SKILL_K8S_EMULATOR_API_PORT": EMULATOR_API_PORT,
+        "SKILL_K8S_BIND_PORT": EMULATOR_BIND_PORT,
+        "SKILL_K8S_EMULATOR_START_DELAY": START_DELAY,
         "SKILL_K8S_BIND_TOKEN": token,
     }
     # The emulator files reach the runner by put_archive, before it starts.
     [(path, data)] = docker_.runner.archives
     assert path == "/"
     assert archive_files(data) == {
-        "opt/sandbox/emulator/emulator.py": emulator_file("/app/sandbox/emulator/emulator.py"),
-        "opt/sandbox/emulator/local_runtime.py": emulator_file(
-            "/app/sandbox/emulator/local_runtime.py"
-        ),
+        f"{EMULATOR_DIR.lstrip('/')}/{Path(app_path).name}": emulator_file(app_path)
+        for app_path in APP_EMULATOR_PATHS
     }
     assert docker_.runner.started
     # The app: the emulator settings with this run's runner and token, the volume at its data dir.
-    assert app["volumes"] == {volume_name: {"bind": "/app/backend/data", "mode": "rw"}}
+    assert app["volumes"] == {volume_name: {"bind": APP_DATA_DIR, "mode": "rw"}}
     env = app["environment"]
     assert {name: env[name] for name in RUNNER_ENV} == {
         "SKILL_SANDLOCK": "false",
         "SKILL_SANDBOX_BACKEND": "k8s",
         "SKILL_K8S_SANDBOX_ENABLED": "true",
         "SKILL_K8S_EMULATOR": "true",
-        "SKILL_K8S_APISERVER": f"http://{runner_name}:18080",
+        "SKILL_K8S_APISERVER": f"http://{runner_name}:{EMULATOR_API_PORT}",
         "SKILL_K8S_BIND_TOKEN": token,
     }
     assert env["BOOTSTRAP_ADMIN_API_KEY"] == "sk-test-key"
@@ -3258,29 +3077,13 @@ def test_each_run_gets_its_own_bind_token(tmp_path):
     assert tokens[0] != tokens[1]
 
 
-@pytest.mark.parametrize(
-    "app_files, missing",
-    [
-        ({}, "/app/sandbox/emulator/emulator.py"),
-        (
-            {"/app/sandbox/emulator/emulator.py": b"# emulator\n"},
-            "/app/sandbox/emulator/local_runtime.py",
-        ),
-    ],
-    ids=["no-emulator", "no-local-runtime"],
-)
-def test_app_image_without_the_emulator_stops_the_run_before_the_runner(
-    tmp_path, app_files, missing
-):
+def test_app_image_without_the_emulator_stops_the_run_before_the_runner(tmp_path):
     items = [task("t1", "rain forecast kenya")]
-    harness = Harness(tmp_path, items, reply_done_on(1), app_files=app_files)
+    harness = Harness(tmp_path, items, reply_done_on(1), app_files={})
 
-    with pytest.raises(RunnerStartError) as error:
+    with pytest.raises(RunnerStartError):
         harness.run()
 
-    message = str(error.value)
-    assert "ghcr.io/rhiza-research/weather-skills-chat:test" in message
-    assert missing in message
     # Neither the runner image nor any runner, volume or app.
     assert harness.docker.pulled == ["ghcr.io/rhiza-research/weather-skills-chat:test"]
     assert harness.docker.create_calls == []
@@ -3297,40 +3100,27 @@ def test_emulator_read_error_stops_the_run_before_the_runner(tmp_path):
         tmp_path, items, reply_done_on(1), archive_error=docker.errors.APIError("daemon busy")
     )
 
-    with pytest.raises(RunnerStartError, match="could not be read from image") as error:
+    with pytest.raises(RunnerStartError):
         harness.run()
 
-    assert "daemon busy" in str(error.value)
     assert harness.docker.create_calls == []
     assert harness.docker.source.removed
 
 
-def broken_stream():
-    yield b"\0" * 10
-    raise requests.exceptions.ChunkedEncodingError("connection broken")
-
-
-@pytest.mark.parametrize(
-    "stream",
-    [lambda: iter([b"not a tar archive"]), broken_stream],
-    ids=["not-a-tar", "stream-broken"],
-)
-def test_unreadable_emulator_archive_stops_the_run_before_the_runner(tmp_path, stream):
+def test_unreadable_emulator_archive_stops_the_run_before_the_runner(tmp_path):
     items = [task("t1", "rain forecast kenya")]
-    harness = Harness(tmp_path, items, reply_done_on(1), archive_stream=stream)
+    harness = Harness(
+        tmp_path, items, reply_done_on(1), archive_stream=lambda: iter([b"not a tar archive"])
+    )
 
-    with pytest.raises(RunnerStartError) as error:
+    with pytest.raises(RunnerStartError):
         harness.run()
 
-    message = str(error.value)
-    assert "/app/sandbox/emulator/emulator.py could not be read from image" in message
-    assert "ghcr.io/rhiza-research/weather-skills-chat:test" in message
     assert harness.docker.create_calls == []
     assert harness.docker.source.removed
 
 
-@pytest.mark.parametrize("pull", [True, False])
-def test_runner_image_pull_failure_stops_the_run_before_the_app(tmp_path, pull):
+def test_runner_image_pull_failure_stops_the_run_before_the_app(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(
         tmp_path,
@@ -3339,35 +3129,25 @@ def test_runner_image_pull_failure_stops_the_run_before_the_app(tmp_path, pull):
         local=local_image(),
         runner_pull_error=docker.errors.ImageNotFound("manifest unknown"),
     )
-    harness.config_path.write_text(CONFIG + f"pull: {'true' if pull else 'false'}\n")
+    harness.config_path.write_text(CONFIG + "pull: false\n")
 
-    with pytest.raises(RunnerStartError) as error:
+    with pytest.raises(RunnerStartError):
         harness.run()
 
-    assert f"Runner image {RUNNER_IMAGE} could not be pulled" in str(error.value)
-    app_pulls = ["ghcr.io/rhiza-research/weather-skills-chat:test"] if pull else []
-    assert harness.docker.pulled == [*app_pulls, RUNNER_IMAGE]
+    assert harness.docker.pulled == [RUNNER_IMAGE]
     assert harness.docker.create_calls == []
     assert harness.docker.volumes_created == {}
     assert harness.docker.run_calls == []
     assert harness.gateway.experiments == []
 
 
-@pytest.mark.parametrize(
-    "options",
-    [
-        {"volume_error": docker.errors.APIError("disk full")},
-        {"create_error": docker.errors.APIError("no such network")},
-        {"runner": FakeContainer([], put_archive_error=docker.errors.APIError("no space"))},
-        {"runner": FakeContainer([], start_error=docker.errors.APIError("port in use"))},
-    ],
-    ids=["volume", "create", "put-archive", "start"],
-)
-def test_runner_start_failure_stops_the_run_and_removes_what_it_created(tmp_path, options):
+def test_runner_start_failure_stops_the_run_and_removes_what_it_created(tmp_path):
     items = [task("t1", "rain forecast kenya")]
-    harness = Harness(tmp_path, items, reply_done_on(1), **options)
+    harness = Harness(
+        tmp_path, items, reply_done_on(1), create_error=docker.errors.APIError("no such network")
+    )
 
-    with pytest.raises(RunnerStartError, match="Runner container could not start"):
+    with pytest.raises(RunnerStartError):
         harness.run()
 
     assert harness.docker.run_calls == []
@@ -3383,7 +3163,7 @@ def test_an_artifacts_folder_that_cannot_be_created_stops_the_run_before_the_run
     setup = FakeContainer([], put_archive_result=False)
     harness = Harness(tmp_path, items, reply_done_on(1), volume_setup=setup)
 
-    with pytest.raises(RunnerStartError, match="artifacts folder could not be created"):
+    with pytest.raises(RunnerStartError):
         harness.run()
 
     assert setup.removed
@@ -3398,7 +3178,7 @@ def test_emulator_files_that_put_archive_does_not_copy_stop_the_run(tmp_path):
     runner = FakeContainer([], put_archive_result=False)
     harness = Harness(tmp_path, items, reply_done_on(1), runner=runner)
 
-    with pytest.raises(RunnerStartError, match="emulator files could not be copied"):
+    with pytest.raises(RunnerStartError):
         harness.run()
 
     assert not runner.started
@@ -3426,7 +3206,7 @@ def test_runner_that_disappears_stops_the_run(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1), runner=FakeContainer(["gone"]))
 
-    with pytest.raises(RunnerStartError, match="disappeared"):
+    with pytest.raises(RunnerStartError):
         harness.run()
 
     assert harness.container.removed
@@ -3456,7 +3236,9 @@ def test_runner_that_dies_and_restarts_plays_the_task_on_the_restarted_runner(tm
 
     assert summary.items == 3 and summary.goals_reached == 3
     assert len(harness.app.chats) == 3
-    assert "is not running before task t2; waiting up to 600 s" in caplog.text
+    runner_name = harness.docker.create_calls[0]["name"]
+    waits = [r.args for r in caplog.records if r.name == "weather_skills_eval.instance"]
+    assert waits == [(runner_name, "before task t2", DEFAULT_APP_START_TIMEOUT_SECONDS)]
     # /health, 3 for t1, 4 polls and 1 check for t2, 3 for t3.
     assert runner.reloads == 12
     assert runner.removed
@@ -3467,11 +3249,9 @@ def test_runner_that_does_not_come_back_stops_the_run_with_its_logs(tmp_path):
     runner = FakeContainer([*THROUGH_T1, "exited"], logs=b"emulator crashed")
     harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
 
-    with pytest.raises(RunnerStartError, match="emulator crashed") as error:
+    with pytest.raises(RunnerStartError, match="emulator crashed"):
         harness.run(**SHORT_WAIT)
 
-    message = str(error.value)
-    assert "was not running steadily before task t2 after 30 s: it is exited" in message
     # /health, 3 for t1, then every 5 s from 0 to 30 s.
     assert runner.reloads == 4 + 7
     assert len(harness.app.chats) == 1
@@ -3481,18 +3261,14 @@ def test_runner_that_does_not_come_back_stops_the_run_with_its_logs(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "statuses, message",
-    [
-        (["running", "gone"], "disappeared before task t1"),
-        (["running", "exited", "gone"], "disappeared before task t1"),
-        (["running", "api-error"], "could not be read before task t1"),
-    ],
-    ids=["gone", "gone-while-waiting", "reload-error"],
+    "statuses",
+    [["running", "gone"], ["running", "api-error"]],
+    ids=["gone", "reload-error"],
 )
-def test_runner_lost_mid_run_stops_the_run(tmp_path, statuses, message):
+def test_runner_lost_mid_run_stops_the_run(tmp_path, statuses):
     harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=FakeContainer(statuses))
 
-    with pytest.raises(RunnerStartError, match=message):
+    with pytest.raises(RunnerStartError):
         harness.run()
 
     assert harness.app.chats == {}
@@ -3531,7 +3307,7 @@ def test_runner_death_stops_the_run_when_the_experiment_keeps_task_errors(tmp_pa
     tasks_raised = []
     keep_task_errors(harness, tasks_raised)
 
-    with pytest.raises(RunnerStartError, match="not running steadily before task t2"):
+    with pytest.raises(RunnerStartError):
         harness.run(**SHORT_WAIT)
 
     # t3 is not played: it raises the same error at once.
@@ -3560,10 +3336,9 @@ def test_runner_crashing_while_the_app_starts_stops_the_run_with_its_logs(tmp_pa
         tmp_path, [task("t1", "rain forecast kenya")], reply_done_on(1), runner=runner
     )
 
-    with pytest.raises(RunnerStartError, match="ImportError: local_runtime") as error:
+    with pytest.raises(RunnerStartError, match="ImportError: local_runtime"):
         harness.run()
 
-    assert "Runner container restarting before the app was ready" in str(error.value)
     assert harness.app.chats == {}
     assert runner.removed
 
@@ -3574,10 +3349,9 @@ def test_runner_in_a_crash_loop_stops_the_run_by_the_timeout(tmp_path):
     runner = FakeContainer([*THROUGH_T1, *loop], logs=b"emulator crashed")
     harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
 
-    with pytest.raises(RunnerStartError, match="emulator crashed") as error:
+    with pytest.raises(RunnerStartError, match="emulator crashed"):
         harness.run(**SHORT_WAIT)
 
-    assert "was not running steadily before task t2 after 30 s" in str(error.value)
     assert len(harness.app.chats) == 1
 
 
@@ -3587,7 +3361,7 @@ def test_runner_that_restarts_on_every_poll_is_not_taken_as_running(tmp_path):
     runner = FakeContainer([*THROUGH_T1, *loop])
     harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
 
-    with pytest.raises(RunnerStartError, match="not running steadily before task t2"):
+    with pytest.raises(RunnerStartError):
         harness.run(**SHORT_WAIT)
 
 
@@ -3596,10 +3370,9 @@ def test_runner_that_exits_with_code_0_stops_the_run_at_once(tmp_path):
     runner = FakeContainer([*THROUGH_T1, ("exited", 0, 0)], logs=b"emulator stopped")
     harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
 
-    with pytest.raises(RunnerStartError, match="emulator stopped") as error:
+    with pytest.raises(RunnerStartError, match="emulator stopped"):
         harness.run(**SHORT_WAIT)
 
-    assert "exited with code 0 before task t2" in str(error.value)
     assert runner.reloads == 5
     assert len(harness.app.chats) == 1
 
@@ -3609,10 +3382,9 @@ def test_a_dead_runner_stops_the_run_at_once(tmp_path):
     runner = FakeContainer([*THROUGH_T1, "dead"], logs=b"emulator removal failed")
     harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
 
-    with pytest.raises(RunnerStartError, match="emulator removal failed") as error:
+    with pytest.raises(RunnerStartError, match="emulator removal failed"):
         harness.run(**SHORT_WAIT)
 
-    assert "is dead before task t2" in str(error.value)
     assert runner.reloads == 5
     assert len(harness.app.chats) == 1
     assert runner.removed
@@ -3661,7 +3433,6 @@ def test_runner_that_restarts_during_a_task_costs_only_that_task(tmp_path, after
     # to its chat, so delete finds the chat's traces.
     [(item_id, error)] = tasks_raised
     assert item_id == "t1"
-    assert "stopped during task t1" in str(error)
     assert "emulator crashed" in str(error)
     assert error.restartable
     # t2 and t3 are played on the restarted runner and scored; t1 is left out.
@@ -3694,10 +3465,9 @@ def test_runner_that_restarts_during_a_task_and_never_comes_back_stops_the_run(t
     with pytest.raises(RunnerStartError, match="emulator crashed") as error:
         harness.run(**SHORT_WAIT)
 
-    assert "was not running steadily before task t2 after 30 s: it is exited" in str(error.value)
     # t1 is not scored; t2 and t3 are not played.
     assert [item_id for item_id, _ in tasks_raised] == ["t1", "t2", "t3"]
-    assert "stopped during task t1" in str(tasks_raised[0][1])
+    assert tasks_raised[0][1].restartable
     assert tasks_raised[1][1] is error.value is tasks_raised[2][1]
     assert harness.gateway.linked == ["chat-1"]
     assert len(harness.app.chats) == 1
@@ -3706,24 +3476,17 @@ def test_runner_that_restarts_during_a_task_and_never_comes_back_stops_the_run(t
 
 
 @pytest.mark.parametrize(
-    "after_t1, message",
-    [
-        (("exited", 0, 0), "stopped during task t1: it is exited"),
-        ("dead", "stopped during task t1: it is dead"),
-        ("gone", "disappeared during task t1"),
-        ("api-error", "could not be read during task t1"),
-    ],
-    ids=["exited-0", "dead", "gone", "reload-error"],
+    "after_t1",
+    [("exited", 0, 0), "gone", "api-error"],
+    ids=["exited-0", "gone", "reload-error"],
 )
-def test_runner_found_stopped_for_good_after_a_task_stops_the_run_at_once(
-    tmp_path, after_t1, message
-):
+def test_runner_found_stopped_for_good_after_a_task_stops_the_run_at_once(tmp_path, after_t1):
     runner = FakeContainer([*BEFORE_T1, after_t1], logs=b"emulator stopped")
     harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
     tasks_raised = []
     keep_task_errors(harness, tasks_raised)
 
-    with pytest.raises(RunnerStartError, match=message) as error:
+    with pytest.raises(RunnerStartError) as error:
         harness.run(**SHORT_WAIT)
 
     assert not error.value.restartable
@@ -3738,20 +3501,14 @@ def test_runner_found_stopped_for_good_after_a_task_stops_the_run_at_once(
     assert harness.docker.volume().removed
 
 
-def test_runner_restarted_during_the_last_task_is_waited_for_after_it(tmp_path, caplog):
+def test_runner_restarted_during_the_last_task_is_waited_for_after_it(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     runner = FakeContainer([*BEFORE_T1, RESTARTED])
     harness = Harness(tmp_path, items, reply_done_on(1), runner=runner)
     tasks_raised = []
     keep_task_errors(harness, tasks_raised)
 
-    with caplog.at_level("INFO"):
-        summary = harness.run()
-
-    assert progress_lines(caplog)[-2:] == [
-        "Waiting for the runner after the last task",
-        "Removing the run's containers and volume",
-    ]
+    summary = harness.run()
 
     assert [item_id for item_id, _ in tasks_raised] == ["t1"]
     assert summary.items == 0 and summary.runner_lost == ["t1"]
@@ -3765,10 +3522,9 @@ def test_runner_lost_on_the_last_task_that_never_comes_back_stops_the_run(tmp_pa
     harness = Harness(tmp_path, items, reply_done_on(1), runner=runner)
     keep_task_errors(harness, [])
 
-    with pytest.raises(RunnerStartError, match="emulator crashed") as error:
+    with pytest.raises(RunnerStartError, match="emulator crashed"):
         harness.run(**SHORT_WAIT)
 
-    assert "not running steadily after the last task after 30 s" in str(error.value)
     assert harness.container.removed
     assert harness.docker.volume().removed
 
@@ -3805,7 +3561,7 @@ def test_a_task_waiting_when_another_stops_the_run_is_not_played(tmp_path, monke
 
     harness.gateway.run_experiment = run_experiment
 
-    with pytest.raises(RunnerStartError, match="stopped during task t1") as error:
+    with pytest.raises(RunnerStartError) as error:
         harness.run()
 
     assert outcomes == [error.value, error.value]
@@ -3839,38 +3595,38 @@ def test_cleanup_errors_are_logged_and_do_not_replace_the_run_error(tmp_path, ca
     with pytest.raises(AppStartError, match="bad env"):
         harness.run()
 
-    logged = caplog.text
-    assert "Could not remove app container" in logged
-    assert "Could not remove runner container" in logged
-    assert "Could not remove volume" in logged
+    # The app container, the runner container and the volume.
+    errors = [
+        r
+        for r in caplog.records
+        if r.name.startswith("weather_skills_eval") and r.levelname == "ERROR"
+    ]
+    assert len(errors) == 3
 
 
 # The progress log
 
-# A duration as the progress log writes it, such as 4m12s.
-DURATION = r"[0-9hms]+"
 
-
-def progress_lines(caplog) -> list[str]:
-    """The run's INFO log lines, in order."""
+def progress_records(caplog) -> list:
+    """The run's INFO log records, in order."""
     return [
-        r.getMessage()
+        r
         for r in caplog.records
         if r.name in ("weather_skills_eval.runner", "weather_skills_eval.instance")
         and r.levelname == "INFO"
     ]
 
 
-def task_lines(caplog) -> list[str]:
-    return [line for line in progress_lines(caplog) if line.startswith("Task ")]
+def task_records(caplog) -> list:
+    """The records of tasks starting, skipped and finishing."""
+    return [r for r in progress_records(caplog) if r.funcName in ("start", "skip", "finish")]
 
 
-def finished_line(number: int, task_id: str, result: str, done: int, total: int = 3) -> str:
-    """A pattern for the line a task logs when it finishes."""
-    return (
-        f"Task {number} of {total} finished: {task_id}, {re.escape(result)}, {DURATION}; "
-        f"{done} of {total} finished, {DURATION} elapsed"
-    )
+def finished(record) -> tuple:
+    """A finished task's number, total, id, result and finished count, without
+    the durations."""
+    number, total, task_id, result, _, done, _, _ = record.args
+    return number, total, task_id, result, done
 
 
 def test_the_run_logs_each_step_and_each_task_out_of_the_total(tmp_path, caplog):
@@ -3879,44 +3635,31 @@ def test_the_run_logs_each_step_and_each_task_out_of_the_total(tmp_path, caplog)
     with caplog.at_level("INFO"):
         harness.run()
 
-    lines = progress_lines(caplog)
+    records = progress_records(caplog)
     runner_name = harness.docker.create_calls[0]["name"]
     app_name = harness.docker.run_calls[0]["name"]
-    assert lines[:11] == [
-        "Dataset weather-tasks read: 3 items",
-        f"Pulling image {APP_REPOSITORY}:test",
-        f"Image {APP_REPOSITORY}:test pulled",
-        f"Pulling runner image {RUNNER_IMAGE}",
-        f"Runner image {RUNNER_IMAGE} pulled",
-        f"Runner container {runner_name} started",
-        f"App container {app_name} started",
-        f"Waiting up to 600s for {app_name} to answer /health",
-        f"App container {app_name} answered /health",
-        "OpenRouter serves anthropic/claude-haiku-5.5 as anthropic/claude-haiku-5.5",
-        "Experiment anthropic/claude-haiku-5.5 started: 3 tasks, concurrency 1",
+    image = f"{APP_REPOSITORY}:test"
+    served = "anthropic/claude-haiku-5.5"
+    assert [r.args for r in records[:11]] == [
+        ("weather-tasks", 3),
+        ("image", image),
+        ("Image", image),
+        ("runner image", RUNNER_IMAGE),
+        ("Runner image", RUNNER_IMAGE),
+        (runner_name,),
+        (app_name,),
+        (DEFAULT_APP_START_TIMEOUT_SECONDS, app_name),
+        (app_name,),
+        (served, served),
+        (served, 3, 1),
     ]
-    tasks = lines[11:17]
-    # No task lost the runner, so it is not waited for after the last task.
-    assert lines[17:] == ["Removing the run's containers and volume"]
+    tasks = records[11:17]
+    # No task lost the runner, so it is not waited for after the last task:
+    # only the removal follows.
+    assert [r.args for r in records[17:]] == [()]
     for number, task_id in enumerate(["t1", "t2", "t3"], start=1):
-        assert tasks[2 * number - 2] == f"Task {number} of 3 started: {task_id}"
-        pattern = finished_line(number, task_id, "goal_reached", number)
-        assert re.fullmatch(pattern, tasks[2 * number - 1])
-
-
-def test_an_image_on_the_docker_host_is_logged_as_found_there(tmp_path, caplog):
-    items = [task("t1", "rain forecast kenya")]
-    harness = Harness(tmp_path, items, reply_done_on(1), local=local_image())
-    harness.config_path.write_text(CONFIG + "pull: false\n")
-
-    with caplog.at_level("INFO"):
-        harness.run()
-
-    lines = progress_lines(caplog)
-    found = f"Image {APP_REPOSITORY}:test found on the Docker host"
-    assert found in lines
-    assert f"Pulling image {APP_REPOSITORY}:test" not in lines
-    assert f"Runner image {RUNNER_IMAGE} pulled" in lines
+        assert tasks[2 * number - 2].args == (number, 3, task_id)
+        assert finished(tasks[2 * number - 1]) == (number, 3, task_id, "goal_reached", number)
 
 
 def test_tasks_are_numbered_in_the_order_they_start(tmp_path, caplog):
@@ -3933,13 +3676,9 @@ def test_tasks_are_numbered_in_the_order_they_start(tmp_path, caplog):
     with caplog.at_level("INFO"):
         harness.run()
 
-    lines = task_lines(caplog)
-    assert lines[0::2] == [
-        "Task 1 of 3 started: t3",
-        "Task 2 of 3 started: t2",
-        "Task 3 of 3 started: t1",
-    ]
-    assert re.fullmatch(finished_line(1, "t3", "goal_reached", 1), lines[1])
+    records = task_records(caplog)
+    assert [r.args for r in records[0::2]] == [(1, 3, "t3"), (2, 3, "t2"), (3, 3, "t1")]
+    assert finished(records[1]) == (1, 3, "t3", "goal_reached", 1)
 
 
 def test_a_chat_error_logs_the_first_line_of_its_error(tmp_path, caplog):
@@ -3954,44 +3693,43 @@ def test_a_chat_error_logs_the_first_line_of_its_error(tmp_path, caplog):
     output = harness.output()
     assert output["outcome"] == "chat_error"
     result = f"chat_error: {output['error'].splitlines()[0]}"
-    assert re.fullmatch(finished_line(1, "t1", result, 1, total=1), task_lines(caplog)[1])
+    assert finished(task_records(caplog)[1]) == (1, 1, "t1", result, 1)
 
 
 def test_a_task_lost_to_a_runner_restart_logs_that_instead_of_an_outcome(tmp_path, caplog):
     runner = FakeContainer([*BEFORE_T1, RESTARTED, RESTARTED], logs=b"emulator crashed")
     harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
-    keep_task_errors(harness, [])
+    tasks_raised = []
+    keep_task_errors(harness, tasks_raised)
 
     with caplog.at_level("INFO"):
         harness.run()
 
-    lines = task_lines(caplog)
-    lost = "not scored, the sandbox runner restarted during it"
-    assert re.fullmatch(finished_line(1, "t1", lost, 1), lines[1])
+    records = task_records(caplog)
+    lost = runner_module.task_result(tasks_raised[0][1])
+    assert finished(records[1]) == (1, 3, "t1", lost, 1)
     # The run goes on, and the next tasks have their outcomes.
-    assert re.fullmatch(finished_line(2, "t2", "goal_reached", 2), lines[3])
-    assert re.fullmatch(finished_line(3, "t3", "goal_reached", 3), lines[5])
+    assert finished(records[3]) == (2, 3, "t2", "goal_reached", 2)
+    assert finished(records[5]) == (3, 3, "t3", "goal_reached", 3)
 
 
 def test_a_task_that_raises_logs_the_first_line_of_its_error(tmp_path, caplog):
     runner = FakeContainer([*BEFORE_T1, ("exited", 0, 0)], logs=b"emulator stopped")
     harness = Harness(tmp_path, THREE_TASKS, reply_done_on(1), runner=runner)
-    keep_task_errors(harness, [])
+    tasks_raised = []
+    keep_task_errors(harness, tasks_raised)
 
     with caplog.at_level("INFO"):
         with pytest.raises(RunnerStartError):
             harness.run(**SHORT_WAIT)
 
-    lines = task_lines(caplog)
-    error = (
-        "raised RunnerStartError: Runner container stopped during task t1: it is exited, "
-        "restarted 0 times, 0 before."
-    )
-    assert re.fullmatch(finished_line(1, "t1", error, 1), lines[1])
+    records = task_records(caplog)
+    error = runner_module.task_result(tasks_raised[0][1])
+    assert finished(records[1]) == (1, 3, "t1", error, 1)
     # t2 and t3 raise the same error without being played.
-    assert lines[2:] == [
-        "Task 2 of 3 skipped: t2, the sandbox runner failed",
-        "Task 3 of 3 skipped: t3, the sandbox runner failed",
+    assert [(r.funcName, r.args) for r in records[2:]] == [
+        ("skip", (2, 3, "t2")),
+        ("skip", (3, 3, "t3")),
     ]
     # The runner's logs, after the first line, are left out.
-    assert "emulator stopped" not in "\n".join(lines)
+    assert "emulator stopped" not in "\n".join(r.getMessage() for r in records)

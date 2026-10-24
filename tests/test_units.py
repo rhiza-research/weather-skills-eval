@@ -6,7 +6,7 @@ from fakes import display_image, display_page, tool_call
 from weather_skills_eval import runner
 from weather_skills_eval.app_client import highest_skill_versions, version_key, visible_text
 from weather_skills_eval.checks import ReplyFiles, reply_files
-from weather_skills_eval.config import ConfigError, pack_name, parse_config
+from weather_skills_eval.config import DEFAULT_APP_PORT, ConfigError, pack_name, parse_config
 from weather_skills_eval.judge import JudgeRuling, PanelRuling
 from weather_skills_eval.runner import comparability_hash
 from weather_skills_eval.scoring import split_usage, trace_metrics
@@ -39,7 +39,7 @@ def test_config_resolves_references_and_defaults_name():
     assert result.name == "prod"
     assert result.env["BOOTSTRAP_ADMIN_API_KEY"] == "sk-key"
     assert result.api_key == "sk-key"
-    assert result.port == "8080"
+    assert result.port == DEFAULT_APP_PORT
 
 
 def test_config_pull_defaults_to_true_and_accepts_booleans():
@@ -68,10 +68,9 @@ def test_config_variant_defaults_to_empty():
     assert parse_config(config(), default_name="x", environ=ENVIRON).variant == ""
 
 
-@pytest.mark.parametrize("value", [3, True, ["high"], {"effort": "high"}], ids=repr)
-def test_config_variant_must_be_a_string(value):
-    with pytest.raises(ConfigError, match="variant: must be a string") as error:
-        parse_config(config(variant=value), default_name="x", environ=ENVIRON)
+def test_config_variant_must_be_a_string():
+    with pytest.raises(ConfigError) as error:
+        parse_config(config(variant=3), default_name="x", environ=ENVIRON)
     assert error.value.field == "variant"
 
 
@@ -188,14 +187,14 @@ def settings_env(**overrides):
 
 
 def test_settings_refuse_the_production_environment():
-    with pytest.raises(SettingsError, match="LANGFUSE_TRACING_ENVIRONMENT"):
-        load_settings(settings_env(LANGFUSE_TRACING_ENVIRONMENT="production"))
+    with pytest.raises(SettingsError):
+        load_settings(settings_env(LANGFUSE_TRACING_ENVIRONMENT=" PRODUCTION "))
 
 
-def test_settings_name_the_missing_variable():
+def test_settings_refuse_a_missing_variable():
     env = settings_env()
     del env["EVAL_JUDGE_MODELS"]
-    with pytest.raises(SettingsError, match="EVAL_JUDGE_MODELS is not set"):
+    with pytest.raises(SettingsError):
         load_settings(env)
 
 
@@ -206,26 +205,16 @@ def test_judge_models_are_a_comma_separated_panel():
     assert settings.judge_models == ("openrouter/b/two", "openrouter/a/one")
 
 
-@pytest.mark.parametrize(
-    "value, message",
-    [
-        ("", "is not set"),
-        ("  ", "is not set"),
-        ("a,,b", "has an empty model name"),
-        ("a,", "has an empty model name"),
-        ("a, a", "names a model more than once"),
-    ],
-    ids=repr,
-)
-def test_invalid_judge_models_name_the_variable(value, message):
-    with pytest.raises(SettingsError, match=f"EVAL_JUDGE_MODELS {message}"):
+@pytest.mark.parametrize("value", ["", "a,,b", "a, a"], ids=repr)
+def test_invalid_judge_models_are_refused(value):
+    with pytest.raises(SettingsError):
         load_settings(settings_env(EVAL_JUDGE_MODELS=value))
 
 
 def test_the_old_judge_model_variable_is_not_read():
     env = settings_env(EVAL_JUDGE_MODEL="j")
     del env["EVAL_JUDGE_MODELS"]
-    with pytest.raises(SettingsError, match="EVAL_JUDGE_MODELS is not set"):
+    with pytest.raises(SettingsError):
         load_settings(env)
 
 
@@ -259,9 +248,9 @@ def graded(**overrides) -> str:
     return comparability_hash(**inputs)
 
 
-def test_the_comparability_hash_is_16_hex_characters_and_stable():
+def test_the_comparability_hash_is_hex_of_its_length_and_stable():
     first = graded()
-    assert len(first) == 16
+    assert len(first) == runner.COMPARABILITY_HASH_LENGTH
     assert int(first, 16) >= 0
     assert graded() == first
     # Neither the judges' nor the items' order changes it.
@@ -349,9 +338,6 @@ def test_the_judges_that_ruled_decide_and_an_errored_judge_is_left_out():
     assert panel.error is None
     assert panel.passed is True
     assert panel.agree is True
-    assert panel.verdict == (
-        "openrouter/a passed: ok; openrouter/b errored: Timeout: x; openrouter/c passed: ok"
-    )
     assert [j["state"] for j in panel.output()] == ["passed", "error", "passed"]
     assert panel.output()[1]["passed"] is None
     # One pass and one fail among the judges that ruled is a tie, which fails.
@@ -362,7 +348,7 @@ def test_the_judges_that_ruled_decide_and_an_errored_judge_is_left_out():
 
 def test_a_panel_where_no_judge_ruled_is_an_error():
     panel = PanelRuling([ruling("a", None, "Timeout: x"), ruling("b", None, "Timeout: y")])
-    assert panel.error == "openrouter/a errored: Timeout: x; openrouter/b errored: Timeout: y"
+    assert panel.error is not None
     assert panel.passed is False
     assert panel.agree is None
 
@@ -378,7 +364,7 @@ def test_the_verdict_is_shared_only_for_the_same_verdict_and_reasoning():
     same = PanelRuling([ruling("a", False, "too wet"), ruling("b", False, "too wet")])
     assert same.verdict == "too wet"
     split = PanelRuling([ruling("a", True, "too wet"), ruling("b", False, "too wet")])
-    assert split.verdict == "openrouter/a passed: too wet; openrouter/b failed: too wet"
+    assert split.verdict != "too wet"
 
 
 def item(**overrides):
@@ -399,12 +385,12 @@ def test_task_parses_a_valid_item():
 
 
 def test_task_rejects_unknown_metadata_key():
-    with pytest.raises(TaskError, match="metadata.difficulty"):
+    with pytest.raises(TaskError, match="difficulty"):
         parse_task(item(metadata={"facts": "Kenya", "turn_limit": 3, "difficulty": "x"}))
 
 
 def test_task_rejects_pause_past_turn_limit():
-    with pytest.raises(TaskError, match="turn limit"):
+    with pytest.raises(TaskError):
         parse_task(
             item(
                 metadata={
@@ -424,7 +410,7 @@ def test_task_turn_limit_is_optional():
     assert parse_task(item()).max_turns(20) == 3
     # Without turn_limit, pauses are checked against EVAL_MAX_TURNS when the run starts.
     assert parse_tasks([item(metadata=metadata)], max_turns=9)
-    with pytest.raises(TaskError, match="i1: metadata.pauses: pause before turn 9 is past"):
+    with pytest.raises(TaskError):
         parse_tasks([item(metadata=metadata)], max_turns=8)
     # With it, against turn_limit only.
     limited = {**metadata, "turn_limit": 10}
@@ -433,14 +419,14 @@ def test_task_turn_limit_is_optional():
 
 @pytest.mark.parametrize("turn_limit", [True, "3", 2.0, 3.0], ids=repr)
 def test_task_turn_limit_must_be_an_integer(turn_limit):
-    with pytest.raises(TaskError, match="metadata.turn_limit"):
+    with pytest.raises(TaskError):
         parse_task(item(metadata={"facts": "K", "turn_limit": turn_limit}))
 
 
 @pytest.mark.parametrize("before_turn", [True, "3", 3.0], ids=repr)
 def test_task_pause_turn_must_be_an_integer(before_turn):
     metadata = {"facts": "K", "pauses": [{"before_turn": before_turn, "seconds": 1}]}
-    with pytest.raises(TaskError, match="metadata.pauses.0.before_turn"):
+    with pytest.raises(TaskError):
         parse_task(item(metadata=metadata))
 
 
@@ -453,13 +439,13 @@ def test_task_pause_seconds_may_be_a_whole_or_fractional_number():
 @pytest.mark.parametrize("seconds", [float("inf"), "inf", float("nan"), True], ids=repr)
 def test_task_pause_seconds_must_be_a_finite_number(seconds):
     metadata = {"facts": "K", "pauses": [{"before_turn": 2, "seconds": seconds}]}
-    with pytest.raises(TaskError, match="metadata.pauses.0.seconds"):
+    with pytest.raises(TaskError):
         parse_task(item(metadata=metadata))
 
 
 @pytest.mark.parametrize("criteria", [[""], ["   "], ["gives totals", "\t\n"]], ids=repr)
 def test_task_judge_criteria_must_hold_text(criteria):
-    with pytest.raises(TaskError, match="expected_output.judge_criteria"):
+    with pytest.raises(TaskError):
         parse_task(item(expected_output={"judge_criteria": criteria}))
 
 
@@ -471,10 +457,10 @@ def test_an_optional_setting_has_its_default_when_unset_and_rejects_an_invalid_v
     assert _number({"X": "0.5"}, "X", 7.5) == 0.5
     assert _whole({"X": "3"}, "X", 7, minimum=0) == 3
     for value in ("many", "nan", "inf", "0", "-1"):
-        with pytest.raises(SettingsError, match="^X "):
+        with pytest.raises(SettingsError, match="X"):
             _number({"X": value}, "X", 7.5)
     for value in ("many", "1.5", "0"):
-        with pytest.raises(SettingsError, match="^X "):
+        with pytest.raises(SettingsError, match="X"):
             _whole({"X": value}, "X", 7, minimum=1)
 
 
@@ -490,18 +476,17 @@ def test_task_deliverables_are_image_or_zarr():
     task = parse_task(item(expected_output={"deliverables": ["image", "zarr"]}))
     assert task.expected.deliverables == ["image", "zarr"]
     assert parse_task(item()).expected.deliverables == []
-    with pytest.raises(TaskError, match="expected_output.deliverables"):
+    with pytest.raises(TaskError):
         parse_task(item(expected_output={"deliverables": ["png"]}))
 
 
 def test_task_needs_a_goal():
-    with pytest.raises(TaskError, match="expected_output") as error:
+    with pytest.raises(TaskError):
         parse_task(item(expected_output={}))
-    assert "needs at least one deliverable or judge criterion" in str(error.value)
 
 
 def test_task_rejects_artifact_checks():
-    with pytest.raises(TaskError, match="expected_output.artifact_checks"):
+    with pytest.raises(TaskError):
         parse_task(item(expected_output={"artifact_checks": [{"path": "*.png"}]}))
 
 

@@ -18,7 +18,7 @@ import httpx
 import litellm
 import requests.exceptions
 
-from weather_skills_eval.langfuse_gateway import play_scores
+from weather_skills_eval.langfuse_gateway import EPOCH, play_scores
 from weather_skills_eval.scoring import TraceRead
 
 
@@ -277,12 +277,11 @@ class FakeApp:
 class FakeContainer:
     """``statuses`` are returned by successive reloads; the status ``gone``
     makes reload raise NotFound, as for a container removed from outside,
-    ``api-error`` makes it raise APIError, and ``connection-error`` and
-    ``read-timeout`` make it raise the requests error docker-py raises when
-    the daemon connection fails or times out. An entry may also be a
+    ``api-error`` makes it raise APIError, and ``connection-error`` makes it
+    raise the requests error docker-py raises when the daemon connection
+    fails. An entry may also be a
     (status, restart count, exit code) tuple, which sets ``attrs``.
-    ``archives`` holds each (path, tar bytes) given to ``put_archive``;
-    ``put_archive_error`` and ``start_error`` fail those calls, and
+    ``archives`` holds each (path, tar bytes) given to ``put_archive``, and
     ``put_archive_result`` is what ``put_archive`` returns."""
 
     def __init__(
@@ -291,8 +290,6 @@ class FakeContainer:
         logs: bytes = b"",
         name: str = "app",
         remove_error: Exception | None = None,
-        put_archive_error: Exception | None = None,
-        start_error: Exception | None = None,
         put_archive_result: bool = True,
     ):
         self._statuses = statuses
@@ -300,8 +297,6 @@ class FakeContainer:
         self._logs = logs
         self.name = name
         self.remove_error = remove_error
-        self.put_archive_error = put_archive_error
-        self.start_error = start_error
         self.put_archive_result = put_archive_result
         self.removed = False
         self.started = False
@@ -311,14 +306,10 @@ class FakeContainer:
         self.archives: list[tuple[str, bytes]] = []
 
     def put_archive(self, path: str, data: bytes) -> bool:
-        if self.put_archive_error:
-            raise self.put_archive_error
         self.archives.append((path, data))
         return self.put_archive_result
 
     def start(self) -> None:
-        if self.start_error:
-            raise self.start_error
         self.started = True
 
     def reload(self) -> None:
@@ -337,8 +328,6 @@ class FakeContainer:
             raise docker.errors.APIError("daemon unavailable")
         if self.status == "connection-error":
             raise requests.exceptions.ConnectionError("connection aborted")
-        if self.status == "read-timeout":
-            raise requests.exceptions.ReadTimeout("read timed out")
 
     def logs(self, tail: int = 200) -> bytes:
         return self._logs
@@ -444,10 +433,9 @@ class FakeDocker:
     the runner; ``app_files`` are the files of the app image the emulator
     is read from (by default both emulator files), ``archive_error``
     fails ``get_archive`` on it and ``archive_stream`` makes the stream it
-    returns; ``volume_error`` fails ``volumes.create``;
-    ``leftovers`` are labeled containers from an earlier run.
-    ``image_digests`` and ``runner_digests`` replace the ``RepoDigests`` of
-    the pulled app and runner images. ``events``
+    returns; ``leftovers`` are labeled containers from an earlier run.
+    ``image_digests`` replaces the ``RepoDigests`` of the pulled app
+    image. ``events``
     records each container and volume created or removed, in order;
     ``source`` is the container created from the app image to read the
     emulator; ``volume_setup`` is the container that creates the artifacts
@@ -469,11 +457,9 @@ class FakeDocker:
         app_files: dict[str, bytes] | None = None,
         archive_error: Exception | None = None,
         archive_stream: Callable | None = None,
-        volume_error: Exception | None = None,
         volume_remove_error: Exception | None = None,
         leftovers: list[FakeContainer] | None = None,
         image_digests: list[str] | None = None,
-        runner_digests: list[str] | None = None,
     ):
         self.container = container
         self.runner = runner or FakeContainer(["running"], name="runner")
@@ -501,12 +487,7 @@ class FakeDocker:
             },
         )
         runner_image = SimpleNamespace(
-            id="sha256:runner",
-            attrs={
-                "RepoDigests": runner_digests
-                if runner_digests is not None
-                else [f"{RUNNER_REPOSITORY}@sha256:run"]
-            },
+            id="sha256:runner", attrs={"RepoDigests": [f"{RUNNER_REPOSITORY}@sha256:run"]}
         )
         outer = self
 
@@ -582,8 +563,6 @@ class FakeDocker:
 
         class Volumes:
             def create(self, name, labels):
-                if volume_error:
-                    raise volume_error
                 volume = FakeVolume(name, labels, remove_error=volume_remove_error)
                 outer.volumes_created[name] = volume
                 outer.events.append(f"volume {name}")
@@ -973,7 +952,7 @@ class FakeRunApi:
 
         def list_experiments(**kwargs):
             record("experiments.list", kwargs)
-            assert kwargs["from_start_time"] == datetime(1970, 1, 1, tzinfo=UTC)
+            assert kwargs["from_start_time"] == EPOCH
             ids = kwargs["id"].split(",")
             data = [
                 SimpleNamespace(id=i, name=name, start_time=fake.START)

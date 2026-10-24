@@ -72,6 +72,10 @@ log = logging.getLogger(__name__)
 # in the comparability hash do not show.
 GRADING_VERSION = 2
 
+COMPARABILITY_HASH_LENGTH = 16
+UNRECORDED = "unrecorded"
+LATEST = "latest"
+
 
 class DatasetError(Exception):
     """The dataset is missing, cannot be read, has no items, has invalid
@@ -177,7 +181,7 @@ def comparability_hash(
             "turn_timeout": float(turn_timeout),
         },
     }
-    return hashlib.sha256(_canonical(graded)).hexdigest()[:16]
+    return hashlib.sha256(_canonical(graded)).hexdigest()[:COMPARABILITY_HASH_LENGTH]
 
 
 async def _resolved(app: AppClient, config: RunConfig) -> tuple[list[str], list[dict], str]:
@@ -432,10 +436,10 @@ def _run(
                 turn_timeout=settings.turn_timeout,
             ),
             "max_turns": str(settings.max_turns),
-            "harness_commit": settings.harness_commit or "unrecorded",
+            "harness_commit": settings.harness_commit or UNRECORDED,
             "batch": settings.batch,
             "dataset": config.dataset,
-            "dataset_version": dataset_version.isoformat() if dataset_version else "latest",
+            "dataset_version": dataset_version.isoformat() if dataset_version else LATEST,
             "dataset_items": str(len(tasks)),
             "dataset_skill_packs": ",".join(required_packs),
         }
