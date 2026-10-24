@@ -20,7 +20,7 @@ from typing import BinaryIO
 
 import yaml
 
-ALLOWED_KEYS = ("name", "image", "runner_image", "pull", "model", "dataset", "env")
+ALLOWED_KEYS = ("name", "variant", "image", "runner_image", "pull", "model", "dataset", "env")
 REQUIRED_KEYS = ("image", "runner_image", "model", "dataset", "env")
 
 # The harness sets these on the app to run skills on the sandbox runner.
@@ -67,6 +67,8 @@ class RunConfig:
     dataset: str
     env: dict[str, str]
     pull: bool = True
+    # Appended to the experiment name in parentheses; empty leaves the name as is.
+    variant: str = ""
 
     @property
     def env_names(self) -> list[str]:
@@ -226,6 +228,12 @@ def parse_config(raw: object, *, default_name: str | None, environ: Mapping[str,
         raise ConfigError("name", "is missing; a configuration read from stdin needs one")
 
     name = _text(raw, "name") if "name" in raw else default_name
+    variant = raw.get("variant")
+    if variant is None:
+        variant = ""
+    if not isinstance(variant, str):
+        raise ConfigError("variant", "must be a string")
+    variant = variant.strip()
     image = _resolve_text("image", "image", _text(raw, "image"), environ).strip()
     if not image:
         raise ConfigError("image", "must be a non-empty string")
@@ -272,6 +280,7 @@ def parse_config(raw: object, *, default_name: str | None, environ: Mapping[str,
         dataset=dataset,
         env=env,
         pull=pull,
+        variant=variant,
     )
 
 

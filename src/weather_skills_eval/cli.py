@@ -260,7 +260,7 @@ def main(
         )
     if summary.experiment_url:
         print(summary.experiment_url)
-    print(cost_line(config_name, summary.experiment_name, summary.agent_cost_usd))
+    print(cost_line(config_name, summary.metadata["served_model"], summary.agent_cost_usd))
     return 0
 
 

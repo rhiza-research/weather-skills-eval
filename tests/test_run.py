@@ -45,6 +45,7 @@ from fakes import (
     zarr_entry,
 )
 
+from weather_skills_eval import cli
 from weather_skills_eval import play as play_module
 from weather_skills_eval import runner as runner_module
 from weather_skills_eval.app_client import ChatError
@@ -355,6 +356,63 @@ def test_an_alias_names_the_experiment_after_the_model_it_points_to(tmp_path):
     assert experiment["metadata"]["model"] == "~anthropic/claude-opus-latest"
     assert experiment["metadata"]["served_model"] == "anthropic/claude-opus-5.5"
     assert summary.experiment_name == "anthropic/claude-opus-5.5"
+
+
+NAME_LINE = "name: production-agent\n"
+
+
+def with_variant(line: str) -> str:
+    """CONFIG with ``line`` after its name."""
+    assert CONFIG.startswith(NAME_LINE)
+    return CONFIG.replace(NAME_LINE, NAME_LINE + line, 1)
+
+
+@pytest.mark.parametrize(
+    "variant_line, name",
+    [
+        ("variant: reasoning_high\n", "z-ai/glm-5.3 (reasoning_high)"),
+        ('variant: "  low  "\n', "z-ai/glm-5.3 (low)"),
+        ("", "z-ai/glm-5.3"),
+        ("variant:\n", "z-ai/glm-5.3"),
+        ('variant: ""\n', "z-ai/glm-5.3"),
+        ('variant: "   "\n', "z-ai/glm-5.3"),
+    ],
+    ids=["set", "padded", "absent", "null", "empty", "blank"],
+)
+def test_a_variant_is_appended_to_the_experiment_name(tmp_path, caplog, variant_line, name):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.gateway.served = "z-ai/glm-5.3"
+    harness.config_path.write_text(with_variant(variant_line))
+
+    with caplog.at_level("INFO"):
+        summary = harness.run()
+
+    experiment = harness.gateway.experiments[0]
+    assert experiment["name"] == name
+    assert summary.experiment_name == name
+    assert f"Experiment {name} started: 1 tasks, concurrency 1" in progress_lines(caplog)
+    # The metadata and the description keep the bare models, and add no key.
+    assert experiment["metadata"]["served_model"] == "z-ai/glm-5.3"
+    assert experiment["description"] == experiment["metadata"]["model"]
+    assert "variant" not in experiment["metadata"]
+
+
+def test_the_cli_prints_the_variant_name_and_a_cost_line_with_the_bare_model(
+    tmp_path, monkeypatch, capsys
+):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(tmp_path, items, reply_done_on(1))
+    harness.gateway.served = "z-ai/glm-5.3"
+    harness.config_path.write_text(with_variant("variant: reasoning_high\n"))
+    monkeypatch.setattr(cli, "run", lambda *args, **kwargs: harness.run())
+
+    assert cli.main(["run", str(harness.config_path)]) == 0
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].startswith("Experiment z-ai/glm-5.3 (reasoning_high) (production-agent), run ")
+    assert lines[-1].startswith("Cost ")
+    assert json.loads(lines[-1].removeprefix("Cost "))["served_model"] == "z-ai/glm-5.3"
 
 
 def test_a_failed_served_model_request_stops_the_run_before_the_experiment(tmp_path):
@@ -2931,6 +2989,10 @@ def test_app_never_healthy_stops_the_run_with_logs(tmp_path):
         (lambda text: text.replace(RUNNER_IMAGE, '""'), "runner_image"),
         (lambda text: text.replace(RUNNER_IMAGE, "${UNSET_RUNNER}"), "runner_image"),
         (lambda text: text + "emulator_commit: abc\n", "emulator_commit"),
+        (lambda text: text + "variant: 3\n", "variant"),
+        (lambda text: text + "variant: true\n", "variant"),
+        (lambda text: text + "variant: [high]\n", "variant"),
+        (lambda text: text + "variant: {effort: high}\n", "variant"),
     ],
 )
 def test_bad_config_does_not_start_the_run(tmp_path, edit, field):

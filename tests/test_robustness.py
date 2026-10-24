@@ -1182,7 +1182,7 @@ def test_cli_summary_names_tasks_lost_to_a_runner_restart(
         experiment_url=None,
         items=3,
         goals_reached=1,
-        metadata={"config_name": "example"},
+        metadata={"config_name": "example", "served_model": "cfg"},
         runner_lost=runner_lost,
         agent_cost_usd=1.2345678,
     )
@@ -1204,7 +1204,7 @@ def test_cli_summary_ends_with_the_cost_line_after_the_experiment_url(monkeypatc
         experiment_url="http://langfuse.invalid/experiment",
         items=1,
         goals_reached=1,
-        metadata={"config_name": "opus-agent"},
+        metadata={"config_name": "opus-agent", "served_model": "anthropic/claude-opus-5.5"},
         runner_lost=[],
         agent_cost_usd=0.0,
     )
@@ -1232,7 +1232,7 @@ def test_cli_prints_the_run_log_on_stderr_while_the_run_lasts(monkeypatch, capsy
             experiment_url=None,
             items=1,
             goals_reached=1,
-            metadata={"config_name": "example"},
+            metadata={"config_name": "example", "served_model": "cfg"},
             runner_lost=[],
             agent_cost_usd=0.0,
         )
@@ -1466,7 +1466,7 @@ def test_cli_main_keeps_scenario_off_langwatch_when_a_key_is_set(monkeypatch):
             experiment_url=None,
             items=1,
             goals_reached=1,
-            metadata={"config_name": "example"},
+            metadata={"config_name": "example", "served_model": "cfg"},
             runner_lost=[],
             agent_cost_usd=0.0,
         )

@@ -56,6 +56,26 @@ def test_config_pull_must_be_a_boolean(value):
     assert error.value.field == "pull"
 
 
+@pytest.mark.parametrize(
+    "value, variant",
+    [("reasoning_high", "reasoning_high"), ("  low  ", "low"), (None, ""), ("", ""), ("   ", "")],
+    ids=repr,
+)
+def test_config_variant_is_stripped_and_empty_when_null_or_blank(value, variant):
+    assert parse_config(config(variant=value), default_name="x", environ=ENVIRON).variant == variant
+
+
+def test_config_variant_defaults_to_empty():
+    assert parse_config(config(), default_name="x", environ=ENVIRON).variant == ""
+
+
+@pytest.mark.parametrize("value", [3, True, ["high"], {"effort": "high"}], ids=repr)
+def test_config_variant_must_be_a_string(value):
+    with pytest.raises(ConfigError, match="variant: must be a string") as error:
+        parse_config(config(variant=value), default_name="x", environ=ENVIRON)
+    assert error.value.field == "variant"
+
+
 def test_config_reference_to_unset_variable_names_the_field():
     raw = config(env={**BASE_ENV, "LANGFUSE_SECRET_KEY": "${MISSING}"})
     with pytest.raises(ConfigError) as error:

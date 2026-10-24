@@ -10,7 +10,8 @@ Order of a run:
    container, and wait for /health.
 4. Read the resolved configuration from the app (the catalog model's base
    model, tools, skill pack commits), and ask OpenRouter which model answers
-   for that base model; the experiment is named after it.
+   for that base model; the experiment is named after it, followed by the
+   configuration's ``variant`` in parentheses when it sets one.
 5. Run the experiment, playing the tasks in a random order drawn for this
    run, which makes runs at once less likely to reach the same data
    providers with the same task at the same time: each item's task waits for
@@ -523,17 +524,18 @@ def _run(
                 gateway.record_app_cost(app_cost, result.app_trace_ids)
             return result.output()
 
+        experiment_name = f"{served_model} ({config.variant})" if config.variant else served_model
         played = in_play_order(dataset, rng)
         log.info(
             "Experiment %s started: %d tasks, concurrency %d",
-            served_model,
+            experiment_name,
             len(tasks),
             settings.concurrency,
         )
         try:
             result = gateway.run_experiment(
                 dataset=played,
-                name=served_model,
+                name=experiment_name,
                 description=model,
                 task=task_fn,
                 metadata=metadata,
@@ -553,7 +555,7 @@ def _run(
 
     outputs = [r.output or {} for r in result.item_results]
     return RunSummary(
-        experiment_name=served_model,
+        experiment_name=experiment_name,
         run_name=result.run_name,
         experiment_url=result.experiment_url,
         items=len(result.item_results),
