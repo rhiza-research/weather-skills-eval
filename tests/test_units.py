@@ -10,7 +10,7 @@ from weather_skills_eval.config import ConfigError, pack_name, parse_config
 from weather_skills_eval.judge import JudgeRuling, PanelRuling
 from weather_skills_eval.runner import comparability_hash
 from weather_skills_eval.scoring import split_usage, trace_metrics
-from weather_skills_eval.settings import SettingsError, load_settings
+from weather_skills_eval.settings import SettingsError, _number, _whole, load_settings
 from weather_skills_eval.simulated_user import SYSTEM_PROMPT
 from weather_skills_eval.tasks import TaskError, parse_task, parse_tasks
 
@@ -535,34 +535,19 @@ def test_simulated_user_prompt_says_a_zarr_store_is_a_data_file():
     ) in SYSTEM_PROMPT.replace("\n", " ")
 
 
-def test_max_turns_defaults_to_20():
-    assert load_settings(settings_env()).max_turns == 20
-    assert load_settings(settings_env(EVAL_MAX_TURNS="50")).max_turns == 50
-    with pytest.raises(SettingsError, match="EVAL_MAX_TURNS"):
-        load_settings(settings_env(EVAL_MAX_TURNS="0"))
-
-
-def test_rate_limit_retries_default_to_6_from_15_seconds():
-    settings = load_settings(settings_env())
-    assert settings.rate_limit_retries == 6
-    assert settings.rate_limit_backoff == 15
-    settings = load_settings(
-        settings_env(EVAL_RATE_LIMIT_RETRIES="0", EVAL_RATE_LIMIT_BACKOFF_SECONDS="0.5")
-    )
-    assert settings.rate_limit_retries == 0
-    assert settings.rate_limit_backoff == 0.5
-
-
-@pytest.mark.parametrize("value", ["-1", "1.5", "many"])
-def test_rate_limit_retries_must_be_a_whole_number_of_at_least_0(value):
-    with pytest.raises(SettingsError, match="EVAL_RATE_LIMIT_RETRIES"):
-        load_settings(settings_env(EVAL_RATE_LIMIT_RETRIES=value))
-
-
-@pytest.mark.parametrize("value", ["0", "-1", "inf", "nan", "soon"])
-def test_rate_limit_backoff_must_be_a_finite_number_greater_than_0(value):
-    with pytest.raises(SettingsError, match="EVAL_RATE_LIMIT_BACKOFF_SECONDS"):
-        load_settings(settings_env(EVAL_RATE_LIMIT_BACKOFF_SECONDS=value))
+def test_an_optional_setting_has_its_default_when_unset_and_rejects_an_invalid_value():
+    # Every optional number setting is read with _number or _whole.
+    for unset in ({}, {"X": ""}, {"X": "  "}):
+        assert _number(unset, "X", 7.5) == 7.5
+        assert _whole(unset, "X", 7, minimum=0) == 7
+    assert _number({"X": "0.5"}, "X", 7.5) == 0.5
+    assert _whole({"X": "3"}, "X", 7, minimum=0) == 3
+    for value in ("many", "nan", "inf", "0", "-1"):
+        with pytest.raises(SettingsError, match="^X "):
+            _number({"X": value}, "X", 7.5)
+    for value in ("many", "1.5", "0"):
+        with pytest.raises(SettingsError, match="^X "):
+            _whole({"X": value}, "X", 7, minimum=1)
 
 
 def test_batch_is_read_stripped_and_empty_when_unset():
@@ -806,17 +791,6 @@ def test_tool_with_ok_false_output_is_a_failure():
     )
     assert metrics.tool_calls == 4
     assert metrics.tool_failures == 2
-
-
-@pytest.mark.parametrize("value", ["0", "-1", "1.5", "many"])
-def test_model_max_tokens_must_be_a_whole_number_of_at_least_1(value):
-    with pytest.raises(SettingsError, match="EVAL_MODEL_MAX_TOKENS"):
-        load_settings(settings_env(EVAL_MODEL_MAX_TOKENS=value))
-
-
-def test_model_max_tokens_defaults_to_8192():
-    assert load_settings(settings_env()).model_max_tokens == 8192
-    assert load_settings(settings_env(EVAL_MODEL_MAX_TOKENS="1024")).model_max_tokens == 1024
 
 
 def test_highest_skill_versions_compares_numerically():

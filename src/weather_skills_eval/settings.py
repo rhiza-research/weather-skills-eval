@@ -4,6 +4,9 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+# 8192 cut off judge verdicts on long transcripts; some models allow no more than 16,384.
+DEFAULT_MODEL_MAX_TOKENS = 16384
+
 
 class SettingsError(Exception):
     """A harness setting is missing or invalid. The message names the variable."""
@@ -107,7 +110,9 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         model_retries=_whole(environ, "EVAL_MODEL_RETRIES", 2, minimum=0),
         rate_limit_retries=_whole(environ, "EVAL_RATE_LIMIT_RETRIES", 6, minimum=0),
         rate_limit_backoff=_number(environ, "EVAL_RATE_LIMIT_BACKOFF_SECONDS", 15),
-        model_max_tokens=_whole(environ, "EVAL_MODEL_MAX_TOKENS", 8192, minimum=1),
+        model_max_tokens=_whole(
+            environ, "EVAL_MODEL_MAX_TOKENS", DEFAULT_MODEL_MAX_TOKENS, minimum=1
+        ),
         max_turns=_whole(environ, "EVAL_MAX_TURNS", 20, minimum=1),
         # Set at image build time from the harness checkout; see compose.yaml.
         harness_commit=environ.get("EVAL_HARNESS_COMMIT", "").strip(),

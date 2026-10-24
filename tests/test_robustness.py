@@ -67,7 +67,7 @@ from weather_skills_eval.judge import GoalJudge, rate_answer
 from weather_skills_eval.langfuse_gateway import LangfuseGateway, LangfuseRuns
 from weather_skills_eval.play import neutral_transcript
 from weather_skills_eval.runner import DatasetError, RunSummary, base_model
-from weather_skills_eval.settings import SettingsError, load_settings
+from weather_skills_eval.settings import DEFAULT_MODEL_MAX_TOKENS, SettingsError, load_settings
 from weather_skills_eval.simulated_user import SimulatedUser
 from weather_skills_eval.tasks import TaskError, parse_task
 
@@ -878,7 +878,7 @@ class OneQuestionUser(AgentAdapter):
         return ScenarioResult(success=True, messages=list(input.messages), reasoning="done")
 
 
-def test_final_judge_and_quality_rating_send_8192_output_tokens(monkeypatch):
+def test_final_judge_and_quality_rating_send_the_default_output_tokens(monkeypatch):
     sent = []
     models = FakeModels()
 
@@ -934,11 +934,11 @@ def test_final_judge_and_quality_rating_send_8192_output_tokens(monkeypatch):
         criteria=[],
         transcript="t",
     )
-    assert [call["max_tokens"] for call in sent] == [8192, 8192]
+    assert [call["max_tokens"] for call in sent] == [DEFAULT_MODEL_MAX_TOKENS] * 2
     assert sent[0]["tools"] and "tools" not in sent[1]
 
 
-def test_simulated_user_call_sends_8192_output_tokens(monkeypatch):
+def test_simulated_user_call_sends_the_default_output_tokens(monkeypatch):
     sent = []
 
     def completion(**kwargs):
@@ -998,7 +998,7 @@ def test_simulated_user_call_sends_8192_output_tokens(monkeypatch):
 
     assert asyncio.run(user.call(agent_input)) == "rain next week?"
     assert asyncio.run(user.call(agent_input)) == "go on"
-    assert [call["max_tokens"] for call in sent] == [8192]
+    assert [call["max_tokens"] for call in sent] == [DEFAULT_MODEL_MAX_TOKENS]
 
 
 FINISH_TEST = {"type": "function", "function": {"name": "finish_test"}}

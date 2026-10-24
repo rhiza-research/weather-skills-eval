@@ -29,7 +29,7 @@ from weather_skills_eval.langfuse_gateway import (
 )
 from weather_skills_eval.llm import ModelReplyError
 from weather_skills_eval.scoring import TraceRead
-from weather_skills_eval.settings import load_settings
+from weather_skills_eval.settings import DEFAULT_MODEL_MAX_TOKENS, load_settings
 
 
 def real_client(exporter: InMemorySpanExporter) -> Langfuse:
@@ -1138,7 +1138,7 @@ def _completion_kwargs(monkeypatch, gateway, **kwargs) -> dict:
     return calls[0]
 
 
-def test_default_settings_cap_every_model_call_at_8192_output_tokens(monkeypatch):
+def test_default_settings_cap_every_model_call_at_the_default_output_tokens(monkeypatch):
     settings = load_settings(
         {
             "LANGFUSE_PUBLIC_KEY": "pk",
@@ -1153,7 +1153,7 @@ def test_default_settings_cap_every_model_call_at_8192_output_tokens(monkeypatch
     built = {}
     monkeypatch.setattr(runner, "LangfuseGateway", lambda **kwargs: built.update(kwargs))
     runner._default_gateway(settings)
-    assert built["model_max_tokens"] == 8192
+    assert built["model_max_tokens"] == DEFAULT_MODEL_MAX_TOKENS
 
     gateway = gateway_for(real_client(InMemorySpanExporter()), model_max_tokens=8192)
     assert _completion_kwargs(monkeypatch, gateway)["max_tokens"] == 8192
