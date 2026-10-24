@@ -615,6 +615,14 @@ def _response(content: str | None = None, tool_call: dict | None = None):
     )
 
 
+TOOL_CHOICE_REFUSAL = 'tool_choice: type "tool" and "any" are not supported for this model.'
+
+
+def tool_choice_refusal(model: str) -> litellm.BadRequestError:
+    """The refusal providers give claude-opus-5.5 when a call forces a tool."""
+    return litellm.BadRequestError(TOOL_CHOICE_REFUSAL, model=model, llm_provider="openrouter")
+
+
 class FakeModels:
     """The simulated user and judge models.
 
@@ -628,8 +636,10 @@ class FakeModels:
     ``judge_without_verdict`` its verdict call answers in text, without the
     finish_test call; the answer-quality call raises ``quality_error`` and the
     verdict call ``verdict_error`` when given, for every judge model or, with
-    ``verdict_error_for``, only for that one. A judge rates the answer 4, or
-    its score in ``quality_scores``.
+    ``verdict_error_for``, only for that one. The verdict call of a model in
+    ``refuses_forced_tool`` raises ``tool_choice_refusal`` when its tool
+    choice forces a tool. A judge rates the answer 4, or its score in
+    ``quality_scores``.
     """
 
     def __init__(
@@ -642,8 +652,10 @@ class FakeModels:
         verdict_error_for: str | None = None,
         failing_judges: set[str] | None = None,
         quality_scores: dict[str, int] | None = None,
+        refuses_forced_tool: set[str] | None = None,
     ):
         self.user_replies = {k: list(v) for k, v in (user_replies or {}).items()}
+        self.refuses_forced_tool = refuses_forced_tool or set()
         self.judge_fails_on = judge_fails_on
         self.judge_without_verdict = judge_without_verdict
         self.quality_error = quality_error
@@ -693,6 +705,9 @@ class FakeModels:
         tools = kwargs.get("tools")
         if tools and self.verdict_error and self.verdict_error_for in (None, model):
             raise self.verdict_error
+        forced = isinstance(kwargs.get("tool_choice"), dict)
+        if tools and forced and model in self.refuses_forced_tool:
+            raise tool_choice_refusal(model)
         if tools and self.judge_without_verdict:
             return _response("I think it looks fine.")
         if tools:

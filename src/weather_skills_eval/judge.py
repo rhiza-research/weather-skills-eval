@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from scenario import AgentInput, JudgeAgent, JudgmentRequest, ScenarioResult
+from scenario._utils.provider_compat import adaptation_for, apply_adaptations
 from scenario.scenario_state import ScenarioState
 
 from .checks import Evidence
@@ -126,6 +127,8 @@ class GoalJudge(JudgeAgent):
         self.verdict: str | None = None
         # False when the evidence decided the verdict without a model call.
         self.model_called = False
+        # The provider refusals this judge's calls adapt to, learned from its calls.
+        self._adaptations: set[str] = set()
 
     def _completion(self, **kwargs):
         if self._evidence is not None:
@@ -135,7 +138,19 @@ class GoalJudge(JudgeAgent):
             kwargs["messages"] = messages
         # This judge's model, whatever Scenario passes.
         kwargs["model"] = self.judge_model
-        return self._complete_fn(JUDGE, self._session_id(), **kwargs)
+        # The loop of Scenario's ProviderCompat.completion (langwatch-scenario
+        # 1.6.0), which this override replaces: a call the provider refuses
+        # for a parameter, such as a tool choice that forces finish_test, is
+        # sent once more adapted, and later calls are sent adapted.
+        while True:
+            adapted = apply_adaptations(kwargs, self._adaptations)
+            try:
+                return self._complete_fn(JUDGE, self._session_id(), **adapted)
+            except Exception as error:
+                adaptation = adaptation_for(error, adapted)
+                if adaptation is None or adaptation in self._adaptations:
+                    raise
+                self._adaptations.add(adaptation)
 
     async def rule(self, state: ScenarioState, *, at_turn_cap: bool) -> bool:
         """The verdict on the play's final result; its reasoning is ``verdict``.

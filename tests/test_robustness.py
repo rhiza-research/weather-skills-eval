@@ -33,6 +33,7 @@ from fakes import (
     FakeVolume,
     app_image_files,
     local_image,
+    tool_choice_refusal,
 )
 from langfuse import Langfuse
 from langfuse.api.core.api_error import ApiError as LangfuseApiError
@@ -998,6 +999,40 @@ def test_simulated_user_call_sends_8192_output_tokens(monkeypatch):
     assert asyncio.run(user.call(agent_input)) == "rain next week?"
     assert asyncio.run(user.call(agent_input)) == "go on"
     assert [call["max_tokens"] for call in sent] == [8192]
+
+
+FINISH_TEST = {"type": "function", "function": {"name": "finish_test"}}
+
+
+def test_a_refused_forced_tool_choice_is_sent_as_auto_on_every_later_call():
+    sent = []
+
+    def complete(role, session_id, **kwargs):
+        sent.append(kwargs)
+        if kwargs["tool_choice"] != "auto":
+            raise tool_choice_refusal(kwargs["model"])
+        return "verdict"
+
+    judge = GoalJudge(
+        criteria=["The assistant gives the rain total"],
+        deliverables=[],
+        model="openrouter/anthropic/claude-opus-5.5",
+        complete=complete,
+        session_id=lambda: "c1",
+        collect_evidence=lambda: None,
+    )
+    messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "t"}]
+    instruction = "Answer only by calling the finish_test tool, never with plain text."
+
+    for _ in range(2):
+        call = {"model": "m", "messages": messages, "tools": [{}], "tool_choice": FINISH_TEST}
+        assert judge._completion(**call) == "verdict"
+
+    # Refused once, then sent adapted: the later call is not refused first.
+    assert [kwargs["tool_choice"] for kwargs in sent] == [FINISH_TEST, "auto", "auto"]
+    for kwargs in sent[1:]:
+        assert kwargs["messages"] == [*messages, {"role": "user", "content": instruction}]
+        assert kwargs["model"] == "openrouter/anthropic/claude-opus-5.5"
 
 
 def test_final_judge_reads_the_run_that_arun_leaves_current():

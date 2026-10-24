@@ -42,6 +42,7 @@ from fakes import (
     image_entry,
     local_image,
     tool_call,
+    tool_choice_refusal,
     zarr_entry,
 )
 
@@ -151,6 +152,7 @@ class Harness:
         verdict_error_for=None,
         failing_judges=None,
         quality_scores=None,
+        refuses_forced_tool=None,
         **docker_options,
     ):
         self.clock = FakeClock()
@@ -164,6 +166,7 @@ class Harness:
             verdict_error_for=verdict_error_for,
             failing_judges=failing_judges,
             quality_scores=quality_scores,
+            refuses_forced_tool=refuses_forced_tool,
         )
         self.gateway = FakeGateway(items, self.models)
         self.container = container or FakeContainer(["running"])
@@ -1265,6 +1268,83 @@ def test_a_panel_where_no_judge_ruled_ends_the_play_as_error(tmp_path):
     scores = harness.scores()
     assert scores["goal_reached"] == 0.0
     assert "judges_agree" not in scores
+
+
+FINISH_TEST_INSTRUCTION = {
+    "role": "user",
+    "content": "Answer only by calling the finish_test tool, never with plain text.",
+}
+
+
+def verdict_calls_of(harness, model: str) -> list[dict]:
+    return [call for call in harness.models.verdict_calls() if call["model"] == model]
+
+
+def test_a_judge_whose_provider_refuses_a_forced_tool_choice_rules_with_auto(tmp_path):
+    items = [task("t1", "rain map kenya", turn_limit=3, deliverables=["image"])]
+    harness = Harness(
+        tmp_path,
+        items,
+        map_reply(presenting=display_image("maps/rain.png")),
+        refuses_forced_tool={PANEL[1]},
+    )
+    harness.run(EVAL_JUDGE_MODELS=",".join(PANEL))
+
+    output = harness.output()
+    assert output["outcome"] == "goal_reached"
+    # Every judge ruled; the refused one is not errored.
+    assert [(j["state"], j["passed"]) for j in output["judges"]] == [("passed", True)] * 3
+    refused, retried = verdict_calls_of(harness, PANEL[1])
+    assert refused["tool_choice"] == {"type": "function", "function": {"name": "finish_test"}}
+    assert retried["tool_choice"] == "auto"
+    # The evidence stays at index 2, and the instruction comes last.
+    assert retried["messages"][2] == evidence_messages(refused)[0]
+    assert retried["messages"][:-1] == refused["messages"]
+    assert retried["messages"][-1] == FINISH_TEST_INSTRUCTION
+    # A judge whose provider does not refuse is called once, as Scenario sends it.
+    for model in (PANEL[0], PANEL[2]):
+        [call] = verdict_calls_of(harness, model)
+        assert call["tool_choice"] == refused["tool_choice"]
+        assert call["messages"] == refused["messages"]
+    assert harness.scores()["judges_agree"] == 1.0
+
+
+def test_a_judge_refused_again_after_auto_is_errored_without_a_third_call(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(
+        tmp_path,
+        items,
+        reply_done_on(1),
+        verdict_error=tool_choice_refusal(PANEL[1]),
+        verdict_error_for=PANEL[1],
+    )
+    harness.run(EVAL_JUDGE_MODELS=",".join(PANEL))
+
+    output = harness.output()
+    assert [j["state"] for j in output["judges"]] == ["passed", "error", "passed"]
+    assert (
+        'tool_choice: type "tool" and "any" are not supported' in output["judges"][1]["reasoning"]
+    )
+    assert [call["tool_choice"] for call in verdict_calls_of(harness, PANEL[1])] == [
+        {"type": "function", "function": {"name": "finish_test"}},
+        "auto",
+    ]
+    assert output["outcome"] == "goal_reached"
+
+
+def test_an_error_that_is_not_a_refusal_is_not_sent_again(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    harness = Harness(
+        tmp_path,
+        items,
+        reply_done_on(1),
+        verdict_error=ModelReplyError(CUT_OFF),
+        verdict_error_for=PANEL[1],
+    )
+    harness.run(EVAL_JUDGE_MODELS=",".join(PANEL[:2]))
+
+    assert [j["state"] for j in harness.output()["judges"]] == ["passed", "error"]
+    assert len(verdict_calls_of(harness, PANEL[1])) == 1
 
 
 def test_a_judge_whose_rating_fails_is_left_out_of_the_mean(tmp_path):

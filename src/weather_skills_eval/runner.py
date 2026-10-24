@@ -70,7 +70,7 @@ log = logging.getLogger(__name__)
 
 # Bumped by hand when how a play is graded changes in a way the prompt texts
 # in the comparability hash do not show.
-GRADING_VERSION = 1
+GRADING_VERSION = 2
 
 
 class DatasetError(Exception):
