@@ -347,9 +347,12 @@ def main(
     docker_client_factory=_docker_client,
     secret_reader: Callable[[str, str], str] = read_secret,
     configs_repo_dir: Path = Path(CONFIGS_REPO_DIR),
-    out=sys.stdout,
-    err=sys.stderr,
+    out=None,
+    err=None,
 ) -> int:
+    # Read at call time, so a stream swapped in after import is the one used.
+    out = sys.stdout if out is None else out
+    err = sys.stderr if err is None else err
     lock = threading.Lock()
 
     def say(line: str) -> None:
