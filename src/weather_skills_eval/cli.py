@@ -24,6 +24,9 @@ Exit codes:
 - 143: the harness was stopped with SIGTERM; the app and runner containers
   and the volume were removed.
 
+``weather-skills-eval batch`` runs one batch from its environment; see
+``batch.py`` for its exit codes.
+
 ``weather-skills-eval delete [--yes] <experiment-id>`` deletes every trace of
 one run, after ``yes`` on stdin unless ``--yes`` is given. Exit codes:
 
@@ -48,6 +51,7 @@ import docker.errors
 import httpx
 from langfuse.api.core.api_error import ApiError as LangfuseApiError
 
+from . import batch
 from .app_client import ChatError
 from .config import ConfigError
 from .instance import AppStartError, RunnerStartError
@@ -114,8 +118,8 @@ def keep_runs_off_langwatch() -> None:
 def log_to_stderr():
     """While the run lasts, print the harness's log lines, INFO and above, on
     stderr, one message per line: its progress through the run and its
-    warnings. They stay off stdout, which ``scripts/run-eval.py`` reads for
-    the summary. The lines do not also reach the root logger, so a handler another
+    warnings. They stay off stdout, which holds the summary. The lines do not
+    also reach the root logger, so a handler another
     library put there does not print them twice."""
     logger = logging.getLogger(__package__)
     handler = logging.StreamHandler(sys.stderr)
@@ -190,7 +194,7 @@ COST_LINE = "Cost "
 
 
 def cost_line(config_name: str, served_model: str, agent_cost_usd: float) -> str:
-    """One line, so ``scripts/run-eval.py`` can read it from the run's mixed output."""
+    """One line, so it can be read from the run's mixed output."""
     cost = {
         "config_name": config_name,
         "served_model": served_model,
@@ -213,6 +217,7 @@ def main(
     run_parser.add_argument(
         "config", type=Path, help="Configuration file (YAML), or - to read it from stdin"
     )
+    commands.add_parser("batch", help="Run one batch, as its environment describes it")
     delete_parser = commands.add_parser("delete", help="Delete every trace of one run")
     delete_parser.add_argument(
         "experiment_id", help="The experiment id: the baseline= value in the experiment URL"
@@ -224,6 +229,8 @@ def main(
 
     if args.command == "delete":
         return delete(args.experiment_id, yes=args.yes, runs_factory=runs_factory)
+    if args.command == "batch":
+        return batch.main(os.environ, docker_client_factory=docker_client_factory)
 
     signal.signal(signal.SIGTERM, _terminate)
     silence_langwatch()

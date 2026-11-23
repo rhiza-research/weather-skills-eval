@@ -394,6 +394,7 @@ def _run(
         port=config.port,
         start_timeout=settings.app_start_timeout,
         poll_interval=settings.poll_interval,
+        batch=settings.batch,
         **(instance_options or {}),
     ) as instance:
 
@@ -438,6 +439,8 @@ def _run(
             "max_turns": str(settings.max_turns),
             "harness_commit": settings.harness_commit or UNRECORDED,
             "batch": settings.batch,
+            "app_image_revision": settings.app_image_revision,
+            "app_image_pr_number": settings.app_image_pr_number,
             "dataset": config.dataset,
             "dataset_version": dataset_version.isoformat() if dataset_version else LATEST,
             "dataset_items": str(len(tasks)),

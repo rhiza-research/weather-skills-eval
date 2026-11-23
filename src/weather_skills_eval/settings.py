@@ -35,6 +35,10 @@ class Settings:
     max_turns: int
     harness_commit: str
     batch: str
+    # The app image's org.opencontainers.image.revision and weather-skills-chat.pr-number
+    # labels, as the batch read them; empty when unset.
+    app_image_revision: str = ""
+    app_image_pr_number: str = ""
 
 
 # Read by the Langfuse SDK and LiteLLM themselves; checked here so a run fails
@@ -121,6 +125,8 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         max_turns=_whole(environ, "EVAL_MAX_TURNS", DEFAULT_MAX_TURNS, minimum=1),
         # Set at image build time from the harness checkout; see compose.yaml.
         harness_commit=environ.get("EVAL_HARNESS_COMMIT", "").strip(),
-        # Groups the runs one scripts/run-eval.py invocation starts.
+        # Groups the runs one batch starts.
         batch=environ.get("EVAL_BATCH", "").strip(),
+        app_image_revision=environ.get("EVAL_APP_IMAGE_REVISION", "").strip(),
+        app_image_pr_number=environ.get("EVAL_APP_IMAGE_PR_NUMBER", "").strip(),
     )

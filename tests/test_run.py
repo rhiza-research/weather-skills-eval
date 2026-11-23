@@ -56,6 +56,7 @@ from weather_skills_eval.config import RUNNER_ENV, ConfigError
 from weather_skills_eval.instance import (
     APP_DATA_DIR,
     ARTIFACTS_SUBPATH,
+    BATCH_LABEL,
     EMULATOR_API_PORT,
     EMULATOR_BIND_PORT,
     EMULATOR_DIR,
@@ -356,11 +357,45 @@ def test_the_batch_is_recorded_in_the_experiment_metadata(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))
 
-    harness.run(EVAL_BATCH=" 2026-10-22T20:07:57Z ", EVAL_HARNESS_COMMIT="7f454f0")
+    harness.run(
+        EVAL_BATCH=" 2026-10-22T20:07:57Z ",
+        EVAL_HARNESS_COMMIT="7f454f0",
+        EVAL_APP_IMAGE_REVISION="8dd46ed4",
+        EVAL_APP_IMAGE_PR_NUMBER="42",
+    )
 
     metadata = harness.gateway.experiments[0]["metadata"]
     assert metadata["batch"] == "2026-10-22T20:07:57Z"
     assert metadata["harness_commit"] == "7f454f0"
+    assert metadata["app_image_revision"] == "8dd46ed4"
+    assert metadata["app_image_pr_number"] == "42"
+    # Every container and the volume the run creates carry the batch id.
+    docker_ = harness.docker
+    labels = [docker_.source.labels, docker_.volume().labels]
+    labels += [call["labels"] for call in docker_.setup_calls + docker_.create_calls]
+    labels += [call["labels"] for call in docker_.run_calls]
+    assert [label[BATCH_LABEL] for label in labels] == ["2026-10-22T20:07:57Z"] * 5
+
+
+def test_an_image_id_is_never_pulled(tmp_path):
+    items = [task("t1", "rain forecast kenya")]
+    image_id = "sha256:" + "a" * 64
+    local = local_image([f"{APP_REPOSITORY}@sha256:abc"], image_id=image_id)
+    harness = Harness(tmp_path, items, reply_done_on(1), local=local)
+    harness.config_path.write_text(
+        CONFIG.replace(APP_IMAGE_LINE, "image: ${APP_IMAGE}").replace(
+            RUNNER_IMAGE, "${RUNNER_IMAGE}"
+        )
+    )
+
+    # As a batch passes them; pull is true by default.
+    harness.run(APP_IMAGE=image_id, RUNNER_IMAGE=image_id)
+
+    assert harness.docker.pulled == []
+    assert harness.docker.looked_up == [image_id, image_id]
+    metadata = harness.gateway.experiments[0]["metadata"]
+    assert metadata["image_id"] == metadata["runner_image_id"] == image_id
+    assert metadata["image_digest"] == f"{APP_REPOSITORY}@sha256:abc"
 
 
 def test_config_read_from_stdin(tmp_path):

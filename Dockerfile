@@ -9,12 +9,14 @@ WORKDIR /app
 
 COPY pyproject.toml uv.lock README.md ./
 
-# The image the eval service runs: no dev dependencies. The configuration is
-# piped in on stdin at run time, so editing one does not rebuild the image.
+# The image the eval service and the batch run: no dev dependencies. The
+# configurations are copied last, for the batch to read; a run by hand still
+# takes its configuration on stdin.
 FROM base AS eval
 RUN uv sync --locked --no-dev --no-install-project
 COPY src ./src
 RUN uv sync --locked --no-dev
+COPY configs ./configs
 # The harness commit recorded in each experiment's metadata.
 ARG HARNESS_COMMIT=""
 ENV EVAL_HARNESS_COMMIT=$HARNESS_COMMIT

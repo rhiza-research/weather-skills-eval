@@ -6,7 +6,13 @@ from fakes import display_image, display_page, tool_call
 from weather_skills_eval import runner
 from weather_skills_eval.app_client import highest_skill_versions, version_key, visible_text
 from weather_skills_eval.checks import ReplyFiles, reply_files
-from weather_skills_eval.config import DEFAULT_APP_PORT, ConfigError, pack_name, parse_config
+from weather_skills_eval.config import (
+    DEFAULT_APP_PORT,
+    ConfigError,
+    pack_name,
+    parse_config,
+    secret_references,
+)
 from weather_skills_eval.judge import JudgeRuling, PanelRuling
 from weather_skills_eval.runner import comparability_hash
 from weather_skills_eval.scoring import split_usage, trace_metrics
@@ -93,6 +99,22 @@ def test_a_reference_resolves_from_the_environment_and_an_unset_or_empty_one_nam
             parse_config(config(image=image), default_name="x", environ=environ)
         assert error.value.field == "image"
         assert f"${{{name}}}" in str(error.value)
+
+
+def test_secret_references_are_the_variables_secret_named_keys_reference():
+    raw = config(
+        env={
+            **BASE_ENV,
+            "OPENAI_API_KEYS": ["${OR}", "${OTHER}"],
+            "LANGFUSE_BASE_URL": "${URL}",
+            "TOOL_SERVERS": {"0": {"key": "${TOOL}", "url": "${TOOL_URL}"}},
+            # A literal is left for parse_config to reject.
+            "MISTRAL_API_KEY": "literal",
+        },
+        image="${APP_IMAGE}",
+    )
+    assert secret_references(raw) == {"S", "P", "K", "OR", "OTHER", "TOOL"}
+    assert secret_references(None) == set()
 
 
 def test_config_requires_the_admin_api_key():

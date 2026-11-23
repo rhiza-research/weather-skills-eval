@@ -158,6 +158,33 @@ def is_secret_name(name: str) -> bool:
     return any(word.lower() in SECRET_WORDS for word in _WORD.findall(name))
 
 
+def secret_references(raw: object) -> set[str]:
+    """The variables that secret-named keys in a configuration's ``env``
+    reference, read before resolving, so a batch knows which secrets a run
+    needs. A value that is not a single reference is left for ``parse_config``
+    to reject."""
+    names: set[str] = set()
+
+    def collect(key: object, value: object) -> None:
+        if isinstance(value, Mapping):
+            for child_key, child in value.items():
+                collect(child_key, child)
+        elif isinstance(value, list):
+            # A list's items take the key of the list, as in _resolve_tree.
+            for child in value:
+                collect(key, child)
+        elif isinstance(key, str) and isinstance(value, str) and is_secret_name(key):
+            match = REFERENCE.fullmatch(value.strip())
+            if match:
+                names.add(match.group(1))
+
+    env = raw.get("env") if isinstance(raw, Mapping) else None
+    if isinstance(env, Mapping):
+        for key, value in env.items():
+            collect(key, value)
+    return names
+
+
 def _lookup(field: str, name: str, environ: Mapping[str, str]) -> str:
     value = environ.get(name)
     if value is None:
