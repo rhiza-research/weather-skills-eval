@@ -657,6 +657,8 @@ def test_skill_state_is_set_only_where_it_differs_from_the_commit(tmp_path):
         ("enabled-by-default", "pack-0", "skill_plot", {"enabled": False}),
     ]
     assert harness.output()["outcome"] == "goal_reached"
+    # The chats get no tool of the skill switched off.
+    assert harness.app.completions[0]["tool_ids"] == ["fetch"]
 
 
 @pytest.mark.parametrize("missing", ["pack", "skill"])

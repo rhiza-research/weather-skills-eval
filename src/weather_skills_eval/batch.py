@@ -29,12 +29,17 @@ Order of a batch:
    in. After a run that finds the app ignored its catalog (exit 6), no further
    run starts (AD-12).
 
+On SIGTERM, as from ``docker stop``, the batch starts no further run and stops
+each run's container, giving it ``HARNESS_STOP_SECONDS`` to remove what it
+created; then it ends with exit 143.
+
 Exit codes: 0 when every run exited 0; 1 when any did not; 2 when the batch
 did not start (a setting, the configuration file or the configs repo files);
-3 when Docker failed before the first run.
+3 when Docker failed before the first run; 143 when it was stopped.
 """
 
 import codecs
+import signal
 import sys
 import threading
 import uuid
@@ -59,6 +64,10 @@ from .settings import REQUIRED_PASSTHROUGH, SettingsError, _required, _whole
 EXIT_FAILED = 1
 EXIT_NOT_STARTED = 2
 EXIT_DOCKER = 3
+EXIT_TERMINATED = 143
+# How long each run gets to remove its containers when the batch stops; less
+# than the grace the kill command gives the batch.
+HARNESS_STOP_SECONDS = 60
 
 NETWORK = "weather-skills-eval"
 HARNESS_LABEL_VALUE = "harness"
@@ -364,11 +373,15 @@ def run_one(
     lock: threading.Lock,
     out,
     err,
+    live: dict | None = None,
+    stopping: threading.Event | None = None,
 ) -> int:
     """One run in a child container of the eval image, with the configuration
     ``name`` and ``files``, by path, copied in and the run's stdout and stderr
-    passed on; returns its exit code. The container is removed when the run
-    ends."""
+    passed on; returns its exit code. The container is in ``live``, by ID,
+    while it exists, so a stopping batch can stop it; it is removed when the
+    run ends."""
+    live = {} if live is None else live
     path = f"{RUN_CONFIG_DIR}/{name}"
     container = docker.containers.create(
         pinned.eval_id,
@@ -380,11 +393,23 @@ def run_one(
         network=NETWORK,
         volumes={DOCKER_SOCKET: {"bind": DOCKER_SOCKET, "mode": "rw"}},
     )
+    with lock:
+        live[container.id] = container
     try:
         # No bind mount, as for the runner's emulator files.
         if not container.put_archive("/", _archive({path: text.encode("utf-8"), **files})):
             raise RuntimeError("the configuration could not be copied into the run container")
-        container.start()
+        with lock:
+            # The batch began stopping after this container was created: the
+            # stop of the live runs found it not yet started.
+            if stopping is not None and stopping.is_set():
+                print(
+                    f"{environment.get('EVAL_MODEL', name)}: not started: the batch was stopped",
+                    file=out,
+                    flush=True,
+                )
+                return EXIT_NOT_STARTED
+            container.start()
         errors: list[str] = []
         readers = [
             threading.Thread(
@@ -404,12 +429,24 @@ def run_one(
         for reader in readers:
             reader.join()
         status = container.wait()
-        if errors:
-            raise RuntimeError(f"the run's output could not be read: {'; '.join(errors)}")
         if "StatusCode" not in status:
             raise RuntimeError(f"Docker reported no exit code: {status}")
-        return status["StatusCode"]
+        code = status["StatusCode"]
+        if errors:
+            with lock:
+                print(
+                    f"Warning: {environment.get('EVAL_MODEL', name)}: the run's output could "
+                    f"not be read to the end: {'; '.join(errors)}",
+                    file=err,
+                    flush=True,
+                )
+            # A failing code is kept, so a run that exited 6 still stops the
+            # batch; a run whose output was lost does not count as passed.
+            return code or EXIT_FAILED
+        return code
     finally:
+        with lock:
+            live.pop(container.id, None)
         try:
             container.remove(force=True)
         except Exception as exc:
@@ -481,7 +518,8 @@ def main(
     out=sys.stdout,
     err=sys.stderr,
 ) -> int:
-    lock = threading.Lock()
+    # Reentrant: the SIGTERM handler takes it on the main thread, which may hold it.
+    lock = threading.RLock()
 
     def say(line: str) -> None:
         with lock:
@@ -526,8 +564,32 @@ def main(
     secrets = {secret: values[secret] for secret in needed if secret in values}
     # Set once a run finds the app ignored its catalog; no run starts after it.
     ignored_catalog = threading.Event()
+    # Set on SIGTERM, as from docker stop; no run starts after it.
+    stopping = threading.Event()
+    # Each run's container, by ID, while it exists.
+    live: dict = {}
+
+    def stop(number, frame) -> None:
+        """Starts no further run, and stops each run's container, so the run
+        removes its app, runner and volume before Docker kills it."""
+        stopping.set()
+        with lock:
+            containers = list(live.values())
+        say(f"Batch stopping: stopping {len(containers)} runs")
+
+        def stop_one(container) -> None:
+            try:
+                container.stop(timeout=HARNESS_STOP_SECONDS)
+            except Exception as exc:
+                say(f"Could not stop run container {container.name}: {exc}")
+
+        for container in containers:
+            threading.Thread(target=stop_one, args=(container,)).start()
 
     def start(model: str, repetition: int, prefix: str) -> int:
+        if stopping.is_set():
+            say(f"{model} run {repetition}: not started: the batch was stopped")
+            return EXIT_NOT_STARTED
         if missing:
             say(f"{model} run {repetition}: not started: {'; '.join(missing)}")
             return EXIT_NOT_STARTED
@@ -549,6 +611,8 @@ def main(
             lock,
             out,
             err,
+            live,
+            stopping,
         )
         if code == EXIT_CATALOG:
             ignored_catalog.set()
@@ -561,7 +625,17 @@ def main(
         for model in settings.models
     ]
     results: list[tuple[str, int]] = []
-    run_queue(queue, settings.parallel_runs, start, results, lock, out)
+    # Only the main thread can take a signal handler.
+    on_main = threading.current_thread() is threading.main_thread()
+    previous = signal.signal(signal.SIGTERM, stop) if on_main else None
+    try:
+        run_queue(queue, settings.parallel_runs, start, results, lock, out)
+    finally:
+        # None: a handler not set from Python, which cannot be put back.
+        if on_main and previous is not None:
+            signal.signal(signal.SIGTERM, previous)
     passed = sum(1 for _, code in results if code == 0)
     say(f"Batch {settings.batch} finished: {passed} of {len(results)} runs exited 0")
+    if stopping.is_set():
+        return EXIT_TERMINATED
     return 0 if passed == len(results) else EXIT_FAILED

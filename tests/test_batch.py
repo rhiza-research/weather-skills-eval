@@ -1,9 +1,13 @@
 """The batch, through ``batch.main`` with fake Docker and a fake Secret Manager."""
 
+import ast
 import io
 import json
+import os
+import signal
 import tarfile
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import docker.errors
@@ -50,6 +54,7 @@ ENVIRON = {
     "OPENROUTER_API_KEY": "or-test",
     "APP_KEY": "app-key",
     "APP_OPENROUTER_API_KEY": "or-app",
+    "LANGFUSE_TRACING_ENVIRONMENT": "eval",
     "HOSTNAME": "batch-container",
 }
 
@@ -77,9 +82,13 @@ class RunContainer:
     """A run's container: its ``stdout`` and ``stderr`` chunks, then ``code``.
     A held one's stdout ends only once ``release`` is set."""
 
-    def __init__(self, kwargs, stdout=(), stderr=(), code=0, hold=False, on_wait=None):
+    def __init__(
+        self, kwargs, stdout=(), stderr=(), code=0, hold=False, on_wait=None, stream_error=None
+    ):
         self.kwargs = kwargs
-        self.name = kwargs["name"]
+        self.name = self.id = kwargs["name"]
+        self.stream_error = stream_error
+        self.stopped = False
         self.model = kwargs["environment"]["EVAL_MODEL"]
         self.stdout, self.stderr, self.code = list(stdout), list(stderr), code
         self.release = threading.Event()
@@ -102,7 +111,15 @@ class RunContainer:
 
     def _stdout(self):
         yield from self.stdout
+        if self.stream_error:
+            raise self.stream_error
         self.release.wait(10)
+
+    def stop(self, timeout):
+        # As docker stop: the run gets SIGTERM, removes what it created and exits 143.
+        self.stopped = True
+        self.code = 143
+        self.release.set()
 
     def wait(self):
         if self.on_wait:
@@ -264,6 +281,8 @@ def test_a_batch_pins_its_images_and_runs_each_model_once_per_round(tmp_path):
         assert env["EVAL_APP_IMAGE_REVISION"] == "8dd46ed4"
         assert env["EVAL_APP_IMAGE_PR_NUMBER"] == "42"
         assert env["EVAL_BATCH"] == BATCH and env["APP_KEY"] == "app-key"
+        # A variable with no secret name reaches every run as it is.
+        assert env["LANGFUSE_TRACING_ENVIRONMENT"] == "eval"
         assert "HOSTNAME" not in env
         assert container.started and container.removed
     assert fake.networks_created == []
@@ -483,6 +502,109 @@ def test_a_docker_error_before_the_runs_stops_the_batch(tmp_path):
     assert code == batch_module.EXIT_DOCKER
     assert "Batch not started, Docker failed: " in err
     assert fake.runs == []
+
+
+def test_sigterm_stops_each_running_run_and_starts_no_other(tmp_path):
+    def run(kwargs):
+        container = RunContainer(kwargs, [b"working\n"], hold=True)
+        # docker stop on the batch while its first run plays: to the process,
+        # so the main thread, waiting in the queue, takes it.
+        threading.Timer(0.2, os.kill, args=(os.getpid(), signal.SIGTERM)).start()
+        return container
+
+    fake = FakeDocker(run)
+    before = signal.getsignal(signal.SIGTERM)
+
+    code, out, _, _ = run_batch(tmp_path, fake)
+
+    [first] = fake.runs
+    assert first.stopped and first.removed
+    assert "m-a run 1: exit 143\n" in out
+    assert "m-b run 1: not started: the batch was stopped\n" in out
+    assert code == batch_module.EXIT_TERMINATED
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_a_run_created_as_the_batch_stops_is_never_started(tmp_path):
+    fake = FakeDocker()
+    container = fake.containers.create(EVAL_ID, name="h", environment={"EVAL_MODEL": "m-a"})
+    fake.runs.clear()
+    fake.run = lambda kwargs: container
+    stopping = threading.Event()
+    stopping.set()
+    out = io.StringIO()
+
+    code = batch_module.run_one(
+        fake,
+        batch_module.PinnedImages(EVAL_ID, APP_ID, RUNNER_ID, "", ""),
+        BATCH,
+        "weather-eval.yaml",
+        CONFIG_TEXT,
+        {},
+        {"EVAL_MODEL": "m-a"},
+        "",
+        threading.RLock(),
+        out,
+        io.StringIO(),
+        {},
+        stopping,
+    )
+
+    assert code == batch_module.EXIT_NOT_STARTED
+    assert not container.started and container.removed
+    assert out.getvalue() == "m-a: not started: the batch was stopped\n"
+
+
+def test_a_run_whose_output_breaks_keeps_its_exit_code(tmp_path):
+    def run(kwargs):
+        broken = OSError("connection reset")
+        return RunContainer(kwargs, [b"half"], code=batch_module.EXIT_CATALOG, stream_error=broken)
+
+    fake = FakeDocker(run)
+
+    _, out, err, _ = run_batch(tmp_path, fake)
+
+    assert "m-a run 1: exit 6\n" in out
+    assert "Warning: weather-eval.yaml: the run's output could not be read to the end" in err
+    # The kept code still stops the batch.
+    assert [r.model for r in fake.runs] == ["m-a"]
+
+
+def test_read_secret_reads_the_latest_version_and_strips_it(monkeypatch):
+    from google.cloud import secretmanager
+
+    names = []
+
+    class Client:
+        def access_secret_version(self, name):
+            names.append(name)
+            return SimpleNamespace(payload=SimpleNamespace(data=b" s3cret\n"))
+
+    monkeypatch.setattr(secretmanager, "SecretManagerServiceClient", Client)
+
+    assert batch_module.read_secret("sheerwater", "weather-skills-eval-x") == "s3cret"
+    assert names == ["projects/sheerwater/secrets/weather-skills-eval-x/versions/latest"]
+
+
+def test_the_launcher_and_the_batch_agree_on_paths_and_labels():
+    """The launcher is a uv script that does not import the package, so its
+    literals are read from its source."""
+    source = Path(__file__).resolve().parent.parent / "scripts" / "run-eval.py"
+    literals = {}
+    for node in ast.parse(source.read_text()).body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    literals[target.id] = node.value.value
+    # docker cp of the archive lands where the batch reads the configs repo.
+    prefix = literals["ARCHIVE_PREFIX"].rstrip("/")
+    assert f"{literals['COPY_TARGET']}/{prefix}" == CONFIGS_REPO_DIR
+    # The labels the launcher sets and filters on are the batch's and harness's.
+    assert literals["LABEL"] == LABEL
+    assert literals["BATCH_LABEL"] == BATCH_LABEL
+    assert literals["HARNESS_ROLE"] == HARNESS_LABEL_VALUE
+    assert literals["HARNESS_STOP_SECONDS"] == batch_module.HARNESS_STOP_SECONDS
+    assert literals["BATCH_STOP_SECONDS"] > batch_module.HARNESS_STOP_SECONDS
 
 
 def test_the_cli_batch_command_runs_the_batch_from_its_environment(monkeypatch, capsys):

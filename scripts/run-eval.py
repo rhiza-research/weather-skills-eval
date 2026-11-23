@@ -13,12 +13,15 @@ every queued run on its own, so the terminal can close. With EVAL_HOST=vm in
 .env, it first moves the checkout to exactly origin/main and runs itself again
 from it."""
 
+import fcntl
 import io
 import os
+import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -50,15 +53,30 @@ ARCHIVE_PREFIX = "configs-repo/"
 BATCH_CONTAINER = "weather-skills-eval-batch"
 LABEL = "weather-skills-eval"
 BATCH_LABEL = "weather-skills-eval.batch"
+# The LABEL value of a batch's run containers.
+HARNESS_ROLE = "harness"
 EVAL_IMAGE_TAG = "weather-skills-eval"
 DOCKER_SOCKET = "/var/run/docker.sock"
-# docker ps output per batch container: name, state and batch id.
-BATCH_FORMAT = f'{{{{.Names}}}}\t{{{{.State}}}}\t{{{{.Label "{BATCH_LABEL}"}}}}'
-# Docker states of a batch container that no longer holds a batch.
-STOPPED = ("exited", "dead")
+# Where the launcher copies the configs archive in the batch container.
+COPY_TARGET = "/app"
+# docker ps output per batch container: ID, state and batch id.
+BATCH_FORMAT = f'{{{{.ID}}}}\t{{{{.State}}}}\t{{{{.Label "{BATCH_LABEL}"}}}}'
+# Docker states of a batch container that holds no batch. One only created
+# never started: the launch lock rules out a launch still starting it.
+STOPPED = ("exited", "dead", "created")
 # Set for the run of itself after an update, to the commit it moved to, so
 # that run does not update again.
 UPDATED_TO = "EVAL_CHECKOUT"
+# One launch at a time on a host, from the checkout update to the batch's
+# start. Outside the checkout, so moving the checkout leaves it alone.
+# /tmp, not tempfile.gettempdir(): TMPDIR differs per user, and the members
+# on the VM share one lock.
+LAUNCH_LOCK = Path("/tmp") / "weather-skills-eval-launch.lock"
+# The descriptor of the held lock, passed to the run of itself after an update.
+LOCK_FD = "EVAL_LAUNCH_LOCK_FD"
+# How long the batch, and each run in it, gets to stop before Docker kills it.
+BATCH_STOP_SECONDS = 90
+HARNESS_STOP_SECONDS = 60
 
 
 def _dotenv(dotenv_path):
@@ -134,12 +152,26 @@ def whole_number_valid(text):
 
 
 def kill_command(batch):
-    """A shell command that removes the batch container first, so it starts no
-    further run, then every container and volume labeled with its batch id."""
+    """A shell command that stops the batch first, so it starts no further run
+    and stops its runs, then stops any run still going, so each removes its
+    own containers; then removes every container labeled with the batch id
+    until none is left, as a run stopping late may still create one; then its
+    volumes."""
     label = f"label={BATCH_LABEL}={batch}"
+
+    def stop(role, seconds):
+        # By label, never by name: the name may be a newer batch's by now.
+        return (
+            f"ids=$(docker ps -q --filter '{label}' --filter 'label={LABEL}={role}'); "
+            f'[ -n "$ids" ] && docker stop -t {seconds} $ids; '
+        )
+
     return (
-        f"docker rm -f {BATCH_CONTAINER}; "
-        f"for c in $(docker ps -aq --filter '{label}'); do docker rm -f -v \"$c\"; done; "
+        stop("batch", BATCH_STOP_SECONDS)
+        + stop(HARNESS_ROLE, HARNESS_STOP_SECONDS)
+        + f"for i in 1 2 3 4 5 6 7 8 9 10; do ids=$(docker ps -aq --filter '{label}'); "
+        f'[ -z "$ids" ] && break; docker rm -f -v $ids; sleep 1; done; '
+        f'[ -n "$ids" ] && echo "Containers left: $ids" >&2; '
         f"for v in $(docker volume ls -q --filter '{label}'); do docker volume rm -f \"$v\"; done"
     )
 
@@ -228,6 +260,11 @@ def update_checkout():
         print(commit.stderr, end="", file=sys.stderr)
         return commit.returncode
     environ = {**os.environ, UPDATED_TO: commit.stdout.strip()}
+    # The run of itself keeps the launch lock: no other launch moves the
+    # checkout between this update and its start.
+    # take_launch_lock checked this descriptor, so it is an int and open.
+    if LOCK_FD in os.environ:
+        os.set_inheritable(int(os.environ[LOCK_FD]), True)
     try:
         os.execvpe("uv", ["uv", "run", str(SCRIPT), *sys.argv[1:]], environ)
     except OSError as exc:
@@ -257,8 +294,37 @@ def batch_containers():
     return [tuple(line.split("\t")) for line in listed.stdout.splitlines() if line.strip()]
 
 
+def take_launch_lock():
+    """Holds LAUNCH_LOCK until this process ends, waiting while another launch
+    on this host holds it. A run of itself after an update already holds it,
+    by the descriptor it inherited."""
+    if LOCK_FD in os.environ:
+        try:
+            # flock on the description this process already holds succeeds again.
+            fcntl.flock(int(os.environ[LOCK_FD]), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except (ValueError, OSError):
+            # Set in the shell, or stale: not a lock this launch holds.
+            del os.environ[LOCK_FD]
+    # Read only, so a lock file another user created is still usable; never
+    # through a symlink planted in /tmp.
+    lock = os.open(LAUNCH_LOCK, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o666)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("Another launch is under way on this host; waiting for it", flush=True)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    os.environ[LOCK_FD] = str(lock)
+
+
+def _stop_launch(number, frame):
+    # Unwinds the launch, so its container is removed on the way out.
+    raise SystemExit(128 + number)
+
+
 def run_eval():
     dotenv = ROOT / ".env"
+    take_launch_lock()
     if on_vm(dotenv):
         code = update_checkout()
         if code is not None:
@@ -349,6 +415,14 @@ def launch(dotenv, containers, offered, folder):
         print(commit.stderr, end="", file=sys.stderr)
         return commit.returncode
     commit = commit.stdout.strip()
+    # Read only: off the VM the image holds the working tree, changes included.
+    # No optional locks: git status may otherwise refresh the index.
+    status = _git("--no-optional-locks", "status", "--porcelain", capture=True)
+    if status.returncode != 0:
+        print(status.stderr, end="", file=sys.stderr)
+        return status.returncode
+    if status.stdout.strip():
+        commit = f"{commit}-dirty"
     iidfile = folder / "image-id"
     build = subprocess.run(
         [
@@ -370,9 +444,10 @@ def launch(dotenv, containers, offered, folder):
         return build.returncode
     image = iidfile.read_text().strip()
 
-    # A batch container that has stopped keeps its logs until a launch replaces it.
-    for name, _, _ in containers:
-        removed = subprocess.run(["docker", "rm", name])
+    # A batch container that has stopped keeps its logs until a launch
+    # replaces it. By ID: the name may already be another container's.
+    for container_id, _, _ in containers:
+        removed = subprocess.run(["docker", "rm", container_id])
         if removed.returncode != 0:
             return removed.returncode
     batch = new_batch()
@@ -389,6 +464,36 @@ def launch(dotenv, containers, offered, folder):
             "EVAL_BATCH": batch,
         }
     )
+    # A hangup or termination from here to the start removes the container
+    # too; a signal ignored, as under nohup, stays ignored.
+    previous = {}
+    for number in (signal.SIGHUP, signal.SIGTERM):
+        if signal.getsignal(number) is not signal.SIG_IGN:
+            previous[number] = signal.signal(number, _stop_launch)
+    # Filled in as the steps succeed, so a signal mid-way still finds the ID.
+    launched = {"id": None, "started": False}
+    try:
+        code = _create_and_start(dotenv, values, image, batch, archive, launched)
+    finally:
+        if launched["id"] and not launched["started"]:
+            # A container never started would hold the name of the next batch.
+            subprocess.run(["docker", "rm", "-f", launched["id"]], stdout=subprocess.DEVNULL)
+        for number, handler in previous.items():
+            # None: a handler not set from Python, which cannot be put back.
+            if handler is not None:
+                signal.signal(number, handler)
+    if not launched["started"]:
+        return code
+    print(f"Batch {batch} started in container {BATCH_CONTAINER}", flush=True)
+    print(f"Follow it with: docker logs -f {BATCH_CONTAINER}", flush=True)
+    return 0
+
+
+def _create_and_start(dotenv, values, image, batch, archive, launched):
+    """Creates the batch container, copies the configs archive in and starts
+    it, recording its ``id`` and whether it ``started`` in ``launched``.
+    Returns the exit code of the last step. Every step after the create acts
+    on the ID, never on the name."""
     created = subprocess.run(
         [
             "docker",
@@ -414,26 +519,23 @@ def launch(dotenv, containers, offered, folder):
             image,
             "batch",
         ],
-        stdout=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        text=True,
     )
     if created.returncode != 0:
         return created.returncode
+    launched["id"] = created.stdout.strip()
     # The configs repo files at the commit, copied in before it starts: the
     # batch container has no git access of its own.
     with open(archive, "rb") as files:
-        copied = subprocess.run(["docker", "cp", "-", f"{BATCH_CONTAINER}:/app"], stdin=files)
-    code = copied.returncode
-    if code == 0:
-        code = subprocess.run(
-            ["docker", "start", BATCH_CONTAINER], stdout=subprocess.DEVNULL
+        copied = subprocess.run(
+            ["docker", "cp", "-", f"{launched['id']}:{COPY_TARGET}"], stdin=files
         ).returncode
-    if code != 0:
-        # A container never started would hold the name of the next batch.
-        subprocess.run(["docker", "rm", "-f", BATCH_CONTAINER], stdout=subprocess.DEVNULL)
-        return code
-    print(f"Batch {batch} started in container {BATCH_CONTAINER}", flush=True)
-    print(f"Follow it with: docker logs -f {BATCH_CONTAINER}", flush=True)
-    return 0
+    if copied != 0:
+        return copied
+    start = subprocess.run(["docker", "start", launched["id"]], stdout=subprocess.DEVNULL)
+    launched["started"] = start.returncode == 0
+    return start.returncode
 
 
 def main():
@@ -569,6 +671,9 @@ def launch_setup(tmp_path, monkeypatch, dotenv, outputs=()):
     monkeypatch.setitem(globals(), "ROOT", tmp_path)
     for name in [*DEFAULTS, *PARALLEL_RUNS, *CONFIGS_REPO, "EVAL_JUDGE_MODELS", UPDATED_TO]:
         monkeypatch.delenv(name, raising=False)
+    # A copy, so the lock descriptor the launch records stays in this test.
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items() if k != LOCK_FD})
+    monkeypatch.setitem(globals(), "LAUNCH_LOCK", tmp_path / "launch.lock")
     asked = []
 
     def select(message, choices, **kwargs):
@@ -609,21 +714,46 @@ DOTENV = (
 LIST_BATCHES = ["docker", "ps", "--all", "--filter", f"label={LABEL}=batch", "--format"]
 
 
+CREATED_ID = "f00d" * 16
+LAUNCH_OUTPUTS = [
+    (["git", "rev-parse"], 0, "abc\n"),
+    (["docker", "create"], 0, f"{CREATED_ID}\n"),
+]
+
+
 def test_a_launch_builds_the_image_and_starts_one_detached_batch(tmp_path, monkeypatch, capsys):
-    # A batch container from an earlier batch has stopped.
-    old = f"{BATCH_CONTAINER}\texited\t2026-11-22T09:00:00Z\n"
+    # Batch containers from earlier batches: one stopped, one created and never started.
+    old = "old1\texited\t2026-11-22T09:00:00Z\nold2\tcreated\t2026-11-22T10:00:00Z\n"
     commands, asked = launch_setup(
         tmp_path,
         monkeypatch,
         DOTENV + "EVAL_PARALLEL_RUNS=2\n",
-        [(LIST_BATCHES, 0, old), (["git", "rev-parse"], 0, "abc\n")],
+        [(LIST_BATCHES, 0, old), *LAUNCH_OUTPUTS],
     )
 
     assert main() == 0
 
-    listed, init, fetch, archive, fetched, commit, build, removed, create, cp, start = (
-        commands.commands()
-    )
+    (
+        listed,
+        init,
+        fetch,
+        archive,
+        fetched,
+        commit,
+        status,
+        build,
+        removed,
+        removed_created,
+        create,
+        cp,
+        start,
+    ) = commands.commands()
+    # Removed by ID, never by name.
+    assert removed_created == ["docker", "rm", "old2"]
+    # Read only; a clean tree records the commit as it is.
+    assert status == ["git", "--no-optional-locks", "status", "--porcelain"]
+    # The launch lock is held, outside the checkout.
+    assert os.environ[LOCK_FD]
     assert listed == [*LIST_BATCHES, BATCH_FORMAT]
     # The ref, main by default, resolved to one commit with this machine's git.
     folder = init[-1]
@@ -634,10 +764,10 @@ def test_a_launch_builds_the_image_and_starts_one_detached_batch(tmp_path, monke
     # Locally the checkout is only read.
     assert commit == ["git", "rev-parse", "HEAD"]
     # Only once the image is built, so a failed build keeps the old logs.
-    assert removed == ["docker", "rm", BATCH_CONTAINER]
+    assert removed == ["docker", "rm", "old1"]
     assert build[:8] == ["docker", "build", "--target", "eval", "--build-arg", "HARNESS_COMMIT=abc"]
     assert build[-3:] == ["--tag", EVAL_IMAGE_TAG, "."]
-    assert commands.calls[6][1]["cwd"] == tmp_path
+    assert commands.calls[7][1]["cwd"] == tmp_path
     values = {
         "EVAL_JUDGE_MODELS": JUDGES[0],
         **DEFAULTS,
@@ -653,11 +783,12 @@ def test_a_launch_builds_the_image_and_starts_one_detached_batch(tmp_path, monke
         "EVAL_IMAGE": "sha256:eval",
         "EVAL_BATCH": "2026-11-23T10:00:00Z",
     }
-    # The configs files at the commit go in before the batch starts.
-    assert cp == ["docker", "cp", "-", f"{BATCH_CONTAINER}:/app"]
+    # The configs files at the commit go in before the batch starts, both by
+    # the ID docker create printed.
+    assert cp == ["docker", "cp", "-", f"{CREATED_ID}:{COPY_TARGET}"]
     with tarfile.open(fileobj=io.BytesIO(commands.copied)) as tar:
         assert f"{ARCHIVE_PREFIX}models/m-a.yaml" in tar.getnames()
-    assert start == ["docker", "start", BATCH_CONTAINER]
+    assert start == ["docker", "start", CREATED_ID]
     assert create == [
         "docker",
         "create",
@@ -689,14 +820,116 @@ def test_a_launch_builds_the_image_and_starts_one_detached_batch(tmp_path, monke
     )
 
 
+STUB_DOCKER = """#!/bin/sh
+# Logs each call; lists a run, two containers and a volume once each.
+echo "$*" >> "$LOG"
+case "$*" in
+  "ps -q "*"=batch") echo b1-container ;;
+  "ps -q "*"=harness") [ -e "$LOG.ran" ] || { touch "$LOG.ran"; echo h1; } ;;
+  "ps -aq "*) [ -e "$LOG.swept" ] || { touch "$LOG.swept"; echo c1; echo c2; } ;;
+  "volume ls "*) echo v1 ;;
+esac
+"""
+
+
+def test_the_kill_command_stops_then_sweeps_until_nothing_is_left(tmp_path):
+    (tmp_path / "docker").write_text(STUB_DOCKER)
+    (tmp_path / "docker").chmod(0o755)
+    log = tmp_path / "calls"
+    env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}", "LOG": str(log)}
+    # The real subprocess.run: the command runs in sh against the stub.
+    subprocess.run(["sh", "-c", kill_command("b1")], env=env, check=True)
+
+    label = f"label={BATCH_LABEL}=b1"
+    assert log.read_text().splitlines() == [
+        # The batch by its labels, never by its name.
+        f"ps -q --filter {label} --filter label={LABEL}=batch",
+        f"stop -t {BATCH_STOP_SECONDS} b1-container",
+        f"ps -q --filter {label} --filter label={LABEL}=harness",
+        f"stop -t {HARNESS_STOP_SECONDS} h1",
+        f"ps -aq --filter {label}",
+        "rm -f -v c1 c2",
+        # Swept again, until none is left.
+        f"ps -aq --filter {label}",
+        f"volume ls -q --filter {label}",
+        "volume rm -f v1",
+    ]
+
+
 def test_a_batch_container_the_files_cannot_be_copied_into_is_removed(tmp_path, monkeypatch):
-    commands, _ = launch_setup(tmp_path, monkeypatch, DOTENV, [(["docker", "cp"], 1, "")])
+    commands, _ = launch_setup(
+        tmp_path, monkeypatch, DOTENV, [*LAUNCH_OUTPUTS, (["docker", "cp"], 1, "")]
+    )
 
     assert main() == 1
 
     *_, cp, removed = commands.commands()
     assert cp[:2] == ["docker", "cp"]
-    assert removed == ["docker", "rm", "-f", BATCH_CONTAINER]
+    assert removed == ["docker", "rm", "-f", CREATED_ID]
+
+
+def test_a_termination_before_the_start_removes_the_batch_container(tmp_path, monkeypatch):
+    commands, _ = launch_setup(tmp_path, monkeypatch, DOTENV, LAUNCH_OUTPUTS)
+    copy = commands.__call__
+
+    def terminated_during_copy(command, **kwargs):
+        if command[:2] == ["docker", "cp"]:
+            # A real SIGTERM, which the handler installed for this window takes.
+            os.kill(os.getpid(), signal.SIGTERM)
+        return copy(command, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", terminated_during_copy)
+    before = signal.getsignal(signal.SIGTERM)
+
+    try:
+        main()
+    except SystemExit as exc:
+        assert exc.code == 128 + signal.SIGTERM
+    else:
+        raise AssertionError("expected SystemExit")
+
+    assert commands.commands()[-1] == ["docker", "rm", "-f", CREATED_ID]
+    assert ["docker", "start", CREATED_ID] not in commands.commands()
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_a_second_launch_waits_for_the_launch_lock(tmp_path, monkeypatch, capsys):
+    launch_setup(tmp_path, monkeypatch, DOTENV)
+    # Another launch holds it, on its own open file description.
+    other = os.open(LAUNCH_LOCK, os.O_RDONLY | os.O_CREAT)
+    fcntl.flock(other, fcntl.LOCK_EX)
+    released = []
+
+    def release():
+        released.append(True)
+        os.close(other)
+
+    threading.Timer(0.2, release).start()
+
+    take_launch_lock()
+
+    assert released
+    assert capsys.readouterr().out == "Another launch is under way on this host; waiting for it\n"
+    assert os.environ[LOCK_FD]
+
+
+def test_off_the_vm_a_checkout_with_changes_is_recorded_dirty_and_left_as_it_is(
+    tmp_path, monkeypatch
+):
+    commands, _ = launch_setup(
+        tmp_path,
+        monkeypatch,
+        DOTENV,
+        [*LAUNCH_OUTPUTS, (["git", "--no-optional-locks"], 0, " M src/x.py\n")],
+    )
+
+    assert main() == 0
+
+    [build] = [c for c in commands.commands() if c[:2] == ["docker", "build"]]
+    assert "HARNESS_COMMIT=abc-dirty" in build
+    # Only reads of the checkout; the configs fetch is in its own folder (-C).
+    git = [c[1] for c in commands.commands() if c[0] == "git" and c[1] != "-C"]
+    assert set(git) <= {"init", "rev-parse", "--no-optional-locks"}
 
 
 def test_a_running_batch_is_named_with_its_kill_command_and_nothing_starts(
@@ -713,12 +946,6 @@ def test_a_running_batch_is_named_with_its_kill_command_and_nothing_starts(
         "A batch is running: 2026-11-23T08:00:00Z\n"
         f"Kill it with: {kill_command('2026-11-23T08:00:00Z')}\n"
     )
-    # The batch container first, then its runs' containers and volumes, by label.
-    command = kill_command("2026-11-23T08:00:00Z")
-    label = f"label={BATCH_LABEL}=2026-11-23T08:00:00Z"
-    assert command.index(f"docker rm -f {BATCH_CONTAINER}") < command.index(label)
-    assert f"docker ps -aq --filter '{label}'" in command
-    assert f"docker volume ls -q --filter '{label}'" in command
 
 
 def test_without_judge_models_the_script_stops_before_asking(tmp_path, monkeypatch, capsys):
@@ -780,6 +1007,8 @@ def test_on_the_vm_the_checkout_moves_to_origin_main_and_the_script_runs_again(
     [(file, args, env)] = execs
     assert (file, args) == ("uv", ["uv", "run", str(SCRIPT)])
     assert env[UPDATED_TO] == "def"
+    # The run of itself inherits the held lock.
+    assert os.get_inheritable(int(env[LOCK_FD]))
     assert asked == []
 
     # The run of itself finds the checkout at that commit and goes on to launch.

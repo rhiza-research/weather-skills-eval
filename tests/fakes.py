@@ -243,7 +243,15 @@ class FakeApp:
         path = request.url.path
         assert request.headers["authorization"] == "Bearer sk-test-key"
         if path == "/api/v1/tool_summary":
-            return httpx.Response(200, json=self.tools)
+            # As the app, which leaves out the tools of skills switched off,
+            # or of a pack switched off.
+            off = {
+                skill["name"]
+                for state in self.pack_state.values()
+                for skill in state["skills"]
+                if not (skill["is_active"] and state["is_active"])
+            }
+            return httpx.Response(200, json=[t for t in self.tools if t["name"] not in off])
         if path == "/api/v1/models/":
             assert request.headers["x-organization-id"] == "platform"
             catalog = json.loads(self.app_env().get("CATALOG_MODELS", "[]"))

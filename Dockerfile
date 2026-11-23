@@ -29,4 +29,6 @@ COPY src ./src
 RUN uv sync --locked
 COPY tests ./tests
 COPY configs ./configs
+# A test reads the launcher's literals to check they match the batch's.
+COPY scripts ./scripts
 COPY .env.example ./
