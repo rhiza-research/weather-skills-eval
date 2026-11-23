@@ -67,11 +67,11 @@ STOPPED = ("exited", "dead", "created")
 # Set for the run of itself after an update, to the commit it moved to, so
 # that run does not update again.
 UPDATED_TO = "EVAL_CHECKOUT"
-# One launch at a time on a host, from the checkout update to the batch's
-# start. Outside the checkout, so moving the checkout leaves it alone.
-# /tmp, not tempfile.gettempdir(): TMPDIR differs per user, and the members
-# on the VM share one lock.
-LAUNCH_LOCK = Path("/tmp") / "weather-skills-eval-launch.lock"
+# One launch at a time per checkout, from the checkout update to the batch's
+# start. The file lives in the checkout's git directory, which moving the
+# checkout to origin/main never touches; None resolves it at launch.
+LAUNCH_LOCK = None
+LAUNCH_LOCK_NAME = "weather-skills-eval-launch.lock"
 # The descriptor of the held lock, passed to the run of itself after an update.
 LOCK_FD = "EVAL_LAUNCH_LOCK_FD"
 # How long the batch, and each run in it, gets to stop before Docker kills it.
@@ -295,8 +295,8 @@ def batch_containers():
 
 
 def take_launch_lock():
-    """Holds LAUNCH_LOCK until this process ends, waiting while another launch
-    on this host holds it. A run of itself after an update already holds it,
+    """Holds the launch lock until this process ends, waiting while another
+    launch from this checkout holds it. A run of itself after an update already holds it,
     by the descriptor it inherited."""
     if LOCK_FD in os.environ:
         try:
@@ -306,13 +306,21 @@ def take_launch_lock():
         except (ValueError, OSError):
             # Set in the shell, or stale: not a lock this launch holds.
             del os.environ[LOCK_FD]
+    path = LAUNCH_LOCK
+    if path is None:
+        git_dir = _git("rev-parse", "--git-dir", capture=True)
+        if git_dir.returncode != 0:
+            print(git_dir.stderr, end="", file=sys.stderr)
+            raise SystemExit(git_dir.returncode)
+        # Relative to the checkout when git prints it so.
+        path = ROOT / git_dir.stdout.strip() / LAUNCH_LOCK_NAME
     # Read only, so a lock file another user created is still usable; never
-    # through a symlink planted in /tmp.
-    lock = os.open(LAUNCH_LOCK, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o666)
+    # through a symlink.
+    lock = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o666)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        print("Another launch is under way on this host; waiting for it", flush=True)
+        print("Another launch is under way from this checkout; waiting for it", flush=True)
         fcntl.flock(lock, fcntl.LOCK_EX)
     os.environ[LOCK_FD] = str(lock)
 
@@ -673,7 +681,9 @@ def launch_setup(tmp_path, monkeypatch, dotenv, outputs=()):
         monkeypatch.delenv(name, raising=False)
     # A copy, so the lock descriptor the launch records stays in this test.
     monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items() if k != LOCK_FD})
-    monkeypatch.setitem(globals(), "LAUNCH_LOCK", tmp_path / "launch.lock")
+    # The checkout's git directory, as git rev-parse --git-dir finds it.
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setitem(globals(), "LAUNCH_LOCK", tmp_path / ".git" / LAUNCH_LOCK_NAME)
     asked = []
 
     def select(message, choices, **kwargs):
@@ -893,6 +903,18 @@ def test_a_termination_before_the_start_removes_the_batch_container(tmp_path, mo
     assert signal.getsignal(signal.SIGTERM) is before
 
 
+def test_the_launch_lock_is_in_the_checkouts_git_directory(tmp_path, monkeypatch):
+    commands, _ = launch_setup(
+        tmp_path, monkeypatch, DOTENV, [(["git", "rev-parse", "--git-dir"], 0, ".git\n")]
+    )
+    monkeypatch.setitem(globals(), "LAUNCH_LOCK", None)
+
+    take_launch_lock()
+
+    assert commands.commands() == [["git", "rev-parse", "--git-dir"]]
+    assert (tmp_path / ".git" / LAUNCH_LOCK_NAME).exists()
+
+
 def test_a_second_launch_waits_for_the_launch_lock(tmp_path, monkeypatch, capsys):
     launch_setup(tmp_path, monkeypatch, DOTENV)
     # Another launch holds it, on its own open file description.
@@ -909,7 +931,9 @@ def test_a_second_launch_waits_for_the_launch_lock(tmp_path, monkeypatch, capsys
     take_launch_lock()
 
     assert released
-    assert capsys.readouterr().out == "Another launch is under way on this host; waiting for it\n"
+    assert capsys.readouterr().out == (
+        "Another launch is under way from this checkout; waiting for it\n"
+    )
     assert os.environ[LOCK_FD]
 
 
