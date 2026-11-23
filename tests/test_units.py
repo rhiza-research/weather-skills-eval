@@ -13,6 +13,7 @@ from weather_skills_eval.config import (
     parse_config,
     secret_references,
 )
+from weather_skills_eval.configs_repo import normalize_repo, parse_connection_keys
 from weather_skills_eval.judge import JudgeRuling, PanelRuling
 from weather_skills_eval.runner import comparability_hash
 from weather_skills_eval.scoring import split_usage, trace_metrics
@@ -115,6 +116,20 @@ def test_secret_references_are_the_variables_secret_named_keys_reference():
     )
     assert secret_references(raw) == {"S", "P", "K", "OR", "OTHER", "TOOL"}
     assert secret_references(None) == set()
+
+
+def test_the_configs_repo_is_recorded_as_https_without_git_and_keys_map_by_base_url():
+    for url in ("https://github.com/org/repo.git", "https://github.com/org/repo/ "):
+        assert normalize_repo(url) == "https://github.com/org/repo"
+    with pytest.raises(SettingsError):
+        normalize_repo("git@github.com:org/repo.git")
+    assert parse_connection_keys(" https://a.invalid/v1/=A_KEY, https://b.invalid/v1=B_KEY,") == {
+        "https://a.invalid/v1": "A_KEY",
+        "https://b.invalid/v1": "B_KEY",
+    }
+    for text in ("https://a.invalid/v1", "https://a.invalid/v1=not a name"):
+        with pytest.raises(SettingsError):
+            parse_connection_keys(text)
 
 
 def test_config_requires_the_admin_api_key():

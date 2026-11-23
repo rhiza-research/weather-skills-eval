@@ -4,8 +4,10 @@ socket is mounted. ``scripts/run-eval.py`` starts it as the detached container
 terminal can close.
 
 Order of a batch:
-1. Read its settings from the environment and its configuration files; stop
-   on any error (exit 2).
+1. Read its settings from the environment, its eval configuration file, and
+   the configs repo files at ``EVAL_CONFIGS_COMMIT``, which the launcher
+   copied into the batch container; stop on any error, or a model in
+   ``EVAL_MODELS`` that the commit does not define (exit 2).
 2. Remove the containers, then the volumes, that carry a
    ``weather-skills-eval.run`` label or another batch's
    ``weather-skills-eval.batch`` label, left over from a run or batch that was
@@ -17,15 +19,19 @@ Order of a batch:
    ``false``, the runner image is pulled. Read the app image's revision and PR
    number labels. A Docker error up to here stops the batch (exit 3).
 5. For each secret a run needs, take it from the batch's environment when
-   set, else read it from Secret Manager.
-6. Run the queue: each configuration once per round, as many rounds as
+   set, else read it from Secret Manager. Only the batch reads Secret
+   Manager, over the host network the launcher runs it on; each run gets
+   only the secrets it needs, as env.
+6. Run the queue: each model once per round, as many rounds as
    ``EVAL_REPETITIONS``, at most ``EVAL_PARALLEL_RUNS`` at once. Each run is a
    child container of the eval image ID running ``weather-skills-eval run`` on
-   one configuration.
+   the eval configuration and one model, with the configs repo files copied
+   in. After a run that finds the app ignored its catalog (exit 6), no further
+   run starts (AD-12).
 
 Exit codes: 0 when every run exited 0; 1 when any did not; 2 when the batch
-did not start (a setting or a configuration file); 3 when Docker failed before
-the first run.
+did not start (a setting, the configuration file or the configs repo files);
+3 when Docker failed before the first run.
 """
 
 import codecs
@@ -38,7 +44,15 @@ from pathlib import Path
 
 import yaml
 
-from .config import ConfigError, secret_references
+from .config import REFERENCE, ConfigError, is_secret_name, secret_references
+from .configs_repo import (
+    COMMIT,
+    EXIT_CATALOG,
+    ConfigsRepoError,
+    load_app_definition,
+    normalize_repo,
+    parse_connection_keys,
+)
 from .instance import BATCH_LABEL, DOCKER_ERRORS, IMAGE_ID, LABEL, RUN_LABEL, _archive
 from .settings import REQUIRED_PASSTHROUGH, SettingsError, _required, _whole
 
@@ -54,6 +68,9 @@ DOCKER_SOCKET = "/var/run/docker.sock"
 CONFIGS_DIR = Path("/app/configs")
 # Where each run container gets its configuration.
 RUN_CONFIG_DIR = "/app/run"
+# Where the launcher copies the configs repo files into the batch container,
+# and where the batch copies them into each run container.
+CONFIGS_REPO_DIR = "/app/configs-repo"
 # The app image labels each run records.
 REVISION_LABEL = "org.opencontainers.image.revision"
 PR_NUMBER_LABEL = "weather-skills-chat.pr-number"
@@ -67,8 +84,12 @@ NOT_FORWARDED = ("HOSTNAME",)
 @dataclass(frozen=True)
 class BatchSettings:
     batch: str
-    # Configuration file names, in the order each round runs them.
-    configs: tuple[str, ...]
+    # The eval configuration's file name.
+    config: str
+    # Model ids at the configs commit, in the order each round runs them.
+    models: tuple[str, ...]
+    configs_repo: str
+    configs_commit: str
     repetitions: int
     parallel_runs: int
     eval_image: str
@@ -90,16 +111,24 @@ class PinnedImages:
 
 
 def load_batch_settings(environ: Mapping[str, str]) -> BatchSettings:
-    raw_configs = _required(environ, "EVAL_BATCH_CONFIGS")
-    configs = tuple(name.strip() for name in raw_configs.split(","))
-    if not all(configs):
-        raise SettingsError(f"EVAL_BATCH_CONFIGS has an empty file name: {raw_configs!r}")
+    raw_models = _required(environ, "EVAL_MODELS")
+    models = tuple(model.strip() for model in raw_models.split(","))
+    if not all(models):
+        raise SettingsError(f"EVAL_MODELS has an empty model id: {raw_models!r}")
+    commit = _required(environ, "EVAL_CONFIGS_COMMIT")
+    if not COMMIT.fullmatch(commit):
+        raise SettingsError(
+            f"EVAL_CONFIGS_COMMIT must be a 40-character commit SHA, not {commit!r}"
+        )
     pull = environ.get("EVAL_PULL_APP_IMAGE", "").strip().lower() or "true"
     if pull not in ("true", "false"):
         raise SettingsError(f"EVAL_PULL_APP_IMAGE must be true or false, not {pull!r}")
     return BatchSettings(
         batch=_required(environ, "EVAL_BATCH"),
-        configs=configs,
+        config=_required(environ, "EVAL_BATCH_CONFIG"),
+        models=models,
+        configs_repo=normalize_repo(_required(environ, "EVAL_CONFIGS_REPO")),
+        configs_commit=commit,
         repetitions=_whole(environ, "EVAL_REPETITIONS", 1, minimum=1),
         parallel_runs=_whole(environ, "EVAL_PARALLEL_RUNS", 1, minimum=1),
         eval_image=_required(environ, "EVAL_IMAGE"),
@@ -125,15 +154,25 @@ def load_configs(names: Iterable[str], configs_dir: Path) -> dict[str, str]:
     return texts
 
 
-def needed_secrets(text: str) -> set[str]:
+def needed_secrets(text: str, connection_keys: Iterable[str]) -> set[str]:
     """The secret variables a run of the configuration ``text`` needs: the
-    harness's own and those its secret-named keys reference."""
+    harness's own, those its secret-named keys reference, and the
+    ``connection_keys`` variables that hold the commit's connection keys."""
     try:
         raw = yaml.safe_load(text)
     except yaml.YAMLError:
         # The run reports the configuration error itself.
         raw = None
-    return set(REQUIRED_PASSTHROUGH) | secret_references(raw)
+    return set(REQUIRED_PASSTHROUGH) | secret_references(raw) | set(connection_keys)
+
+
+def repo_files(root: Path) -> dict[str, bytes]:
+    """Every file under ``root``, by its path in a run container."""
+    return {
+        f"{CONFIGS_REPO_DIR}/{path.relative_to(root).as_posix()}": path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
 
 
 def secret_id(name: str) -> str:
@@ -256,14 +295,29 @@ def pin_images(docker, settings: BatchSettings, say: Callable[[str], None]) -> P
 
 
 def run_environment(
-    environ: Mapping[str, str], secrets: Mapping[str, str], pinned: PinnedImages
+    environ: Mapping[str, str],
+    needed: Iterable[str],
+    secrets: Mapping[str, str],
+    pinned: PinnedImages,
+    model: str,
 ) -> dict[str, str]:
     """A run's environment: the batch's own, which holds the dotenv file and
-    the launcher's choices, plus the secrets it needs, the pinned images and
-    the network."""
+    the launcher's choices, without any secret-named variable the run does not
+    need in ``needed``, plus the secrets read for it, its model, where its
+    configs repo files are, the pinned images and the network."""
+    needed = set(needed)
+
+    def forwarded(name: str) -> bool:
+        if name in NOT_FORWARDED:
+            return False
+        # The harness's EVAL_ settings hold no secret, EVAL_CONNECTION_KEYS included.
+        return name.startswith("EVAL_") or not is_secret_name(name) or name in needed
+
     return {
-        **{name: value for name, value in environ.items() if name not in NOT_FORWARDED},
+        **{name: value for name, value in environ.items() if forwarded(name)},
         **secrets,
+        "EVAL_MODEL": model,
+        "EVAL_CONFIGS_DIR": CONFIGS_REPO_DIR,
         "APP_IMAGE": pinned.app_id,
         "RUNNER_IMAGE": pinned.runner_id,
         "EVAL_DOCKER_NETWORK": NETWORK,
@@ -304,6 +358,7 @@ def run_one(
     batch: str,
     name: str,
     text: str,
+    files: Mapping[str, bytes],
     environment: Mapping[str, str],
     prefix: str,
     lock: threading.Lock,
@@ -311,8 +366,9 @@ def run_one(
     err,
 ) -> int:
     """One run in a child container of the eval image, with the configuration
-    copied in and the run's stdout and stderr passed on; returns its exit
-    code. The container is removed when the run ends."""
+    ``name`` and ``files``, by path, copied in and the run's stdout and stderr
+    passed on; returns its exit code. The container is removed when the run
+    ends."""
     path = f"{RUN_CONFIG_DIR}/{name}"
     container = docker.containers.create(
         pinned.eval_id,
@@ -326,7 +382,7 @@ def run_one(
     )
     try:
         # No bind mount, as for the runner's emulator files.
-        if not container.put_archive("/", _archive({path: text.encode("utf-8")})):
+        if not container.put_archive("/", _archive({path: text.encode("utf-8"), **files})):
             raise RuntimeError("the configuration could not be copied into the run container")
         container.start()
         errors: list[str] = []
@@ -371,10 +427,10 @@ def run_queue(
     lock: threading.Lock,
     out,
 ) -> None:
-    """Runs each queued (configuration, round) with ``start(name, round,
-    prefix)``, in queue order, at most ``parallel`` at once: the next starts
-    when one ends. With ``parallel`` above 1 every line of a run is prefixed
-    with ``[<configuration> run <round>] ``. Each run's exit code is added to
+    """Runs each queued (model, round) with ``start(model, round, prefix)``,
+    in queue order, at most ``parallel`` at once: the next starts when one
+    ends. With ``parallel`` above 1 every line of a run is prefixed with
+    ``[<model> run <round>] ``. Each run's exit code is added to
     ``results`` and printed; a run ``start`` raises on is recorded as
     failed, after a line saying why."""
     slots = threading.Semaphore(parallel)
@@ -421,6 +477,7 @@ def main(
     docker_client_factory=_docker_client,
     secret_reader: Callable[[str, str], str] = read_secret,
     configs_dir: Path = CONFIGS_DIR,
+    configs_repo_dir: Path = Path(CONFIGS_REPO_DIR),
     out=sys.stdout,
     err=sys.stderr,
 ) -> int:
@@ -432,11 +489,26 @@ def main(
 
     try:
         settings = load_batch_settings(environ)
-        texts = load_configs(settings.configs, configs_dir)
-    except (SettingsError, ConfigError) as exc:
+        [text] = load_configs([settings.config], configs_dir).values()
+        definition = load_app_definition(configs_repo_dir)
+        unknown = [model for model in settings.models if model not in definition.models]
+        if unknown:
+            raise ConfigsRepoError(
+                f"EVAL_MODELS names {', '.join(unknown)}, not at the configs commit; "
+                f"it has {', '.join(sorted(definition.models))}"
+            )
+        files = repo_files(configs_repo_dir)
+        connection_keys = parse_connection_keys(environ.get("EVAL_CONNECTION_KEYS", ""))
+        unmapped = [u for u in definition.connections if u.rstrip("/") not in connection_keys]
+        if unmapped:
+            raise ConfigsRepoError(
+                f"EVAL_CONNECTION_KEYS names no key variable for connection {', '.join(unmapped)}"
+            )
+        key_variables = [connection_keys[u.rstrip("/")] for u in definition.connections]
+    except (SettingsError, ConfigError, ConfigsRepoError, OSError) as exc:
         print(f"Batch not started: {exc}", file=err, flush=True)
         return EXIT_NOT_STARTED
-    say(f"Batch {settings.batch}")
+    say(f"Batch {settings.batch}: {settings.configs_repo} at {settings.configs_commit}")
 
     try:
         docker = docker_client_factory()
@@ -447,27 +519,46 @@ def main(
         print(f"Batch not started, Docker failed: {exc}", file=err, flush=True)
         return EXIT_DOCKER
 
-    needed = {name: needed_secrets(text) for name, text in texts.items()}
-    values, errors = resolve_secrets(
-        set().union(*needed.values()), environ, settings.secrets_project, secret_reader
-    )
+    # The same for every model: the commit's connections are shared.
+    needed = needed_secrets(text, key_variables)
+    values, errors = resolve_secrets(needed, environ, settings.secrets_project, secret_reader)
+    missing = [errors[secret] for secret in sorted(needed) if secret in errors]
+    secrets = {secret: values[secret] for secret in needed if secret in values}
+    # Set once a run finds the app ignored its catalog; no run starts after it.
+    ignored_catalog = threading.Event()
 
-    def start(name: str, repetition: int, prefix: str) -> int:
-        missing = [errors[secret] for secret in sorted(needed[name]) if secret in errors]
+    def start(model: str, repetition: int, prefix: str) -> int:
         if missing:
-            say(f"{name} run {repetition}: not started: {'; '.join(missing)}")
+            say(f"{model} run {repetition}: not started: {'; '.join(missing)}")
             return EXIT_NOT_STARTED
-        secrets = {secret: values[secret] for secret in needed[name] if secret in values}
-        environment = run_environment(environ, secrets, pinned)
-        return run_one(
-            docker, pinned, settings.batch, name, texts[name], environment, prefix, lock, out, err
+        if ignored_catalog.is_set():
+            say(f"{model} run {repetition}: not started: the app image ignored its catalog")
+            return EXIT_NOT_STARTED
+        # Any variable the config references reaches the run, whatever its key.
+        referenced = needed | set(REFERENCE.findall(text))
+        environment = run_environment(environ, referenced, secrets, pinned, model)
+        code = run_one(
+            docker,
+            pinned,
+            settings.batch,
+            settings.config,
+            text,
+            files,
+            environment,
+            prefix,
+            lock,
+            out,
+            err,
         )
+        if code == EXIT_CATALOG:
+            ignored_catalog.set()
+        return code
 
-    # In rounds, each configuration once per round.
+    # In rounds, each model once per round.
     queue = [
-        (name, repetition)
+        (model, repetition)
         for repetition in range(1, settings.repetitions + 1)
-        for name in settings.configs
+        for model in settings.models
     ]
     results: list[tuple[str, int]] = []
     run_queue(queue, settings.parallel_runs, start, results, lock, out)

@@ -7,7 +7,9 @@ Exit codes:
   summary gives their number.
 - 1: the run failed for any other reason.
 - 2: the run did not start: a harness setting, the configuration file, the
-  dataset or a dataset item is invalid, the dataset is missing, empty or
+  configs repo files (another schema version, a model not at the commit, a
+  connection without a key), the dataset or a dataset item is
+  invalid, the dataset is missing, empty or
   could not be read from Langfuse (any error, a Langfuse error included), or
   the dataset needs a skill pack the configuration does not turn on.
 - 3: the app or the sandbox runner did not start (an app image without the
@@ -16,11 +18,14 @@ Exit codes:
   timeout before a task, or after the last task when no task waited for it
   after it was lost, the runner was found exited with code 0, dead,
   disappeared or unreadable before or after a task, or Docker failed.
-- 4: the app failed while the harness read its catalog model, tools and
+- 4: the app's skill state could not be made to match the configs repo, or
+  the app failed while the harness read its catalog model, tools and
   skill packs, or reported no base model for the catalog model, or, after
   the dataset was read, a network error (an httpx error, such as a
   connection error or timeout) reaching the app or Langfuse stopped the run.
 - 5: Langfuse returned an error response after the dataset was read.
+- 6: the app's catalog ids were not the ids it was given, so the app image
+  does not provision from env.
 - 143: the harness was stopped with SIGTERM; the app and runner containers
   and the volume were removed.
 
@@ -54,6 +59,7 @@ from langfuse.api.core.api_error import ApiError as LangfuseApiError
 from . import batch
 from .app_client import ChatError
 from .config import ConfigError
+from .configs_repo import EXIT_CATALOG, CatalogMismatchError, ConfigsRepoError, SkillStateError
 from .instance import AppStartError, RunnerStartError
 from .langfuse_gateway import ExperimentNotFound, LangfuseRuns
 from .runner import DatasetError, run
@@ -240,8 +246,12 @@ def main(
     try:
         with log_to_stderr():
             summary = run(args.config, environ, docker_client_factory=docker_client_factory)
-    except (SettingsError, ConfigError, TaskError, DatasetError) as exc:
+    except (SettingsError, ConfigError, ConfigsRepoError, TaskError, DatasetError) as exc:
         return _fail(EXIT_NOT_STARTED, f"Run not started: {exc}")
+    except CatalogMismatchError as exc:
+        return _fail(EXIT_CATALOG, f"Run stopped, the app ignored its catalog: {exc}")
+    except SkillStateError as exc:
+        return _fail(EXIT_APP_FAILED, f"Run stopped, the app's skill state: {exc}")
     except RunnerStartError as exc:
         return _fail(EXIT_APP_NOT_STARTED, f"Run stopped, the sandbox runner did not start: {exc}")
     except AppStartError as exc:

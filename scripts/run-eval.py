@@ -1,24 +1,29 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["python-dotenv>=1.2.4", "questionary>=2.1.1"]
+# dependencies = ["python-dotenv>=1.2.4", "pyyaml>=6.0.3", "questionary>=2.1.1"]
 # ///
-"""Launches one eval batch on the Docker host it runs on, for the configs picked
-from a checklist, with the judge models, simulated user model, app image, runner
-image, concurrency, repetitions and number of runs at once chosen for it. It
-builds the eval image, starts the batch as one detached container and exits;
-the batch runs every queued run on its own, so the terminal can close. With
-EVAL_HOST=vm in .env, it first moves the checkout to exactly origin/main and
-runs itself again from it."""
+"""Launches one eval batch on the Docker host it runs on: it resolves the configs
+repo ref given to one commit with git, and runs the models picked from that
+commit with the eval config, judge models, simulated user model, app image,
+runner image, concurrency, repetitions and number of runs at once chosen for
+it. It builds the eval image, starts the batch as one detached container with
+the configs repo files at that commit copied in, and exits; the batch runs
+every queued run on its own, so the terminal can close. With EVAL_HOST=vm in
+.env, it first moves the checkout to exactly origin/main and runs itself again
+from it."""
 
+import io
 import os
 import subprocess
 import sys
+import tarfile
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
 import questionary
+import yaml
 from dotenv import dotenv_values
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -35,6 +40,11 @@ DEFAULTS = {
 
 # How many runs the batch keeps going at once; prefilled like DEFAULTS.
 PARALLEL_RUNS = {"EVAL_PARALLEL_RUNS": "1"}
+
+# The configs repo; no default, since it is set in .env or the shell.
+CONFIGS_REPO = {"EVAL_CONFIGS_REPO": ""}
+# Where the batch reads the configs repo files: <ARCHIVE_PREFIX> under /app.
+ARCHIVE_PREFIX = "configs-repo/"
 
 # The fixed name is the lock: Docker refuses a second container with it.
 BATCH_CONTAINER = "weather-skills-eval-batch"
@@ -77,6 +87,22 @@ def on_vm(dotenv_path):
     return (_dotenv(dotenv_path).get("EVAL_HOST") or "").strip() == "vm"
 
 
+def repo_valid(text):
+    """True for an HTTPS URL without credentials, else the message questionary shows."""
+    host = text.strip().removeprefix("https://").split("/", 1)[0]
+    if text.strip().startswith("https://") and "@" not in host:
+        return True
+    return "An HTTPS URL of the configs repo, without a user name or token"
+
+
+def ref_valid(text):
+    """True for a ref, else the message questionary shows."""
+    # git fetch takes a full SHA, never an abbreviated one.
+    # A leading dash would reach git as an option.
+    ref = text.strip()
+    return (bool(ref) and not ref.startswith("-")) or "A branch, a tag or a full commit SHA"
+
+
 def judges_valid(picked):
     """True for at least one judge, else the message questionary shows."""
     return bool(picked) or "Pick at least one judge"
@@ -116,6 +142,52 @@ def kill_command(batch):
         f"for c in $(docker ps -aq --filter '{label}'); do docker rm -f -v \"$c\"; done; "
         f"for v in $(docker volume ls -q --filter '{label}'); do docker volume rm -f \"$v\"; done"
     )
+
+
+def fetch_configs(url, ref, folder):
+    """Fetches ``ref`` of the configs repo ``url`` with the git access of this
+    machine into a new repository in ``folder``, and writes its files to
+    ``folder/configs.tar`` under ARCHIVE_PREFIX. Returns the commit SHA and the
+    archive's path, or None after printing why it failed."""
+    archive = Path(folder) / "configs.tar"
+    for args in (
+        ["init", "-q", str(folder)],
+        ["-C", str(folder), "fetch", "-q", "--depth", "1", url, ref],
+        [
+            "-C",
+            str(folder),
+            "archive",
+            f"--prefix={ARCHIVE_PREFIX}",
+            "-o",
+            str(archive),
+            "FETCH_HEAD",
+        ],
+    ):
+        done = subprocess.run(["git", *args], capture_output=True, text=True)
+        if done.returncode != 0:
+            print(f"Configs repo {url} at {ref}: {done.stderr}", end="", file=sys.stderr)
+            return None
+    commit = subprocess.run(
+        ["git", "-C", str(folder), "rev-parse", "FETCH_HEAD"], capture_output=True, text=True
+    )
+    if commit.returncode != 0:
+        print(commit.stderr, end="", file=sys.stderr)
+        return None
+    return commit.stdout.strip(), archive
+
+
+def model_ids(archive):
+    """The id of each model file in the configs archive, sorted."""
+    ids = []
+    with tarfile.open(archive) as tar:
+        for member in tar.getmembers():
+            folder, _, name = member.name.removeprefix(ARCHIVE_PREFIX).rpartition("/")
+            if member.isfile() and folder == "models" and name.endswith(".yaml"):
+                data = yaml.safe_load(tar.extractfile(member).read())
+                model = data.get("model") if isinstance(data, dict) else None
+                if isinstance(model, dict) and isinstance(model.get("id"), str):
+                    ids.append(model["id"])
+    return sorted(ids)
 
 
 def _git(*args, capture=False):
@@ -204,9 +276,43 @@ def run_eval():
     if not offered:
         print("EVAL_JUDGE_MODELS names no judge model; set it in the shell or .env", flush=True)
         return 2
+    with tempfile.TemporaryDirectory() as folder:
+        return launch(dotenv, containers, offered, Path(folder))
+
+
+def launch(dotenv, containers, offered, folder):
+    """Asks for the batch, builds the eval image and starts the batch, with
+    the configs repo files fetched into ``folder``."""
+    repo = (
+        questionary.text(
+            "EVAL_CONFIGS_REPO:",
+            default=prefilled(os.environ, dotenv, CONFIGS_REPO)["EVAL_CONFIGS_REPO"],
+            validate=repo_valid,
+        )
+        .unsafe_ask()
+        .strip()
+    )
+    ref = questionary.text("Configs ref:", default="main", validate=ref_valid).unsafe_ask().strip()
+    fetched = fetch_configs(repo, ref, folder)
+    if fetched is None:
+        return 1
+    configs_commit, archive = fetched
+    print(f"Configs {repo} at {ref} is commit {configs_commit}", flush=True)
     configs = sorted(p.name for p in (ROOT / "configs").glob("*.yaml") if p.name != "example.yaml")
-    picked = questionary.checkbox("Configs to run:", choices=configs).unsafe_ask()
-    if not picked:
+    if not configs:
+        print("configs/ holds no eval config besides example.yaml", flush=True)
+        return 2
+    try:
+        offered_models = model_ids(archive)
+    except (tarfile.TarError, yaml.YAMLError, UnicodeDecodeError) as exc:
+        print(f"The configs repo files at {configs_commit} cannot be read: {exc}", flush=True)
+        return 2
+    if not offered_models:
+        print(f"The configs repo at {configs_commit} has no model file", flush=True)
+        return 2
+    config = questionary.select("Eval config:", choices=configs).unsafe_ask()
+    models = questionary.checkbox("Models to run:", choices=offered_models).unsafe_ask()
+    if not models:
         return 0
     judges = questionary.checkbox(
         "Judge models:",
@@ -243,27 +349,26 @@ def run_eval():
         print(commit.stderr, end="", file=sys.stderr)
         return commit.returncode
     commit = commit.stdout.strip()
-    with tempfile.TemporaryDirectory() as folder:
-        iidfile = Path(folder) / "image-id"
-        build = subprocess.run(
-            [
-                "docker",
-                "build",
-                "--target",
-                "eval",
-                "--build-arg",
-                f"HARNESS_COMMIT={commit}",
-                "--iidfile",
-                str(iidfile),
-                "--tag",
-                EVAL_IMAGE_TAG,
-                ".",
-            ],
-            cwd=ROOT,
-        )
-        if build.returncode != 0:
-            return build.returncode
-        image = iidfile.read_text().strip()
+    iidfile = folder / "image-id"
+    build = subprocess.run(
+        [
+            "docker",
+            "build",
+            "--target",
+            "eval",
+            "--build-arg",
+            f"HARNESS_COMMIT={commit}",
+            "--iidfile",
+            str(iidfile),
+            "--tag",
+            EVAL_IMAGE_TAG,
+            ".",
+        ],
+        cwd=ROOT,
+    )
+    if build.returncode != 0:
+        return build.returncode
+    image = iidfile.read_text().strip()
 
     # A batch container that has stopped keeps its logs until a launch replaces it.
     for name, _, _ in containers:
@@ -276,20 +381,26 @@ def run_eval():
             "EVAL_REPETITIONS": str(int(repetitions)),
             "EVAL_PARALLEL_RUNS": str(int(parallel)),
             "EVAL_PULL_APP_IMAGE": "true" if pull else "false",
-            "EVAL_BATCH_CONFIGS": ",".join(picked),
+            "EVAL_BATCH_CONFIG": config,
+            "EVAL_MODELS": ",".join(models),
+            "EVAL_CONFIGS_REPO": repo,
+            "EVAL_CONFIGS_COMMIT": configs_commit,
             "EVAL_IMAGE": image,
             "EVAL_BATCH": batch,
         }
     )
-    started = subprocess.run(
+    created = subprocess.run(
         [
             "docker",
-            "run",
-            "--detach",
+            "create",
             "--name",
             BATCH_CONTAINER,
             "--restart",
             "no",
+            # Only the batch reaches the metadata server, for Secret Manager;
+            # the VM blocks it for containers on other networks.
+            "--network",
+            "host",
             "--label",
             f"{LABEL}=batch",
             "--label",
@@ -305,8 +416,21 @@ def run_eval():
         ],
         stdout=subprocess.DEVNULL,
     )
-    if started.returncode != 0:
-        return started.returncode
+    if created.returncode != 0:
+        return created.returncode
+    # The configs repo files at the commit, copied in before it starts: the
+    # batch container has no git access of its own.
+    with open(archive, "rb") as files:
+        copied = subprocess.run(["docker", "cp", "-", f"{BATCH_CONTAINER}:/app"], stdin=files)
+    code = copied.returncode
+    if code == 0:
+        code = subprocess.run(
+            ["docker", "start", BATCH_CONTAINER], stdout=subprocess.DEVNULL
+        ).returncode
+    if code != 0:
+        # A container never started would hold the name of the next batch.
+        subprocess.run(["docker", "rm", "-f", BATCH_CONTAINER], stdout=subprocess.DEVNULL)
+        return code
     print(f"Batch {batch} started in container {BATCH_CONTAINER}", flush=True)
     print(f"Follow it with: docker logs -f {BATCH_CONTAINER}", flush=True)
     return 0
@@ -394,20 +518,37 @@ class _Answer:
         return self.value
 
 
+CONFIGS_COMMIT = "c" * 40
+
+
 class FakeCommands:
     """``subprocess.run``: records each command and answers it from
     ``outputs``, (command prefix, exit code, stdout) entries matched in order.
-    ``docker build`` writes ``image`` to its --iidfile."""
+    ``docker build`` writes ``image`` to its --iidfile; ``git archive`` writes
+    a configs archive with models m-b and m-a; ``git rev-parse FETCH_HEAD``
+    answers CONFIGS_COMMIT; ``docker cp`` records the archive it reads."""
 
     def __init__(self, outputs=(), image="sha256:eval"):
         self.outputs = list(outputs)
         self.image = image
         self.calls = []
+        self.copied = None
 
     def __call__(self, command, **kwargs):
         self.calls.append((command, kwargs))
         if command[:2] == ["docker", "build"]:
             Path(command[command.index("--iidfile") + 1]).write_text(f"{self.image}\n")
+        if "archive" in command:
+            with tarfile.open(command[command.index("-o") + 1], "w") as tar:
+                for model in ("m-b", "m-a"):
+                    data = f"schema_version: 1\nmodel:\n  id: {model}\n".encode()
+                    info = tarfile.TarInfo(f"{ARCHIVE_PREFIX}models/{model}.yaml")
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+        if command[-1] == "FETCH_HEAD" and "rev-parse" in command:
+            return subprocess.CompletedProcess(command, 0, stdout=f"{CONFIGS_COMMIT}\n", stderr="")
+        if command[:2] == ["docker", "cp"]:
+            self.copied = kwargs["stdin"].read()
         for prefix, code, stdout in self.outputs:
             if command[: len(prefix)] == prefix:
                 return subprocess.CompletedProcess(command, code, stdout=stdout, stderr="")
@@ -418,16 +559,24 @@ class FakeCommands:
 
 
 def launch_setup(tmp_path, monkeypatch, dotenv, outputs=()):
-    """ROOT at ``tmp_path`` with configs a and b and ``dotenv`` as .env; the
-    questions take their defaults. Returns the fake commands and the questions asked."""
+    """ROOT at ``tmp_path`` with the eval config weather-eval and ``dotenv``
+    as .env; the questions take their defaults, and every model. Returns the
+    fake commands and the questions asked."""
     (tmp_path / "configs").mkdir()
-    for name in ("a", "b", "example"):
-        (tmp_path / "configs" / f"{name}.yaml").write_text(f"name: {name}\n")
+    for name in ("weather-eval", "example"):
+        (tmp_path / "configs" / f"{name}.yaml").write_text("dataset: d\n")
     (tmp_path / ".env").write_text(dotenv)
     monkeypatch.setitem(globals(), "ROOT", tmp_path)
-    for name in [*DEFAULTS, *PARALLEL_RUNS, "EVAL_JUDGE_MODELS", UPDATED_TO]:
+    for name in [*DEFAULTS, *PARALLEL_RUNS, *CONFIGS_REPO, "EVAL_JUDGE_MODELS", UPDATED_TO]:
         monkeypatch.delenv(name, raising=False)
     asked = []
+
+    def select(message, choices, **kwargs):
+        asked.append(message)
+        [choice] = choices
+        return _Answer(choice)
+
+    monkeypatch.setattr(questionary, "select", select)
 
     def checkbox(message, choices, **kwargs):
         asked.append(message)
@@ -452,7 +601,11 @@ def launch_setup(tmp_path, monkeypatch, dotenv, outputs=()):
     return commands, asked
 
 
-DOTENV = f"EVAL_JUDGE_MODELS={JUDGES[0]}\nEVAL_SIMULATED_USER_MODEL=openrouter/test/user\n"
+REPO_URL = "https://github.com/rhiza-research/weather-skills-configs"
+DOTENV = (
+    f"EVAL_JUDGE_MODELS={JUDGES[0]}\nEVAL_SIMULATED_USER_MODEL=openrouter/test/user\n"
+    f"EVAL_CONFIGS_REPO={REPO_URL}\n"
+)
 LIST_BATCHES = ["docker", "ps", "--all", "--filter", f"label={LABEL}=batch", "--format"]
 
 
@@ -468,15 +621,23 @@ def test_a_launch_builds_the_image_and_starts_one_detached_batch(tmp_path, monke
 
     assert main() == 0
 
-    listed, commit, build, removed, run = commands.commands()
+    listed, init, fetch, archive, fetched, commit, build, removed, create, cp, start = (
+        commands.commands()
+    )
     assert listed == [*LIST_BATCHES, BATCH_FORMAT]
+    # The ref, main by default, resolved to one commit with this machine's git.
+    folder = init[-1]
+    assert init == ["git", "init", "-q", folder]
+    assert fetch == ["git", "-C", folder, "fetch", "-q", "--depth", "1", REPO_URL, "main"]
+    assert archive[2:5] == [folder, "archive", f"--prefix={ARCHIVE_PREFIX}"]
+    assert fetched == ["git", "-C", folder, "rev-parse", "FETCH_HEAD"]
     # Locally the checkout is only read.
     assert commit == ["git", "rev-parse", "HEAD"]
     # Only once the image is built, so a failed build keeps the old logs.
     assert removed == ["docker", "rm", BATCH_CONTAINER]
     assert build[:8] == ["docker", "build", "--target", "eval", "--build-arg", "HARNESS_COMMIT=abc"]
     assert build[-3:] == ["--tag", EVAL_IMAGE_TAG, "."]
-    assert commands.calls[2][1]["cwd"] == tmp_path
+    assert commands.calls[6][1]["cwd"] == tmp_path
     values = {
         "EVAL_JUDGE_MODELS": JUDGES[0],
         **DEFAULTS,
@@ -484,18 +645,28 @@ def test_a_launch_builds_the_image_and_starts_one_detached_batch(tmp_path, monke
         "EVAL_REPETITIONS": "1",
         "EVAL_PARALLEL_RUNS": "2",
         "EVAL_PULL_APP_IMAGE": "true",
-        "EVAL_BATCH_CONFIGS": "a.yaml,b.yaml",
+        "EVAL_BATCH_CONFIG": "weather-eval.yaml",
+        # Every model at the commit was picked, offered in id order.
+        "EVAL_MODELS": "m-a,m-b",
+        "EVAL_CONFIGS_REPO": REPO_URL,
+        "EVAL_CONFIGS_COMMIT": CONFIGS_COMMIT,
         "EVAL_IMAGE": "sha256:eval",
         "EVAL_BATCH": "2026-11-23T10:00:00Z",
     }
-    assert run == [
+    # The configs files at the commit go in before the batch starts.
+    assert cp == ["docker", "cp", "-", f"{BATCH_CONTAINER}:/app"]
+    with tarfile.open(fileobj=io.BytesIO(commands.copied)) as tar:
+        assert f"{ARCHIVE_PREFIX}models/m-a.yaml" in tar.getnames()
+    assert start == ["docker", "start", BATCH_CONTAINER]
+    assert create == [
         "docker",
-        "run",
-        "--detach",
+        "create",
         "--name",
         BATCH_CONTAINER,
         "--restart",
         "no",
+        "--network",
+        "host",
         "--label",
         f"{LABEL}=batch",
         "--label",
@@ -512,9 +683,20 @@ def test_a_launch_builds_the_image_and_starts_one_detached_batch(tmp_path, monke
     ]
     assert "Pull the app image?" in asked
     assert capsys.readouterr().out == (
+        f"Configs {REPO_URL} at main is commit {CONFIGS_COMMIT}\n"
         f"Batch 2026-11-23T10:00:00Z started in container {BATCH_CONTAINER}\n"
         f"Follow it with: docker logs -f {BATCH_CONTAINER}\n"
     )
+
+
+def test_a_batch_container_the_files_cannot_be_copied_into_is_removed(tmp_path, monkeypatch):
+    commands, _ = launch_setup(tmp_path, monkeypatch, DOTENV, [(["docker", "cp"], 1, "")])
+
+    assert main() == 1
+
+    *_, cp, removed = commands.commands()
+    assert cp[:2] == ["docker", "cp"]
+    assert removed == ["docker", "rm", "-f", BATCH_CONTAINER]
 
 
 def test_a_running_batch_is_named_with_its_kill_command_and_nothing_starts(

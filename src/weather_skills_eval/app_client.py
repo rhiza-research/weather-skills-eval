@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 import httpx
 
+PLATFORM = {"X-Organization-Id": "platform"}
 _DETAILS = re.compile(r"<details\b[^>]*>.*?</details>", re.IGNORECASE | re.DOTALL)
 
 
@@ -110,6 +111,26 @@ class AppClient:
 
     async def skill_packs(self) -> list[dict]:
         return await self._json("GET", "/api/v1/skills/", list)
+
+    # As a platform admin: the app grants the admin role only with this header,
+    # and lists inactive models, packs and skills only in this organization.
+
+    async def platform_models(self) -> list[dict]:
+        return await self._json("GET", "/api/v1/models/", list, headers=PLATFORM)
+
+    async def platform_skill_packs(self) -> list[dict]:
+        return await self._json("GET", "/api/v1/skills/", list, headers=PLATFORM)
+
+    async def toggle_skill_pack(self, pack_id: str) -> None:
+        await self._json("POST", f"/api/v1/skills/{pack_id}/toggle", object, headers=PLATFORM)
+
+    async def toggle_skill(self, pack_id: str, tool_id: str) -> None:
+        path = f"/api/v1/skills/{pack_id}/skills/{tool_id}/toggle"
+        await self._json("POST", path, object, headers=PLATFORM)
+
+    async def set_skill_enabled_by_default(self, pack_id: str, tool_id: str, enabled: bool) -> None:
+        path = f"/api/v1/skills/{pack_id}/skills/{tool_id}/enabled-by-default"
+        await self._json("POST", path, object, headers=PLATFORM, json={"enabled": enabled})
 
     async def catalog_model(self, model_id: str) -> dict:
         return await self._json("GET", "/api/v1/models/model", dict, params={"id": model_id})

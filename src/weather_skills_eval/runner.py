@@ -1,17 +1,22 @@
-"""A run: one configuration, every task in the dataset played once, one Langfuse experiment.
+"""A run: one configuration and one model of a configs repo commit, every task in
+the dataset played once, one Langfuse experiment.
 
 Order of a run:
-1. Read the harness settings and the configuration file; stop on any error.
+1. Read the harness settings, the configuration file and the configs repo
+   files at the commit, and add the app env they define for the model;
+   stop on any error.
 2. Read the dataset, check that the configuration turns on every skill pack
    the dataset's metadata names in ``skill_packs``, and check every item
    against the task format.
 3. Pull the app image, read the sandbox emulator from it, pull the runner
    image, start the runner container and its volume, then the app
    container, and wait for /health.
-4. Read the resolved configuration from the app (the catalog model's base
+4. Check that the app's catalog ids are the ids it was given, and make its
+   skill pack and skill state match the configs repo.
+   Read the resolved configuration from the app (the catalog model's base
    model, tools, skill pack commits), and ask OpenRouter which model answers
    for that base model; the experiment is named after it, followed by the
-   configuration's ``variant`` in parentheses when it sets one.
+   model's ``eval.variant`` in parentheses when it sets one.
 5. Run the experiment, playing the tasks in a random order drawn for this
    run, which makes runs at once less likely to reach the same data
    providers with the same task at the same time: each item's task waits for
@@ -45,6 +50,15 @@ from pathlib import Path
 
 from .app_client import AppClient, ChatError, highest_skill_versions
 from .config import RunConfig, load_config
+from .configs_repo import (
+    AppDefinition,
+    ConfigsSource,
+    apply_skill_state,
+    check_catalog,
+    load_app_definition,
+    load_source,
+    with_app_definition,
+)
 from .instance import AppInstance, RunnerStartError
 from .judge import (
     EVIDENCE_HEADER,
@@ -296,13 +310,19 @@ def run(
     shuffles the order the tasks are played in; an unseeded one when None."""
     run_started = clock()
     settings = load_settings(environ)
-    config: RunConfig = load_config(config_path, environ, stdin=stdin)
+    source = load_source(environ)
+    definition = load_app_definition(source.directory)
+    config: RunConfig = with_app_definition(
+        load_config(config_path, environ, stdin=stdin), definition, source, environ
+    )
     gateway = (gateway_factory or _default_gateway)(settings)
     try:
         return _run(
             config,
             settings,
             gateway,
+            definition=definition,
+            source=source,
             docker_client_factory=docker_client_factory,
             app_transport=app_transport,
             instance_options=instance_options,
@@ -369,6 +389,8 @@ def _run(
     settings: Settings,
     gateway: LangfuseGateway,
     *,
+    definition: AppDefinition,
+    source: ConfigsSource,
     docker_client_factory,
     app_transport,
     instance_options,
@@ -404,6 +426,9 @@ def _run(
         async def read_resolved():
             app = new_app()
             try:
+                # AD-12, then AD-24, before anything reads what they set.
+                await check_catalog(app, definition)
+                await apply_skill_state(app, definition)
                 return await _resolved(app, config)
             finally:
                 await app.aclose()
@@ -441,6 +466,8 @@ def _run(
             "batch": settings.batch,
             "app_image_revision": settings.app_image_revision,
             "app_image_pr_number": settings.app_image_pr_number,
+            "configs_repo": source.repo,
+            "configs_commit": source.commit,
             "dataset": config.dataset,
             "dataset_version": dataset_version.isoformat() if dataset_version else LATEST,
             "dataset_items": str(len(tasks)),

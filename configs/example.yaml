@@ -1,8 +1,8 @@
-# A configuration for weather-skills-eval. Copy it, replace every TODO, and set the
-# referenced ${...} variables in .env, except APP_IMAGE and RUNNER_IMAGE, which are
-# chosen per run (scripts/run-eval.py or docker compose run -e). Every secret is a
-# ${...} reference.
-name: example
+# A configuration for weather-skills-eval: the eval side of a run. Copy it,
+# replace every TODO, and set the referenced ${...} variables in .env, except
+# APP_IMAGE and RUNNER_IMAGE, which are chosen per batch (scripts/run-eval.py or
+# docker compose run -e). Every secret is a ${...} reference. The model, skill
+# packs, connections and tracked settings come from the configs repo commit.
 image: ${APP_IMAGE}
 # The image skills run on: the sandbox runner image the cluster runs. It is
 # pulled on every run, whatever pull says.
@@ -10,29 +10,12 @@ runner_image: ${RUNNER_IMAGE}
 # false runs the app image already on the Docker host instead of pulling it;
 # scripts/run-eval.py pulls it first when asked.
 pull: false
-model: TODO
 dataset: TODO
 env:
   WEBUI_SECRET_KEY: ${APP_WEBUI_SECRET_KEY}
   BOOTSTRAP_ADMIN_EMAIL: TODO
   BOOTSTRAP_ADMIN_PASSWORD: ${APP_ADMIN_PASSWORD}
   BOOTSTRAP_ADMIN_API_KEY: ${APP_ADMIN_API_KEY}
-
-  OPENAI_API_BASE_URLS: https://openrouter.ai/api/v1
-  OPENAI_API_KEYS: ${APP_OPENROUTER_API_KEY}
-  OPENAI_API_CONFIGS:
-    "0":
-      model_call_tracing: openrouter
-
-  CATALOG_MODELS:
-    - id: TODO
-      name: TODO
-      base_model_id: TODO
-      meta: {}
-      params: {}
-  SKILL_PACKS:
-    - git_url: TODO
-      ref: main
 
   # The app must trace into the Langfuse project the harness reads.
   LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL}

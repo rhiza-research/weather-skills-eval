@@ -21,7 +21,8 @@ from typing import BinaryIO
 import yaml
 
 ALLOWED_KEYS = ("name", "variant", "image", "runner_image", "pull", "model", "dataset", "env")
-REQUIRED_KEYS = ("image", "runner_image", "model", "dataset", "env")
+# model and variant come from the configs repo in a run; see configs_repo.py.
+REQUIRED_KEYS = ("image", "runner_image", "dataset", "env")
 
 # The harness sets these on the app to run skills on the sandbox runner.
 RUNNER_ENV = (
@@ -240,9 +241,8 @@ def _env_value(name: str, value: object, environ: Mapping[str, str]) -> str:
     raise ConfigError(field, "must be a string, or a mapping or list written as JSON")
 
 
-def parse_config(raw: object, *, default_name: str | None, environ: Mapping[str, str]) -> RunConfig:
-    """``default_name`` is used when the file has no ``name``; with ``None``
-    (a configuration read from stdin) ``name`` is required."""
+def parse_config(raw: object, *, default_name: str, environ: Mapping[str, str]) -> RunConfig:
+    """``default_name`` is used when the file has no ``name``."""
     if not isinstance(raw, Mapping):
         raise ConfigError("<root>", "must be a mapping")
     for key in raw:
@@ -251,8 +251,6 @@ def parse_config(raw: object, *, default_name: str | None, environ: Mapping[str,
     for key in REQUIRED_KEYS:
         if key not in raw:
             raise ConfigError(key, "is missing")
-    if default_name is None and "name" not in raw:
-        raise ConfigError("name", "is missing; a configuration read from stdin needs one")
 
     name = _text(raw, "name") if "name" in raw else default_name
     variant = raw.get("variant")
@@ -269,7 +267,7 @@ def parse_config(raw: object, *, default_name: str | None, environ: Mapping[str,
     ).strip()
     if not runner_image:
         raise ConfigError("runner_image", "must be a non-empty string")
-    model = _text(raw, "model")
+    model = _text(raw, "model") if "model" in raw else ""
     dataset = _text(raw, "dataset")
     pull = raw.get("pull", True)
     if not isinstance(pull, bool):
@@ -315,7 +313,7 @@ STDIN = "-"
 
 
 def _from_text(
-    text: str, *, source: str, default_name: str | None, environ: Mapping[str, str]
+    text: str, *, source: str, default_name: str, environ: Mapping[str, str]
 ) -> RunConfig:
     try:
         raw = yaml.safe_load(text)
@@ -333,7 +331,8 @@ def load_config(path: Path, environ: Mapping[str, str], stdin: BinaryIO | None =
             text = stream.read().decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ConfigError(source, f"is not UTF-8 text: {exc}") from exc
-        return _from_text(text, source=source, default_name=None, environ=environ)
+        # A run names itself after its model, so stdin needs no name.
+        return _from_text(text, source=source, default_name="", environ=environ)
     try:
         text = path.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:

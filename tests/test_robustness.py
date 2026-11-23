@@ -58,6 +58,15 @@ from weather_skills_eval.checks import (
     reply_files,
 )
 from weather_skills_eval.config import ConfigError, load_config, parse_config
+from weather_skills_eval.configs_repo import (
+    EXIT_CATALOG,
+    AppDefinition,
+    CatalogMismatchError,
+    ConfigsRepoError,
+    ConfigsSource,
+    SkillStateError,
+    with_app_definition,
+)
 from weather_skills_eval.instance import (
     AppInstance,
     AppStartError,
@@ -212,6 +221,11 @@ def test_example_config_is_valid():
     config = load_config(REPO / "configs" / "example.yaml", environ)
     assert config.name == "example"
     assert config.runner_image == "value"
+    # The eval config in use leaves to the configs repo all it defines.
+    definition = AppDefinition({"m": {"id": "m"}}, {"m": ""}, [], {}, {"TASK_MODEL": ""})
+    source = ConfigsSource(Path("."), "https://example.invalid/r", "c" * 40, "m", {})
+    in_use = load_config(REPO / "configs" / "weather-eval.yaml", environ)
+    assert with_app_definition(in_use, definition, source, environ).model == "m"
 
 
 # Settings
@@ -999,6 +1013,10 @@ def test_a_cancelled_final_judge_call_keeps_its_evidence_until_the_verdict_ends(
         (docker.errors.APIError("daemon down"), cli.EXIT_APP_NOT_STARTED),
         (ChatError("GET /api/v1/tool_summary returned 500"), cli.EXIT_APP_FAILED),
         (LangfuseApiError(status_code=500, body="boom"), cli.EXIT_LANGFUSE),
+        (ConfigsRepoError("settings.yaml is schema version 2"), cli.EXIT_NOT_STARTED),
+        (SkillStateError("skill plot is not in the app"), cli.EXIT_APP_FAILED),
+        # The code a batch stops on.
+        (CatalogMismatchError("other ids"), EXIT_CATALOG),
         (RuntimeError("unexpected"), cli.EXIT_FAILED),
     ],
 )
