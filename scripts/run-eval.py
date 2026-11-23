@@ -591,7 +591,7 @@ def test_a_launch_builds_the_image_and_starts_one_detached_batch(tmp_path, monke
     assert commit == ["git", "rev-parse", "HEAD"]
     # Only once the image is built, so a failed build keeps the old logs.
     assert removed == ["docker", "rm", "old1"]
-    assert build[:8] == ["docker", "build", "--target", "eval", "--build-arg", "HARNESS_COMMIT=abc"]
+    assert build[:6] == ["docker", "build", "--target", "eval", "--build-arg", "HARNESS_COMMIT=abc"]
     assert build[-1] == "."
     assert commands.calls[6][1]["cwd"] == tmp_path
     values = {
