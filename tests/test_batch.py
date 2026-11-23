@@ -21,7 +21,6 @@ from weather_skills_eval.batch import (
     NETWORK,
     PR_NUMBER_LABEL,
     REVISION_LABEL,
-    RUN_CONFIG_DIR,
     main,
     secret_id,
 )
@@ -35,12 +34,10 @@ APP_IMAGE = "ghcr.io/rhiza-research/weather-skills-chat:pr-42"
 RUNNER_IMAGE = "ghcr.io/rhiza-research/weather-skills-sandbox-runner:prod"
 CONFIGS_COMMIT = "c" * 40
 OPENROUTER = "https://openrouter.ai/api/v1"
-CONFIG_TEXT = "dataset: d\nenv:\n  BOOTSTRAP_ADMIN_API_KEY: ${APP_KEY}\n"
 
 # What the launcher passes, plus the dotenv file's harness settings.
 ENVIRON = {
     "EVAL_BATCH": BATCH,
-    "EVAL_BATCH_CONFIG": "weather-eval.yaml",
     "EVAL_MODELS": "m-a,m-b",
     "EVAL_CONFIGS_REPO": "https://github.com/rhiza-research/weather-skills-configs",
     "EVAL_CONFIGS_COMMIT": CONFIGS_COMMIT,
@@ -52,7 +49,9 @@ ENVIRON = {
     "LANGFUSE_PUBLIC_KEY": "pk-test",
     "LANGFUSE_SECRET_KEY": "sk-lf-test",
     "OPENROUTER_API_KEY": "or-test",
-    "APP_KEY": "app-key",
+    "APP_WEBUI_SECRET_KEY": "webui-secret",
+    "APP_ADMIN_PASSWORD": "admin-password",
+    "APP_ADMIN_API_KEY": "app-key",
     "APP_OPENROUTER_API_KEY": "or-app",
     "LANGFUSE_TRACING_ENVIRONMENT": "eval",
     "HOSTNAME": "batch-container",
@@ -213,11 +212,8 @@ class FakeDocker:
 def run_batch(
     tmp_path, fake, environ=None, secrets=None, models=("m-a", "m-b"), connection=OPENROUTER
 ):
-    """``main`` with the eval config and a configs repo copy holding
-    ``models``; returns the exit code, stdout, stderr and the secrets read."""
-    configs = tmp_path / "configs"
-    configs.mkdir(parents=True, exist_ok=True)
-    (configs / "weather-eval.yaml").write_text(CONFIG_TEXT)
+    """``main`` with a configs repo copy holding ``models``; returns the exit
+    code, stdout, stderr and the secrets read."""
     repo = tmp_path / "configs-repo"
     write_repo(repo, models, connection)
     read = []
@@ -234,7 +230,6 @@ def run_batch(
         {**ENVIRON, **(environ or {})},
         docker_client_factory=lambda: fake,
         secret_reader=reader,
-        configs_dir=configs,
         configs_repo_dir=repo,
         out=out,
         err=err,
@@ -258,16 +253,14 @@ def test_a_batch_pins_its_images_and_runs_each_model_once_per_round(tmp_path):
     assert fake.looked_up == [EVAL_ID]
     assert fake.pulled == [APP_IMAGE, RUNNER_IMAGE]
     assert read == []
-    # In rounds, from the eval image ID, each with the eval config and the
-    # configs repo files copied in.
+    # In rounds, from the eval image ID, each with the configs repo files copied in.
     assert [r.model for r in fake.runs] == ["m-a", "m-b", "m-a", "m-b"]
     for container in fake.runs:
         kwargs = container.kwargs
         assert kwargs["image"] == EVAL_ID
         assert kwargs["entrypoint"] == ["weather-skills-eval"]
-        assert kwargs["command"] == ["run", f"{RUN_CONFIG_DIR}/weather-eval.yaml"]
+        assert kwargs["command"] == ["run"]
         files = container.files()
-        assert files[f"{RUN_CONFIG_DIR}/weather-eval.yaml"] == CONFIG_TEXT
         assert f"{CONFIGS_REPO_DIR}/models/m-b.yaml" in files
         assert f"{CONFIGS_REPO_DIR}/schemas/model.json" in files
         assert kwargs["labels"] == {LABEL: HARNESS_LABEL_VALUE, BATCH_LABEL: BATCH}
@@ -280,7 +273,7 @@ def test_a_batch_pins_its_images_and_runs_each_model_once_per_round(tmp_path):
         assert env["EVAL_DOCKER_NETWORK"] == NETWORK
         assert env["EVAL_APP_IMAGE_REVISION"] == "8dd46ed4"
         assert env["EVAL_APP_IMAGE_PR_NUMBER"] == "42"
-        assert env["EVAL_BATCH"] == BATCH and env["APP_KEY"] == "app-key"
+        assert env["EVAL_BATCH"] == BATCH and env["APP_ADMIN_API_KEY"] == "app-key"
         # A variable with no secret name reaches every run as it is.
         assert env["LANGFUSE_TRACING_ENVIRONMENT"] == "eval"
         assert "HOSTNAME" not in env
@@ -458,10 +451,14 @@ def test_a_connection_without_a_key_variable_does_not_start_the_batch(tmp_path):
 
 def test_a_secret_that_cannot_be_read_starts_no_run(tmp_path):
     for environ, reason in (
-        ({"APP_KEY": ""}, "APP_KEY is not set, and EVAL_SECRETS_PROJECT is not set"),
         (
-            {"APP_KEY": "", "EVAL_SECRETS_PROJECT": "sheerwater"},
-            "APP_KEY is not set, and secret weather-skills-eval-app-key could not be read",
+            {"APP_ADMIN_API_KEY": ""},
+            "APP_ADMIN_API_KEY is not set, and EVAL_SECRETS_PROJECT is not set",
+        ),
+        (
+            {"APP_ADMIN_API_KEY": "", "EVAL_SECRETS_PROJECT": "rhiza-shared"},
+            "APP_ADMIN_API_KEY is not set, and secret weather-skills-eval-app-admin-api-key "
+            "could not be read",
         ),
     ):
         fake = FakeDocker()
@@ -483,7 +480,6 @@ def test_an_invalid_setting_or_input_file_does_not_start_the_batch(tmp_path):
         ({"EVAL_PARALLEL_RUNS": "0"}, ("m-a", "m-b"), "EVAL_PARALLEL_RUNS"),
         ({"EVAL_PULL_APP_IMAGE": "maybe"}, ("m-a", "m-b"), "EVAL_PULL_APP_IMAGE"),
         ({"EVAL_CONFIGS_COMMIT": "main"}, ("m-a", "m-b"), "EVAL_CONFIGS_COMMIT"),
-        ({"EVAL_BATCH_CONFIG": "../weather-eval.yaml"}, ("m-a", "m-b"), "weather-eval.yaml"),
         # The commit does not define m-b; the error names what it has.
         ({}, ("m-a", "m-c"), "m-b, not at the configs commit; it has m-a, m-c"),
     ):
@@ -538,8 +534,6 @@ def test_a_run_created_as_the_batch_stops_is_never_started(tmp_path):
         fake,
         batch_module.PinnedImages(EVAL_ID, APP_ID, RUNNER_ID, "", ""),
         BATCH,
-        "weather-eval.yaml",
-        CONFIG_TEXT,
         {},
         {"EVAL_MODEL": "m-a"},
         "",
@@ -565,7 +559,7 @@ def test_a_run_whose_output_breaks_keeps_its_exit_code(tmp_path):
     _, out, err, _ = run_batch(tmp_path, fake)
 
     assert "m-a run 1: exit 6\n" in out
-    assert "Warning: weather-eval.yaml: the run's output could not be read to the end" in err
+    assert "Warning: m-a: the run's output could not be read to the end" in err
     # The kept code still stops the batch.
     assert [r.model for r in fake.runs] == ["m-a"]
 

@@ -12,7 +12,6 @@ import uuid
 import warnings
 from collections.abc import Callable
 from datetime import UTC, datetime
-from pathlib import Path
 
 import docker.errors
 import httpx
@@ -57,15 +56,12 @@ from weather_skills_eval.checks import (
     collect_evidence,
     reply_files,
 )
-from weather_skills_eval.config import ConfigError, load_config, parse_config
+from weather_skills_eval.config import ConfigError, RunConfig
 from weather_skills_eval.configs_repo import (
     EXIT_CATALOG,
-    AppDefinition,
     CatalogMismatchError,
     ConfigsRepoError,
-    ConfigsSource,
     SkillStateError,
-    with_app_definition,
 )
 from weather_skills_eval.instance import (
     AppInstance,
@@ -79,72 +75,17 @@ from weather_skills_eval.runner import RunSummary, base_model
 from weather_skills_eval.settings import DEFAULT_MODEL_MAX_TOKENS, SettingsError, load_settings
 from weather_skills_eval.tasks import TaskError, parse_task
 
-REPO = Path(__file__).resolve().parent.parent
 
-BASE_ENV = {
-    "WEBUI_SECRET_KEY": "${S}",
-    "BOOTSTRAP_ADMIN_EMAIL": "admin",
-    "BOOTSTRAP_ADMIN_PASSWORD": "${P}",
-    "BOOTSTRAP_ADMIN_API_KEY": "${K}",
-}
-ENVIRON = {"S": "secret", "P": "password", "K": "sk-key"}
-
-
-def parse(env_extra=None, environ=ENVIRON):
-    raw = {
-        "image": "img:tag",
-        "runner_image": "runner:tag",
-        "model": "m",
-        "dataset": "d",
-        "env": {**BASE_ENV, **(env_extra or {})},
+def parse(env_extra=None):
+    """A run's config with ``env_extra`` in its env, mappings and lists as JSON."""
+    env = {
+        name: value if isinstance(value, str) else json.dumps(value)
+        for name, value in (env_extra or {}).items()
     }
-    return parse_config(raw, default_name="x", environ=environ)
+    return RunConfig("x", "img:tag", "runner:tag", "m", "d", env)
 
 
 # Configuration
-
-
-def test_references_in_structured_values_are_substituted_into_the_structure():
-    result = parse(
-        {"CATALOG_MODELS": [{"id": "m", "params": {"api_key": "${K}", "note": 'a "${S}"'}}]}
-    )
-    models = json.loads(result.env["CATALOG_MODELS"])
-    assert models[0]["params"]["api_key"] == "sk-key"
-    assert models[0]["params"]["note"] == 'a "secret"'
-
-
-def test_literal_secret_inside_a_mapping_stops_the_run():
-    with pytest.raises(ConfigError) as error:
-        parse({"CATALOG_MODELS": [{"id": "m", "params": {"api_key": "sk-literal"}}]})
-    assert error.value.field == "env.CATALOG_MODELS[0].params.api_key"
-
-
-def test_null_secret_inside_a_mapping_is_accepted():
-    # A connection without auth, such as a tool server, can have a null key.
-    result = parse({"TOOL_SERVER_CONNECTIONS": [{"url": "http://tools", "key": None}]})
-    assert json.loads(result.env["TOOL_SERVER_CONNECTIONS"])[0]["key"] is None
-
-
-def test_token_counts_and_tokenizer_names_are_not_secrets():
-    result = parse(
-        {
-            "CATALOG_MODELS": [{"id": "m", "params": {"max_tokens": 4000}}],
-            "TIKTOKEN_ENCODING_NAME": "cl100k_base",
-        }
-    )
-    assert json.loads(result.env["CATALOG_MODELS"])[0]["params"]["max_tokens"] == 4000
-
-
-def test_secret_reference_with_whitespace_resolves_to_the_value_alone():
-    result = parse({"OPENAI_API_KEYS": "  ${K}  "})
-    assert result.env["OPENAI_API_KEYS"] == "sk-key"
-
-
-@pytest.mark.parametrize("port", ["0", "http"])
-def test_invalid_port_stops_the_run(port):
-    with pytest.raises(ConfigError) as error:
-        parse({"PORT": port})
-    assert error.value.field == "env.PORT"
 
 
 def test_valid_port_is_used():
@@ -163,7 +104,7 @@ def test_valid_port_is_used():
 )
 def test_invalid_connection_configs_stop_the_run(configs, field):
     with pytest.raises(ConfigError) as error:
-        parse({"OPENAI_API_CONFIGS": configs})
+        _ = parse({"OPENAI_API_CONFIGS": configs}).connections
     assert error.value.field == field
 
 
@@ -194,38 +135,6 @@ def test_connections_are_read_in_the_order_written():
     configs = {"0": {"prefix_id": "a"}, "1": {"enable": False}}
     assert parse({"OPENAI_API_CONFIGS": configs}).connections == list(configs.values())
     assert parse().connections == []
-
-
-def test_non_utf8_config_file_is_a_config_error(tmp_path):
-    path = tmp_path / "bad.yaml"
-    path.write_bytes(b"image: \xff\xfe\n")
-    with pytest.raises(ConfigError):
-        load_config(path, ENVIRON)
-
-
-def test_example_config_is_valid():
-    environ = {
-        name: "value"
-        for name in (
-            "APP_IMAGE",
-            "RUNNER_IMAGE",
-            "APP_WEBUI_SECRET_KEY",
-            "APP_ADMIN_PASSWORD",
-            "APP_ADMIN_API_KEY",
-            "APP_OPENROUTER_API_KEY",
-            "LANGFUSE_BASE_URL",
-            "LANGFUSE_PUBLIC_KEY",
-            "LANGFUSE_SECRET_KEY",
-        )
-    }
-    config = load_config(REPO / "configs" / "example.yaml", environ)
-    assert config.name == "example"
-    assert config.runner_image == "value"
-    # The eval config in use leaves to the configs repo all it defines.
-    definition = AppDefinition({"m": {"id": "m"}}, {"m": ""}, [], {}, {"TASK_MODEL": ""})
-    source = ConfigsSource(Path("."), "https://example.invalid/r", "c" * 40, "m", {})
-    in_use = load_config(REPO / "configs" / "weather-eval.yaml", environ)
-    assert with_app_definition(in_use, definition, source, environ).model == "m"
 
 
 # Settings
@@ -1025,7 +934,7 @@ def test_cli_exit_codes(monkeypatch, error, code):
         raise error
 
     monkeypatch.setattr(cli, "run", failing_run)
-    assert cli.main(["run", "configs/example.yaml"]) == code
+    assert cli.main(["run"]) == code
 
 
 def test_cli_summary_ends_with_the_cost_line_after_the_experiment_url(monkeypatch, capsys):
@@ -1040,7 +949,7 @@ def test_cli_summary_ends_with_the_cost_line_after_the_experiment_url(monkeypatc
         agent_cost_usd=0.0,
     )
     monkeypatch.setattr(cli, "run", lambda *args, **kwargs: summary)
-    assert cli.main(["run", "-"]) == 0
+    assert cli.main(["run"]) == 0
     lines = capsys.readouterr().out.splitlines()
     assert lines[-2] == "http://langfuse.invalid/experiment"
     assert lines[-1].startswith(cli.COST_LINE)
@@ -1069,7 +978,7 @@ def test_cli_prints_the_run_log_on_stderr_while_the_run_lasts(monkeypatch, capsy
         )
 
     monkeypatch.setattr(cli, "run", logging_run)
-    assert cli.main(["run", "-"]) == 0
+    assert cli.main(["run"]) == 0
     captured = capsys.readouterr()
     assert "Task 1 of 1 started: t1" in captured.err.splitlines()
     # Stdout holds only the summary.
@@ -1087,7 +996,7 @@ def test_cli_restores_the_logger_when_the_run_fails(monkeypatch, capsys):
         raise SettingsError("EVAL_JUDGE_MODELS is not set")
 
     monkeypatch.setattr(cli, "run", failing_run)
-    assert cli.main(["run", "-"]) == cli.EXIT_NOT_STARTED
+    assert cli.main(["run"]) == cli.EXIT_NOT_STARTED
     err = capsys.readouterr().err.splitlines()
     assert "Dataset d read: 1 items" in err
     assert (package.handlers, package.level, package.propagate) == (handlers, level, propagate)
@@ -1251,11 +1160,10 @@ def test_cli_main_keeps_scenario_off_langwatch_when_a_key_is_set(monkeypatch):
     monkeypatch.setenv("langwatch_api_key", "lw-lower")
     seen = {}
 
-    def play_and_resolve(path, environ, **kwargs):
+    def play_and_resolve(environ, **kwargs):
         seen["os.environ"] = [n for n in os.environ if n.upper() == "LANGWATCH_API_KEY"]
-        # A configuration still resolves the key from the harness's environment.
-        config = parse({"LANGWATCH_API_KEY": "${LANGWATCH_API_KEY}"}, {**ENVIRON, **environ})
-        seen["config"] = config.env["LANGWATCH_API_KEY"]
+        # The run still gets the key, in the copy of the environment taken first.
+        seen["config"] = environ["LANGWATCH_API_KEY"]
         play_one_scenario()
         return RunSummary(
             experiment_name="cfg",
@@ -1270,7 +1178,7 @@ def test_cli_main_keeps_scenario_off_langwatch_when_a_key_is_set(monkeypatch):
 
     monkeypatch.setattr(cli, "run", play_and_resolve)
     with fresh_scenario_tracing() as attached:
-        assert cli.main(["run", "configs/example.yaml"]) == 0
+        assert cli.main(["run"]) == 0
     assert seen == {"os.environ": [], "config": "lw-test"}
     assert posts == []
     assert exporters == []
@@ -1281,18 +1189,6 @@ def test_sigterm_handler_unwinds_with_exit_code_143():
     with pytest.raises(SystemExit) as exit_info:
         cli._terminate(signal.SIGTERM, None)
     assert exit_info.value.code == cli.EXIT_TERMINATED
-
-
-def test_cli_passes_dash_through_to_read_stdin(monkeypatch):
-    seen = []
-
-    def recording_run(path, environ, **kwargs):
-        seen.append(path)
-        raise SettingsError("stop here")
-
-    monkeypatch.setattr(cli, "run", recording_run)
-    cli.main(["run", "-"])
-    assert str(seen[0]) == "-"
 
 
 def run_api(**options) -> FakeRunApi:
@@ -1386,21 +1282,6 @@ def test_cli_delete_with_any_other_error_exits_failed():
         raise RuntimeError("unexpected")
 
     assert cli.main(["delete", "e1"], runs_factory=broken) == cli.EXIT_FAILED
-
-
-def test_load_config_from_stdin_and_from_a_path(tmp_path):
-    text = (
-        "name: from-stdin\nimage: img:tag\nrunner_image: runner:tag\n"
-        "model: m\ndataset: d\nenv:\n"
-        "  WEBUI_SECRET_KEY: ${S}\n  BOOTSTRAP_ADMIN_EMAIL: admin\n"
-        "  BOOTSTRAP_ADMIN_PASSWORD: ${P}\n  BOOTSTRAP_ADMIN_API_KEY: ${K}\n"
-    )
-    assert load_config(Path("-"), ENVIRON, stdin=io.BytesIO(text.encode())).name == "from-stdin"
-    path = tmp_path / "file.yaml"
-    path.write_text(text.replace("name: from-stdin\n", ""))
-    assert load_config(path, ENVIRON).name == "file"
-    with pytest.raises(ConfigError):
-        load_config(Path("-"), ENVIRON, stdin=io.BytesIO(b"\xff\xfe"))
 
 
 class SharedDaemon:

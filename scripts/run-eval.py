@@ -5,7 +5,7 @@
 # ///
 """Launches one eval batch on the Docker host it runs on: it resolves the configs
 repo ref given to one commit with git, and runs the models picked from that
-commit with the eval config, judge models, simulated user model, app image,
+commit with the judge models, simulated user model, app image,
 runner image, concurrency, repetitions and number of runs at once chosen for
 it. It builds the eval image, starts the batch as one detached container with
 the configs repo files at that commit copied in, and exits; the batch runs
@@ -372,10 +372,6 @@ def launch(dotenv, containers, offered, folder):
         return 1
     configs_commit, archive = fetched
     print(f"Configs {repo} at {ref} is commit {configs_commit}", flush=True)
-    configs = sorted(p.name for p in (ROOT / "configs").glob("*.yaml") if p.name != "example.yaml")
-    if not configs:
-        print("configs/ holds no eval config besides example.yaml", flush=True)
-        return 2
     try:
         offered_models = model_ids(archive)
     except (tarfile.TarError, yaml.YAMLError, UnicodeDecodeError) as exc:
@@ -384,7 +380,6 @@ def launch(dotenv, containers, offered, folder):
     if not offered_models:
         print(f"The configs repo at {configs_commit} has no model file", flush=True)
         return 2
-    config = questionary.select("Eval config:", choices=configs).unsafe_ask()
     models = questionary.checkbox("Models to run:", choices=offered_models).unsafe_ask()
     if not models:
         return 0
@@ -464,7 +459,6 @@ def launch(dotenv, containers, offered, folder):
             "EVAL_REPETITIONS": str(int(repetitions)),
             "EVAL_PARALLEL_RUNS": str(int(parallel)),
             "EVAL_PULL_APP_IMAGE": "true" if pull else "false",
-            "EVAL_BATCH_CONFIG": config,
             "EVAL_MODELS": ",".join(models),
             "EVAL_CONFIGS_REPO": repo,
             "EVAL_CONFIGS_COMMIT": configs_commit,
@@ -669,12 +663,8 @@ class FakeCommands:
 
 
 def launch_setup(tmp_path, monkeypatch, dotenv, outputs=()):
-    """ROOT at ``tmp_path`` with the eval config weather-eval and ``dotenv``
-    as .env; the questions take their defaults, and every model. Returns the
-    fake commands and the questions asked."""
-    (tmp_path / "configs").mkdir()
-    for name in ("weather-eval", "example"):
-        (tmp_path / "configs" / f"{name}.yaml").write_text("dataset: d\n")
+    """ROOT at ``tmp_path`` with ``dotenv`` as .env; the questions take their
+    defaults, and every model. Returns the fake commands and the questions asked."""
     (tmp_path / ".env").write_text(dotenv)
     monkeypatch.setitem(globals(), "ROOT", tmp_path)
     for name in [*DEFAULTS, *PARALLEL_RUNS, *CONFIGS_REPO, "EVAL_JUDGE_MODELS", UPDATED_TO]:
@@ -685,13 +675,6 @@ def launch_setup(tmp_path, monkeypatch, dotenv, outputs=()):
     (tmp_path / ".git").mkdir()
     monkeypatch.setitem(globals(), "LAUNCH_LOCK", tmp_path / ".git" / LAUNCH_LOCK_NAME)
     asked = []
-
-    def select(message, choices, **kwargs):
-        asked.append(message)
-        [choice] = choices
-        return _Answer(choice)
-
-    monkeypatch.setattr(questionary, "select", select)
 
     def checkbox(message, choices, **kwargs):
         asked.append(message)
@@ -785,7 +768,6 @@ def test_a_launch_builds_the_image_and_starts_one_detached_batch(tmp_path, monke
         "EVAL_REPETITIONS": "1",
         "EVAL_PARALLEL_RUNS": "2",
         "EVAL_PULL_APP_IMAGE": "true",
-        "EVAL_BATCH_CONFIG": "weather-eval.yaml",
         # Every model at the commit was picked, offered in id order.
         "EVAL_MODELS": "m-a,m-b",
         "EVAL_CONFIGS_REPO": REPO_URL,

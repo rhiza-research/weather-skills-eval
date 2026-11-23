@@ -26,7 +26,7 @@ from pathlib import Path
 
 import yaml
 
-from .config import ConfigError, RunConfig
+from .config import RunConfig
 from .settings import SettingsError, _required
 
 # The one schema version the harness reads: each schema's x-schema-version and
@@ -42,14 +42,6 @@ COMMIT = re.compile(r"[0-9a-f]{40}")
 # The exit code of a run whose app ignored its catalog; a batch starts no
 # further run after it.
 EXIT_CATALOG = 6
-# App variables the configs repo defines; an eval config may not set them.
-APP_DEFINED = (
-    "CATALOG_MODELS",
-    "SKILL_PACKS",
-    "OPENAI_API_BASE_URLS",
-    "OPENAI_API_KEYS",
-    "OPENAI_API_CONFIGS",
-)
 
 
 class ConfigsRepoError(Exception):
@@ -238,14 +230,8 @@ def with_app_definition(
     source: ConfigsSource,
     environ: Mapping[str, str],
 ) -> RunConfig:
-    """The eval config ``config`` running model ``source.model``: its env plus
+    """The eval side ``config`` running model ``source.model``: its env plus
     the app env the configs repo defines. The run's config name is the model id."""
-    for key in ("model", "variant"):
-        if getattr(config, key):
-            raise ConfigError(key, "comes from the configs repo commit; remove it")
-    for name in (*APP_DEFINED, *definition.settings):
-        if name in config.env:
-            raise ConfigError(f"env.{name}", "comes from the configs repo commit; remove it")
     if source.model not in definition.models:
         raise ConfigsRepoError(
             f"Model {source.model} is not in the configs repo commit; "
