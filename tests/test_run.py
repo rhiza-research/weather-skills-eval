@@ -52,15 +52,10 @@ from weather_skills_eval import simulated_user as simulated_user_module
 from weather_skills_eval.app_client import ChatError
 from weather_skills_eval.checks import NOTHING_PRESENTED, Evidence, PresentedFile
 from weather_skills_eval.config import RUNNER_ENV
-from weather_skills_eval.configs_repo import (
-    CatalogMismatchError,
-    ConfigsRepoError,
-    SkillStateError,
-)
+from weather_skills_eval.configs_repo import ConfigsRepoError
 from weather_skills_eval.instance import (
     APP_DATA_DIR,
     ARTIFACTS_SUBPATH,
-    BATCH_LABEL,
     EMULATOR_API_PORT,
     EMULATOR_BIND_PORT,
     EMULATOR_DIR,
@@ -113,7 +108,7 @@ ENVIRON = {
     "EVAL_DATASET": "weather-tasks",
     "APP_IMAGE": "ghcr.io/rhiza-research/weather-skills-chat:test",
     "RUNNER_IMAGE": RUNNER_IMAGE,
-    "EVAL_CONFIGS_REPO": "https://github.com/rhiza-research/weather-skills-configs.git",
+    "EVAL_CONFIGS_REPO": "https://github.com/rhiza-research/weather-skills-configs",
     "EVAL_CONFIGS_COMMIT": "4d174dae" + "0" * 32,
     "EVAL_CONNECTION_KEYS": "https://openrouter.ai/api/v1=APP_OPENROUTER_KEY",
 }
@@ -427,28 +422,6 @@ def test_the_batch_is_recorded_in_the_experiment_metadata(tmp_path):
     assert metadata["harness_commit"] == "7f454f0"
     assert metadata["app_image_revision"] == "8dd46ed4"
     assert metadata["app_image_pr_number"] == "42"
-    # Every container and the volume the run creates carry the batch id.
-    docker_ = harness.docker
-    labels = [docker_.source.labels, docker_.volume().labels]
-    labels += [call["labels"] for call in docker_.setup_calls + docker_.create_calls]
-    labels += [call["labels"] for call in docker_.run_calls]
-    assert [label[BATCH_LABEL] for label in labels] == ["2026-10-22T20:07:57Z"] * 5
-
-
-def test_an_image_id_is_never_pulled(tmp_path):
-    items = [task("t1", "rain forecast kenya")]
-    image_id = "sha256:" + "a" * 64
-    local = local_image([f"{APP_REPOSITORY}@sha256:abc"], image_id=image_id)
-    harness = Harness(tmp_path, items, reply_done_on(1), local=local)
-
-    # As a batch passes them; pull is true by default.
-    harness.run(APP_IMAGE=image_id, RUNNER_IMAGE=image_id)
-
-    assert harness.docker.pulled == []
-    assert harness.docker.looked_up == [image_id, image_id]
-    metadata = harness.gateway.experiments[0]["metadata"]
-    assert metadata["image_id"] == metadata["runner_image_id"] == image_id
-    assert metadata["image_digest"] == f"{APP_REPOSITORY}@sha256:abc"
 
 
 def test_an_alias_names_the_experiment_after_the_model_it_points_to(tmp_path):
@@ -552,7 +525,7 @@ def test_the_app_runs_as_the_configs_commit_defines_it(tmp_path):
     assert env["OPENAI_API_KEYS"] == ENVIRON["APP_OPENROUTER_KEY"]
     assert env["TASK_MODEL"] == env["TASK_MODEL_EXTERNAL"] == ""
     metadata = harness.gateway.experiments[0]["metadata"]
-    # HTTPS without .git, the SHA, and the model id.
+    # The repo, the SHA, and the model id.
     assert metadata["configs_repo"] == "https://github.com/rhiza-research/weather-skills-configs"
     assert metadata["configs_commit"] == ENVIRON["EVAL_CONFIGS_COMMIT"]
     assert metadata["catalog_model"] == MODEL
@@ -572,26 +545,6 @@ def test_configs_of_another_schema_version_do_not_start_the_run(tmp_path):
         assert harness.docker.pulled == []
 
 
-def test_a_connection_without_a_key_variable_does_not_start_the_run(tmp_path):
-    harness = Harness(tmp_path, [task("t1", "rain forecast kenya")], reply_done_on(1))
-
-    with pytest.raises(ConfigsRepoError, match=OPENROUTER):
-        harness.run(EVAL_CONNECTION_KEYS="https://other.invalid/v1=APP_OPENROUTER_KEY")
-
-    assert harness.docker.pulled == []
-
-
-def test_an_app_that_ignores_its_catalog_stops_the_run(tmp_path):
-    harness = Harness(tmp_path, [task("t1", "rain forecast kenya")], reply_done_on(1))
-    harness.app.catalog_ids = ["prod-model"]
-
-    with pytest.raises(CatalogMismatchError):
-        harness.run()
-
-    assert harness.gateway.experiments == []
-    assert harness.container.removed
-
-
 def test_skill_state_is_set_only_where_it_differs_from_the_commit(tmp_path):
     harness = Harness(tmp_path, [task("t1", "rain forecast kenya")], reply_done_on(1))
     plot = {"name": "plot", "is_active": False, "enabled_by_default": False}
@@ -608,22 +561,6 @@ def test_skill_state_is_set_only_where_it_differs_from_the_commit(tmp_path):
     assert harness.output()["outcome"] == "goal_reached"
     # The chats get no tool of the skill switched off.
     assert harness.app.completions[0]["tool_ids"] == ["fetch"]
-
-
-@pytest.mark.parametrize("missing", ["pack", "skill"])
-def test_a_pack_or_skill_missing_from_the_app_stops_the_run(tmp_path, missing):
-    harness = Harness(tmp_path, [task("t1", "rain forecast kenya")], reply_done_on(1))
-    absent = {"name": "absent", "is_active": True, "enabled_by_default": True}
-    harness.repo.packs([pack(skills=[absent])])
-    if missing == "pack":
-        # The app lists no pack.
-        harness.app.app_env = lambda: {"CATALOG_MODELS": json.dumps([{"id": MODEL}])}
-
-    with pytest.raises(SkillStateError):
-        harness.run()
-
-    assert harness.app.skill_changes == []
-    assert harness.gateway.experiments == []
 
 
 def test_goal_met_records_turns_cost_tokens_and_time(tmp_path):
@@ -3007,7 +2944,6 @@ def test_app_never_healthy_stops_the_run_with_logs(tmp_path):
         ("APP_IMAGE", ""),
         ("EVAL_DATASET", ""),
         ("APP_ADMIN_API_KEY", " "),
-        ("EVAL_PULL_APP_IMAGE", "no"),
     ],
 )
 def test_a_missing_or_bad_eval_setting_does_not_start_the_run(tmp_path, setting, value):

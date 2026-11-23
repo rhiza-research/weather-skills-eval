@@ -19,7 +19,6 @@ What each file gives the app, as the repo's README says:
 
 import dataclasses
 import json
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,7 +26,7 @@ from pathlib import Path
 import yaml
 
 from .config import RunConfig
-from .settings import SettingsError, _required
+from .settings import _required
 
 # The one schema version the harness reads: each schema's x-schema-version and
 # each data file's schema_version.
@@ -38,10 +37,6 @@ SCHEMAS = (
     "schemas/connections.json",
     "schemas/settings.json",
 )
-COMMIT = re.compile(r"[0-9a-f]{40}")
-# The exit code of a run whose app ignored its catalog; a batch starts no
-# further run after it.
-EXIT_CATALOG = 6
 
 
 class ConfigsRepoError(Exception):
@@ -49,20 +44,14 @@ class ConfigsRepoError(Exception):
     or do not define what a run needs. The message names the file or setting."""
 
 
-class CatalogMismatchError(Exception):
-    """The app's catalog ids are not the ids it was given: the app image does
-    not provision its catalog from the environment."""
-
-
 class SkillStateError(Exception):
-    """The app's skill pack or skill state differs from the configs repo, or a
-    pack or skill the repo records is not in the app."""
+    """A pack or skill the configs repo records is not in the app."""
 
 
 @dataclass(frozen=True)
 class ConfigsSource:
     directory: Path
-    # HTTPS, without a trailing slash or .git, as each run records it.
+    # As each run records it.
     repo: str
     commit: str
     model: str
@@ -83,17 +72,6 @@ class AppDefinition:
     settings: dict[str, object]
 
 
-def normalize_repo(url: str) -> str:
-    """``https://github.com/org/repo.git/`` -> ``https://github.com/org/repo``."""
-    repo = url.strip().rstrip("/").removesuffix(".git")
-    if not repo.startswith("https://"):
-        raise SettingsError(f"EVAL_CONFIGS_REPO must be an HTTPS URL, not {url!r}")
-    # Recorded in every experiment, so it must carry no credentials.
-    if "@" in repo.removeprefix("https://").split("/", 1)[0]:
-        raise SettingsError("EVAL_CONFIGS_REPO must not hold a user name or token")
-    return repo
-
-
 def parse_connection_keys(text: str) -> dict[str, str]:
     """``<base URL>=<VARIABLE>`` pairs, comma-separated."""
     keys = {}
@@ -102,23 +80,15 @@ def parse_connection_keys(text: str) -> dict[str, str]:
             continue
         url, _, name = pair.rpartition("=")
         url, name = url.strip().rstrip("/"), name.strip()
-        if not url or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-            raise SettingsError(
-                f"EVAL_CONNECTION_KEYS needs <base URL>=<VARIABLE> pairs, not {pair!r}"
-            )
         keys[url] = name
     return keys
 
 
 def load_source(environ: Mapping[str, str]) -> ConfigsSource:
     commit = _required(environ, "EVAL_CONFIGS_COMMIT")
-    if not COMMIT.fullmatch(commit):
-        raise SettingsError(
-            f"EVAL_CONFIGS_COMMIT must be a 40-character commit SHA, not {commit!r}"
-        )
     return ConfigsSource(
         directory=Path(_required(environ, "EVAL_CONFIGS_DIR")),
-        repo=normalize_repo(_required(environ, "EVAL_CONFIGS_REPO")),
+        repo=_required(environ, "EVAL_CONFIGS_REPO"),
         commit=commit,
         model=_required(environ, "EVAL_MODEL"),
         connection_keys=parse_connection_keys(environ.get("EVAL_CONNECTION_KEYS", "")),
@@ -126,26 +96,17 @@ def load_source(environ: Mapping[str, str]) -> ConfigsSource:
 
 
 def _read(root: Path, name: str) -> dict:
-    """A data file, refused unless it is a mapping of the supported version."""
+    """A data file, refused unless it is of the supported version."""
     try:
         data = yaml.safe_load((root / name).read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
         raise ConfigsRepoError(f"{name} cannot be read: {exc}") from exc
-    if not isinstance(data, dict):
-        raise ConfigsRepoError(f"{name} must be a mapping")
     if data.get("schema_version") != SCHEMA_VERSION:
         raise ConfigsRepoError(
             f"{name} is schema version {data.get('schema_version')!r}; "
             f"the harness reads only version {SCHEMA_VERSION}"
         )
     return data
-
-
-def _field(data: Mapping, name: str, key: str, kind: type):
-    value = data.get(key)
-    if not isinstance(value, kind):
-        raise ConfigsRepoError(f"{name}: {key} must be a {kind.__name__}")
-    return value
 
 
 def load_app_definition(root: Path) -> AppDefinition:
@@ -166,20 +127,16 @@ def load_app_definition(root: Path) -> AppDefinition:
     for path in sorted((root / "models").glob("*.yaml")):
         name = f"models/{path.name}"
         data = _read(root, name)
-        model = _field(data, name, "model", dict)
-        model_id = _field(model, name, "id", str)
-        variant = _field(data, name, "eval", dict).get("variant") or ""
-        if not isinstance(variant, str):
-            raise ConfigsRepoError(f"{name}: eval.variant must be a string or null")
+        model = data["model"]
+        model_id = model["id"]
+        variant = data["eval"].get("variant") or ""
         variant = variant.strip()
         models[model_id] = model
         variants[model_id] = variant
-    if not models:
-        raise ConfigsRepoError("models/ holds no model file")
 
-    packs = _field(_read(root, "skill-packs.yaml"), "skill-packs.yaml", "skill_packs", list)
-    connections = _field(_read(root, "connections.yaml"), "connections.yaml", "connections", dict)
-    settings = _field(_read(root, "settings.yaml"), "settings.yaml", "settings", dict)
+    packs = _read(root, "skill-packs.yaml")["skill_packs"]
+    connections = _read(root, "connections.yaml")["connections"]
+    settings = _read(root, "settings.yaml")["settings"]
     return AppDefinition(models, variants, packs, connections, settings)
 
 
@@ -232,11 +189,6 @@ def with_app_definition(
 ) -> RunConfig:
     """The eval side ``config`` running model ``source.model``: its env plus
     the app env the configs repo defines. The run's config name is the model id."""
-    if source.model not in definition.models:
-        raise ConfigsRepoError(
-            f"Model {source.model} is not in the configs repo commit; "
-            f"it has {', '.join(sorted(definition.models))}"
-        )
     return dataclasses.replace(
         config,
         name=source.model,
@@ -244,18 +196,6 @@ def with_app_definition(
         variant=definition.variants[source.model],
         env={**config.env, **app_env(definition, source.connection_keys, environ)},
     )
-
-
-async def check_catalog(app, definition: AppDefinition) -> None:
-    """The app's catalog ids, read as a platform admin, must be the ids it was given."""
-    listed = await app.platform_models()
-    ids = sorted(str(m.get("id")) for m in listed if isinstance(m, dict))
-    given = sorted(definition.models)
-    if ids != given:
-        raise CatalogMismatchError(
-            f"The app lists catalog models {ids}, not the {given} it was given in "
-            "CATALOG_MODELS: the app image does not provision from env"
-        )
 
 
 def _skill_differences(wanted: list[dict], listed: list) -> tuple[list[str], list[tuple]]:
@@ -304,9 +244,8 @@ def _skill_differences(wanted: list[dict], listed: list) -> tuple[list[str], lis
 async def apply_skill_state(app, definition: AppDefinition) -> None:
     """Makes the app's pack and skill ``is_active`` and skill
     ``enabled_by_default`` match the configs repo (AD-24). The toggle routes
-    flip the state, so each is called only on a difference. Reads the state
-    again and raises ``SkillStateError`` when anything still differs, or when a
-    recorded pack or skill is not in the app."""
+    flip the state, so each is called only on a difference. Raises
+    ``SkillStateError`` when a recorded pack or skill is not in the app."""
     missing, changes = _skill_differences(definition.skill_packs, await app.platform_skill_packs())
     if missing:
         raise SkillStateError("; ".join(missing))
@@ -317,9 +256,3 @@ async def apply_skill_state(app, definition: AppDefinition) -> None:
             await app.toggle_skill(pack_id, tool_id)
         else:
             await app.set_skill_enabled_by_default(pack_id, tool_id, value)
-    missing, changes = _skill_differences(definition.skill_packs, await app.platform_skill_packs())
-    if missing or changes:
-        differing = missing + [f"{description} differs" for description, *_ in changes]
-        raise SkillStateError(
-            "The app's skill state does not match the configs repo: " + "; ".join(differing)
-        )

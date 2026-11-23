@@ -31,11 +31,7 @@ and the volume are removed when the run ends, whether the run succeeded or
 not, and when the harness gets SIGTERM (the CLI turns it into an exit that
 unwinds through this cleanup).
 
-An image reference that is an image ID, as a batch passes them, is never
-pulled, whatever ``pull`` says: the batch pinned it on the host.
-
-The containers and the volume are labeled with their run's id, and with the
-batch's id when ``EVAL_BATCH`` is set. A run only ever
+The containers and the volume are labeled with their run's id. A run only ever
 touches the objects it created, by name, so runs sharing one Docker daemon do
 not interfere. A harness killed with SIGKILL cannot clean up; its objects keep
 the ``weather-skills-eval.run`` label and are removed by hand.
@@ -43,7 +39,6 @@ the ``weather-skills-eval.run`` label and are removed by hand.
 
 import io
 import logging
-import re
 import secrets
 import tarfile
 import time
@@ -69,7 +64,6 @@ VOLUME_SETUP_LABEL_VALUE = "volume-setup"
 VOLUME_LABEL_VALUE = "data"
 RUN_LABEL = "weather-skills-eval.run"
 BATCH_LABEL = "weather-skills-eval.batch"
-IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 
 # The app mounts the whole volume at its data directory. The runner mounts
 # only the volume's artifacts folder, at the path its emulator reads as
@@ -176,7 +170,6 @@ class AppInstance:
         start_timeout: float,
         poll_interval: float,
         pull: bool = True,
-        batch: str = "",
         health_check: Callable[[str], bool] = _health_ok,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
@@ -190,7 +183,6 @@ class AppInstance:
         self._start_timeout = start_timeout
         self._poll_interval = poll_interval
         self._pull_first = pull
-        self._batch = batch
         self._health_check = health_check
         self._clock = clock
         self._sleep = sleep
@@ -238,11 +230,7 @@ class AppInstance:
         }
 
     def _labels(self, value: str) -> dict[str, str]:
-        labels = {LABEL: value, RUN_LABEL: self.run_id}
-        if self._batch:
-            # So the batch's kill command and the next batch's cleanup find it.
-            labels[BATCH_LABEL] = self._batch
-        return labels
+        return {LABEL: value, RUN_LABEL: self.run_id}
 
     def _emulator_files(self, image) -> dict[str, bytes]:
         """The emulator files of the app image, keyed by their path in the
@@ -294,12 +282,9 @@ class AppInstance:
     def _repo_digest(ref: str, image) -> str | None:
         """A digest reference itself, since it names exactly the image Docker
         resolved, even when ``RepoDigests`` spells it another way; else the
-        image's first digest for the reference's repository, or its first
-        digest of any repository for an image ID, which names none."""
+        image's first digest for the reference's repository."""
         if "@" in ref:
             return ref
-        if IMAGE_ID.fullmatch(ref):
-            return next(iter(image.attrs.get("RepoDigests") or []), None)
         repository = repository_of(ref)
         for digest in image.attrs.get("RepoDigests") or []:
             if digest.split("@", 1)[0] == repository:
@@ -308,9 +293,8 @@ class AppInstance:
 
     def _image(self, ref: str, error: type[AppStartError], what: str, pull: bool):
         """The image to start, and its digest: the one a digest reference
-        pins, else its first digest for its repository. An image ID cannot be
-        pulled, so it is read from the host whatever ``pull`` says."""
-        if not pull or IMAGE_ID.fullmatch(ref):
+        pins, else its first digest for its repository."""
+        if not pull:
             # An image built on the host has no repo digest until it is pushed.
             image = self._local(ref, error, what)
             log.info("%s %s found on the Docker host", what, ref)
@@ -527,7 +511,7 @@ class AppInstance:
         self.image_id = image.id
         try:
             files = self._emulator_files(image)
-            # A published image: pulled whatever ``pull`` says, unless it is an image ID.
+            # A published image: pulled whatever ``pull`` says.
             runner_image, self.runner_image_digest = self._image(
                 self._runner_image_ref, RunnerStartError, "Runner image", True
             )

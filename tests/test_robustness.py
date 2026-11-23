@@ -58,8 +58,6 @@ from weather_skills_eval.checks import (
 )
 from weather_skills_eval.config import ConfigError, RunConfig
 from weather_skills_eval.configs_repo import (
-    EXIT_CATALOG,
-    CatalogMismatchError,
     ConfigsRepoError,
     SkillStateError,
 )
@@ -924,8 +922,6 @@ def test_a_cancelled_final_judge_call_keeps_its_evidence_until_the_verdict_ends(
         (LangfuseApiError(status_code=500, body="boom"), cli.EXIT_LANGFUSE),
         (ConfigsRepoError("settings.yaml is schema version 2"), cli.EXIT_NOT_STARTED),
         (SkillStateError("skill plot is not in the app"), cli.EXIT_APP_FAILED),
-        # The code a batch stops on.
-        (CatalogMismatchError("other ids"), EXIT_CATALOG),
         (RuntimeError("unexpected"), cli.EXIT_FAILED),
     ],
 )

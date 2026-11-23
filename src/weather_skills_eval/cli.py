@@ -7,7 +7,7 @@ Exit codes:
   were not scored because the sandbox runner restarted during them; the
   summary gives their number.
 - 1: the run failed for any other reason.
-- 2: the run did not start: a harness setting, the configs repo files (another schema version, a model not at the commit, a
+- 2: the run did not start: a harness setting, the configs repo files (another schema version, a
   connection without a key), the dataset or a dataset item is
   invalid, the dataset is missing, empty or
   could not be read from Langfuse (any error, a Langfuse error included), or
@@ -24,8 +24,6 @@ Exit codes:
   the dataset was read, a network error (an httpx error, such as a
   connection error or timeout) reaching the app or Langfuse stopped the run.
 - 5: Langfuse returned an error response after the dataset was read.
-- 6: the app's catalog ids were not the ids it was given, so the app image
-  does not provision from env.
 - 143: the harness was stopped with SIGTERM; the app and runner containers
   and the volume were removed.
 
@@ -58,7 +56,7 @@ from langfuse.api.core.api_error import ApiError as LangfuseApiError
 from . import batch
 from .app_client import ChatError
 from .config import ConfigError
-from .configs_repo import EXIT_CATALOG, CatalogMismatchError, ConfigsRepoError, SkillStateError
+from .configs_repo import ConfigsRepoError, SkillStateError
 from .instance import AppStartError, RunnerStartError
 from .langfuse_gateway import ExperimentNotFound, LangfuseRuns
 from .runner import DatasetError, run
@@ -244,8 +242,6 @@ def main(
             summary = run(environ, docker_client_factory=docker_client_factory)
     except (SettingsError, ConfigError, ConfigsRepoError, TaskError, DatasetError) as exc:
         return _fail(EXIT_NOT_STARTED, f"Run not started: {exc}")
-    except CatalogMismatchError as exc:
-        return _fail(EXIT_CATALOG, f"Run stopped, the app ignored its catalog: {exc}")
     except SkillStateError as exc:
         return _fail(EXIT_APP_FAILED, f"Run stopped, the app's skill state: {exc}")
     except RunnerStartError as exc:

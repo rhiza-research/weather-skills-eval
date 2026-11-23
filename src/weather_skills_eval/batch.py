@@ -5,39 +5,27 @@ terminal can close.
 
 Order of a batch:
 1. Read its settings from the environment, and the configs repo files at ``EVAL_CONFIGS_COMMIT``, which the launcher
-   copied into the batch container; stop on any error, or a model in
-   ``EVAL_MODELS`` that the commit does not define (exit 2).
-2. Remove the containers, then the volumes, that carry a
-   ``weather-skills-eval.run`` label or another batch's
-   ``weather-skills-eval.batch`` label, left over from a run or batch that was
-   killed.
-3. Create the ``weather-skills-eval`` network when it is missing. It is never
+   copied into the batch container; stop on any error (exit 2).
+2. Create the ``weather-skills-eval`` network when it is missing. It is never
    removed.
-4. Pin the eval, app and runner images to image IDs: the eval image is read
-   from the host, the app image is pulled unless ``EVAL_PULL_APP_IMAGE`` is
-   ``false``, the runner image is pulled. Read the app image's revision and PR
-   number labels. A Docker error up to here stops the batch (exit 3).
-5. For each secret a run needs, take it from the batch's environment when
+3. Pull the app image unless ``EVAL_PULL_APP_IMAGE`` is ``false``, and read
+   its revision and PR number labels. A Docker error up to here stops the
+   batch (exit 3).
+4. For each secret a run needs, take it from the batch's environment when
    set, else read it from Secret Manager. Only the batch reads Secret
    Manager, over the host network the launcher runs it on; each run gets
    only the secrets it needs, as env.
-6. Run the queue: each model once per round, as many rounds as
+5. Run the queue: each model once per round, as many rounds as
    ``EVAL_REPETITIONS``, at most ``EVAL_PARALLEL_RUNS`` at once. Each run is a
    child container of the eval image ID running ``weather-skills-eval run`` on
-   one model, with the configs repo files copied in. After a run that finds the app ignored its catalog (exit 6), no further
-   run starts (AD-12).
-
-On SIGTERM, as from ``docker stop``, the batch starts no further run and stops
-each run's container, giving it ``HARNESS_STOP_SECONDS`` to remove what it
-created; then it ends with exit 143.
+   one model, with the configs repo files copied in.
 
 Exit codes: 0 when every run exited 0; 1 when any did not; 2 when the batch
 did not start (a setting or the configs repo files);
-3 when Docker failed before the first run; 143 when it was stopped.
+3 when Docker failed before the first run.
 """
 
 import codecs
-import signal
 import sys
 import threading
 import uuid
@@ -47,23 +35,16 @@ from pathlib import Path
 
 from .config import APP_ENV, is_secret_name
 from .configs_repo import (
-    COMMIT,
-    EXIT_CATALOG,
     ConfigsRepoError,
     load_app_definition,
-    normalize_repo,
     parse_connection_keys,
 )
-from .instance import BATCH_LABEL, DOCKER_ERRORS, IMAGE_ID, LABEL, RUN_LABEL, _archive
+from .instance import BATCH_LABEL, DOCKER_ERRORS, LABEL, _archive
 from .settings import REQUIRED_PASSTHROUGH, SettingsError, _required, _whole
 
 EXIT_FAILED = 1
 EXIT_NOT_STARTED = 2
 EXIT_DOCKER = 3
-EXIT_TERMINATED = 143
-# How long each run gets to remove its containers when the batch stops; less
-# than the grace the kill command gives the batch.
-HARNESS_STOP_SECONDS = 60
 
 NETWORK = "weather-skills-eval"
 HARNESS_LABEL_VALUE = "harness"
@@ -78,8 +59,6 @@ PR_NUMBER_LABEL = "weather-skills-chat.pr-number"
 # Secret Manager secret id of an environment variable: this prefix, then the
 # name lowercased with underscores as dashes. Shared with the VM's Terraform.
 SECRET_PREFIX = "weather-skills-eval-"
-# Docker sets it per container, so the batch's own is not passed on.
-NOT_FORWARDED = ("HOSTNAME",)
 
 
 @dataclass(frozen=True)
@@ -101,9 +80,6 @@ class BatchSettings:
 
 @dataclass(frozen=True)
 class PinnedImages:
-    eval_id: str
-    app_id: str
-    runner_id: str
     # The app image's labels; empty when it does not carry them.
     app_revision: str
     app_pr_number: str
@@ -112,20 +88,12 @@ class PinnedImages:
 def load_batch_settings(environ: Mapping[str, str]) -> BatchSettings:
     raw_models = _required(environ, "EVAL_MODELS")
     models = tuple(model.strip() for model in raw_models.split(","))
-    if not all(models):
-        raise SettingsError(f"EVAL_MODELS has an empty model id: {raw_models!r}")
     commit = _required(environ, "EVAL_CONFIGS_COMMIT")
-    if not COMMIT.fullmatch(commit):
-        raise SettingsError(
-            f"EVAL_CONFIGS_COMMIT must be a 40-character commit SHA, not {commit!r}"
-        )
     pull = environ.get("EVAL_PULL_APP_IMAGE", "").strip().lower() or "true"
-    if pull not in ("true", "false"):
-        raise SettingsError(f"EVAL_PULL_APP_IMAGE must be true or false, not {pull!r}")
     return BatchSettings(
         batch=_required(environ, "EVAL_BATCH"),
         models=models,
-        configs_repo=normalize_repo(_required(environ, "EVAL_CONFIGS_REPO")),
+        configs_repo=_required(environ, "EVAL_CONFIGS_REPO"),
         configs_commit=commit,
         repetitions=_whole(environ, "EVAL_REPETITIONS", 1, minimum=1),
         parallel_runs=_whole(environ, "EVAL_PARALLEL_RUNS", 1, minimum=1),
@@ -202,40 +170,6 @@ def resolve_secrets(
     return values, errors
 
 
-def remove_leftovers(docker, batch: str, say: Callable[[str], None]) -> None:
-    """Remove the containers, then the volumes, of any run, and of any batch
-    but ``batch``. One that cannot be removed is reported and the batch goes
-    on: it only takes up room."""
-
-    def leftover(labels: Mapping[str, str]) -> bool:
-        return RUN_LABEL in labels or labels.get(BATCH_LABEL, batch) != batch
-
-    containers = {}
-    for label in (RUN_LABEL, BATCH_LABEL):
-        for container in docker.containers.list(all=True, filters={"label": label}):
-            if leftover(container.labels or {}):
-                containers[container.id] = container
-    for container in containers.values():
-        try:
-            container.remove(force=True, v=True)
-        except DOCKER_ERRORS as exc:
-            say(f"Could not remove leftover container {container.name}: {exc}")
-        else:
-            say(f"Removed leftover container {container.name}")
-    volumes = {}
-    for label in (RUN_LABEL, BATCH_LABEL):
-        for volume in docker.volumes.list(filters={"label": label}):
-            if leftover(volume.attrs.get("Labels") or {}):
-                volumes[volume.name] = volume
-    for volume in volumes.values():
-        try:
-            volume.remove(force=True)
-        except DOCKER_ERRORS as exc:
-            say(f"Could not remove leftover volume {volume.name}: {exc}")
-        else:
-            say(f"Removed leftover volume {volume.name}")
-
-
 def ensure_network(docker, batch: str, say: Callable[[str], None]) -> None:
     """Create the network runs join when it is missing; never remove it."""
     # The names filter also matches names that only contain it.
@@ -246,28 +180,15 @@ def ensure_network(docker, batch: str, say: Callable[[str], None]) -> None:
 
 
 def pin_images(docker, settings: BatchSettings, say: Callable[[str], None]) -> PinnedImages:
-    """The image ID of each image, resolved once, so no rebuild or pull
-    during the batch changes what its runs start from."""
-    eval_image = docker.images.get(settings.eval_image)
-    # An image ID cannot be pulled.
-    if settings.pull_app_image and not IMAGE_ID.fullmatch(settings.app_image):
+    """The app image's labels, from the image pulled unless
+    ``EVAL_PULL_APP_IMAGE`` is ``false``."""
+    if settings.pull_app_image:
         say(f"Pulling app image {settings.app_image}")
         app = docker.images.pull(settings.app_image)
     else:
         app = docker.images.get(settings.app_image)
-    say(f"Pulling runner image {settings.runner_image}")
-    runner = docker.images.pull(settings.runner_image)
-    for what, ref, image in (
-        ("Eval", settings.eval_image, eval_image),
-        ("App", settings.app_image, app),
-        ("Runner", settings.runner_image, runner),
-    ):
-        say(f"{what} image {ref} pinned as {image.id}")
     labels = (app.attrs.get("Config") or {}).get("Labels") or {}
     return PinnedImages(
-        eval_id=eval_image.id,
-        app_id=app.id,
-        runner_id=runner.id,
         app_revision=labels.get(REVISION_LABEL, ""),
         app_pr_number=labels.get(PR_NUMBER_LABEL, ""),
     )
@@ -283,12 +204,10 @@ def run_environment(
     """A run's environment: the batch's own, which holds the dotenv file and
     the launcher's choices, without any secret-named variable the run does not
     need in ``needed``, plus the secrets read for it, its model, where its
-    configs repo files are, the pinned images and the network."""
+    configs repo files are, the app image's labels and the network."""
     needed = set(needed)
 
     def forwarded(name: str) -> bool:
-        if name in NOT_FORWARDED:
-            return False
         # The harness's EVAL_ settings hold no secret, EVAL_CONNECTION_KEYS included.
         return name.startswith("EVAL_") or not is_secret_name(name) or name in needed
 
@@ -297,8 +216,6 @@ def run_environment(
         **secrets,
         "EVAL_MODEL": model,
         "EVAL_CONFIGS_DIR": CONFIGS_REPO_DIR,
-        "APP_IMAGE": pinned.app_id,
-        "RUNNER_IMAGE": pinned.runner_id,
         "EVAL_DOCKER_NETWORK": NETWORK,
         "EVAL_APP_IMAGE_REVISION": pinned.app_revision,
         "EVAL_APP_IMAGE_PR_NUMBER": pinned.app_pr_number,
@@ -333,7 +250,7 @@ def pass_on(
 
 def run_one(
     docker,
-    pinned: PinnedImages,
+    image: str,
     batch: str,
     files: Mapping[str, bytes],
     environment: Mapping[str, str],
@@ -341,17 +258,12 @@ def run_one(
     lock: threading.Lock,
     out,
     err,
-    live: dict | None = None,
-    stopping: threading.Event | None = None,
 ) -> int:
-    """One run in a child container of the eval image, with ``files``, by
+    """One run in a child container of the eval ``image``, with ``files``, by
     path, copied in and the run's stdout and stderr passed on; returns its
-    exit code. The container is in ``live``, by ID, while it exists, so a
-    stopping batch can stop it; it is removed when the run ends."""
-    live = {} if live is None else live
-    name = environment.get("EVAL_MODEL", "run")
+    exit code. The container is removed when the run ends."""
     container = docker.containers.create(
-        pinned.eval_id,
+        image,
         entrypoint=["weather-skills-eval"],
         command=["run"],
         name=f"weather-skills-eval-harness-{uuid.uuid4().hex[:12]}",
@@ -360,23 +272,10 @@ def run_one(
         network=NETWORK,
         volumes={DOCKER_SOCKET: {"bind": DOCKER_SOCKET, "mode": "rw"}},
     )
-    with lock:
-        live[container.id] = container
     try:
         # No bind mount, as for the runner's emulator files.
-        if not container.put_archive("/", _archive(dict(files))):
-            raise RuntimeError("the configs repo files could not be copied into the run container")
-        with lock:
-            # The batch began stopping after this container was created: the
-            # stop of the live runs found it not yet started.
-            if stopping is not None and stopping.is_set():
-                print(
-                    f"{name}: not started: the batch was stopped",
-                    file=out,
-                    flush=True,
-                )
-                return EXIT_NOT_STARTED
-            container.start()
+        container.put_archive("/", _archive(dict(files)))
+        container.start()
         errors: list[str] = []
         readers = [
             threading.Thread(
@@ -395,32 +294,9 @@ def run_one(
             reader.start()
         for reader in readers:
             reader.join()
-        status = container.wait()
-        if "StatusCode" not in status:
-            raise RuntimeError(f"Docker reported no exit code: {status}")
-        code = status["StatusCode"]
-        if errors:
-            with lock:
-                print(
-                    f"Warning: {name}: the run's output could not be read to the end: "
-                    f"{'; '.join(errors)}",
-                    file=err,
-                    flush=True,
-                )
-            # A failing code is kept, so a run that exited 6 still stops the
-            # batch; a run whose output was lost does not count as passed.
-            return code or EXIT_FAILED
-        return code
+        return container.wait()["StatusCode"]
     finally:
-        with lock:
-            live.pop(container.id, None)
-        try:
-            container.remove(force=True)
-        except Exception as exc:
-            with lock:
-                print(
-                    f"Could not remove run container {container.name}: {exc}", file=err, flush=True
-                )
+        container.remove(force=True)
 
 
 def run_queue(
@@ -435,8 +311,7 @@ def run_queue(
     in queue order, at most ``parallel`` at once: the next starts when one
     ends. With ``parallel`` above 1 every line of a run is prefixed with
     ``[<model> run <round>] ``. Each run's exit code is added to
-    ``results`` and printed; a run ``start`` raises on is recorded as
-    failed, after a line saying why."""
+    ``results`` and printed."""
     slots = threading.Semaphore(parallel)
     threads = []
 
@@ -444,16 +319,7 @@ def run_queue(
         label = f"{name} run {repetition}"
         prefix = f"[{label}] " if parallel > 1 else ""
         try:
-            try:
-                code = start(name, repetition, prefix)
-            except Exception as exc:
-                with lock:
-                    print(
-                        f"{label}: failed in the batch: {type(exc).__name__}: {exc}",
-                        file=out,
-                        flush=True,
-                    )
-                code = EXIT_FAILED
+            code = start(name, repetition, prefix)
             with lock:
                 results.append((label, code))
                 print(f"{label}: exit {code}", file=out, flush=True)
@@ -484,8 +350,7 @@ def main(
     out=sys.stdout,
     err=sys.stderr,
 ) -> int:
-    # Reentrant: the SIGTERM handler takes it on the main thread, which may hold it.
-    lock = threading.RLock()
+    lock = threading.Lock()
 
     def say(line: str) -> None:
         with lock:
@@ -494,19 +359,8 @@ def main(
     try:
         settings = load_batch_settings(environ)
         definition = load_app_definition(configs_repo_dir)
-        unknown = [model for model in settings.models if model not in definition.models]
-        if unknown:
-            raise ConfigsRepoError(
-                f"EVAL_MODELS names {', '.join(unknown)}, not at the configs commit; "
-                f"it has {', '.join(sorted(definition.models))}"
-            )
         files = repo_files(configs_repo_dir)
         connection_keys = parse_connection_keys(environ.get("EVAL_CONNECTION_KEYS", ""))
-        unmapped = [u for u in definition.connections if u.rstrip("/") not in connection_keys]
-        if unmapped:
-            raise ConfigsRepoError(
-                f"EVAL_CONNECTION_KEYS names no key variable for connection {', '.join(unmapped)}"
-            )
         key_variables = [connection_keys[u.rstrip("/")] for u in definition.connections]
     except (SettingsError, ConfigsRepoError, OSError) as exc:
         print(f"Batch not started: {exc}", file=err, flush=True)
@@ -515,7 +369,6 @@ def main(
 
     try:
         docker = docker_client_factory()
-        remove_leftovers(docker, settings.batch, say)
         ensure_network(docker, settings.batch, say)
         pinned = pin_images(docker, settings, say)
     except DOCKER_ERRORS as exc:
@@ -527,46 +380,17 @@ def main(
     values, errors = resolve_secrets(needed, environ, settings.secrets_project, secret_reader)
     missing = [errors[secret] for secret in sorted(needed) if secret in errors]
     secrets = {secret: values[secret] for secret in needed if secret in values}
-    # Set once a run finds the app ignored its catalog; no run starts after it.
-    ignored_catalog = threading.Event()
-    # Set on SIGTERM, as from docker stop; no run starts after it.
-    stopping = threading.Event()
-    # Each run's container, by ID, while it exists.
-    live: dict = {}
-
-    def stop(number, frame) -> None:
-        """Starts no further run, and stops each run's container, so the run
-        removes its app, runner and volume before Docker kills it."""
-        stopping.set()
-        with lock:
-            containers = list(live.values())
-        say(f"Batch stopping: stopping {len(containers)} runs")
-
-        def stop_one(container) -> None:
-            try:
-                container.stop(timeout=HARNESS_STOP_SECONDS)
-            except Exception as exc:
-                say(f"Could not stop run container {container.name}: {exc}")
-
-        for container in containers:
-            threading.Thread(target=stop_one, args=(container,)).start()
 
     def start(model: str, repetition: int, prefix: str) -> int:
-        if stopping.is_set():
-            say(f"{model} run {repetition}: not started: the batch was stopped")
-            return EXIT_NOT_STARTED
         if missing:
             say(f"{model} run {repetition}: not started: {'; '.join(missing)}")
-            return EXIT_NOT_STARTED
-        if ignored_catalog.is_set():
-            say(f"{model} run {repetition}: not started: the app image ignored its catalog")
             return EXIT_NOT_STARTED
         # Every variable the app's environment comes from reaches the run.
         referenced = needed | set(APP_ENV.values())
         environment = run_environment(environ, referenced, secrets, pinned, model)
-        code = run_one(
+        return run_one(
             docker,
-            pinned,
+            settings.eval_image,
             settings.batch,
             files,
             environment,
@@ -574,12 +398,7 @@ def main(
             lock,
             out,
             err,
-            live,
-            stopping,
         )
-        if code == EXIT_CATALOG:
-            ignored_catalog.set()
-        return code
 
     # In rounds, each model once per round.
     queue = [
@@ -588,17 +407,7 @@ def main(
         for model in settings.models
     ]
     results: list[tuple[str, int]] = []
-    # Only the main thread can take a signal handler.
-    on_main = threading.current_thread() is threading.main_thread()
-    previous = signal.signal(signal.SIGTERM, stop) if on_main else None
-    try:
-        run_queue(queue, settings.parallel_runs, start, results, lock, out)
-    finally:
-        # None: a handler not set from Python, which cannot be put back.
-        if on_main and previous is not None:
-            signal.signal(signal.SIGTERM, previous)
+    run_queue(queue, settings.parallel_runs, start, results, lock, out)
     passed = sum(1 for _, code in results if code == 0)
     say(f"Batch {settings.batch} finished: {passed} of {len(results)} runs exited 0")
-    if stopping.is_set():
-        return EXIT_TERMINATED
     return 0 if passed == len(results) else EXIT_FAILED

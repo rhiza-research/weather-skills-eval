@@ -115,9 +115,6 @@ class AppClient:
     # As a platform admin: the app grants the admin role only with this header,
     # and lists inactive models, packs and skills only in this organization.
 
-    async def platform_models(self) -> list[dict]:
-        return await self._json("GET", "/api/v1/models/", list, headers=PLATFORM)
-
     async def platform_skill_packs(self) -> list[dict]:
         return await self._json("GET", "/api/v1/skills/", list, headers=PLATFORM)
 

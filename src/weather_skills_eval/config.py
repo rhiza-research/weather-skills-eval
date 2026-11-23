@@ -15,7 +15,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from .settings import SettingsError, _required
+from .settings import _required
 
 # The harness sets these on the app to run skills on the sandbox runner.
 RUNNER_ENV = (
@@ -153,8 +153,6 @@ def run_config(environ: Mapping[str, str]) -> RunConfig:
     ``EVAL_PULL_APP_IMAGE`` (``true``, the default, or ``false``) and the app
     variables of APP_ENV, each required."""
     pull = environ.get("EVAL_PULL_APP_IMAGE", "").strip().lower() or "true"
-    if pull not in ("true", "false"):
-        raise SettingsError(f"EVAL_PULL_APP_IMAGE must be true or false, not {pull!r}")
     return RunConfig(
         name="",
         image=_required(environ, "APP_IMAGE"),

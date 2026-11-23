@@ -185,11 +185,9 @@ class FakeApp:
                 "meta": {"manifest": {"kind": "skill", "skill_name": "fetch", "version": "2"}},
             },
         ]
-        # The env the app container was started with; the catalog and the
-        # packs it lists come from it.
+        # The env the app container was started with; the packs it lists
+        # come from it.
         self.app_env: Callable[[], dict] = dict
-        # Catalog ids listed in place of those of CATALOG_MODELS, when set.
-        self.catalog_ids: list[str] | None = None
         # Each pack's state, by git_url: is_active and its skills.
         self.pack_state: dict[str, dict] = {}
         # Skills each pack holds when first listed.
@@ -252,11 +250,6 @@ class FakeApp:
                 if not (skill["is_active"] and state["is_active"])
             }
             return httpx.Response(200, json=[t for t in self.tools if t["name"] not in off])
-        if path == "/api/v1/models/":
-            assert request.headers["x-organization-id"] == "platform"
-            catalog = json.loads(self.app_env().get("CATALOG_MODELS", "[]"))
-            ids = self.catalog_ids if self.catalog_ids is not None else [m["id"] for m in catalog]
-            return httpx.Response(200, json=[{"id": model_id} for model_id in ids])
         if path == "/api/v1/skills/":
             return httpx.Response(200, json=self._packs())
         changed = self._skill_route(request, path)

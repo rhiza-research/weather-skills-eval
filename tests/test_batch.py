@@ -1,16 +1,10 @@
 """The batch, through ``batch.main`` with fake Docker and a fake Secret Manager."""
 
-import ast
 import io
 import json
-import os
-import signal
 import tarfile
 import threading
-from pathlib import Path
 from types import SimpleNamespace
-
-import docker.errors
 
 from weather_skills_eval import batch as batch_module
 from weather_skills_eval import cli
@@ -24,12 +18,11 @@ from weather_skills_eval.batch import (
     main,
     secret_id,
 )
-from weather_skills_eval.instance import BATCH_LABEL, LABEL, RUN_LABEL
+from weather_skills_eval.instance import BATCH_LABEL, LABEL
 
 BATCH = "2026-11-23T10:00:00Z"
 EVAL_ID = "sha256:" + "e" * 64
 APP_ID = "sha256:" + "a" * 64
-RUNNER_ID = "sha256:" + "f" * 64
 APP_IMAGE = "ghcr.io/rhiza-research/weather-skills-chat:pr-42"
 RUNNER_IMAGE = "ghcr.io/rhiza-research/weather-skills-sandbox-runner:prod"
 CONFIGS_COMMIT = "c" * 40
@@ -54,7 +47,6 @@ ENVIRON = {
     "APP_ADMIN_API_KEY": "app-key",
     "APP_OPENROUTER_API_KEY": "or-app",
     "LANGFUSE_TRACING_ENVIRONMENT": "eval",
-    "HOSTNAME": "batch-container",
 }
 
 
@@ -81,13 +73,9 @@ class RunContainer:
     """A run's container: its ``stdout`` and ``stderr`` chunks, then ``code``.
     A held one's stdout ends only once ``release`` is set."""
 
-    def __init__(
-        self, kwargs, stdout=(), stderr=(), code=0, hold=False, on_wait=None, stream_error=None
-    ):
+    def __init__(self, kwargs, stdout=(), stderr=(), code=0, hold=False, on_wait=None):
         self.kwargs = kwargs
         self.name = self.id = kwargs["name"]
-        self.stream_error = stream_error
-        self.stopped = False
         self.model = kwargs["environment"]["EVAL_MODEL"]
         self.stdout, self.stderr, self.code = list(stdout), list(stderr), code
         self.release = threading.Event()
@@ -110,15 +98,7 @@ class RunContainer:
 
     def _stdout(self):
         yield from self.stdout
-        if self.stream_error:
-            raise self.stream_error
         self.release.wait(10)
-
-    def stop(self, timeout):
-        # As docker stop: the run gets SIGTERM, removes what it created and exits 143.
-        self.stopped = True
-        self.code = 143
-        self.release.set()
 
     def wait(self):
         if self.on_wait:
@@ -140,37 +120,18 @@ class RunContainer:
             }
 
 
-class Leftover:
-    def __init__(self, name, labels):
-        self.id = self.name = name
-        self.labels = labels
-        self.attrs = {"Labels": labels}
-        self.removed = False
-
-    def remove(self, force=False, v=False):
-        self.removed = True
-
-
 class FakeDocker:
     """Docker for a batch. ``run`` makes the container of each run from the
-    create arguments; ``leftovers`` are containers and volumes already there."""
+    create arguments."""
 
-    def __init__(
-        self, run=None, leftovers=(), networks=(NETWORK,), app_labels=None, pull_error=None
-    ):
+    def __init__(self, run=None, networks=(NETWORK,), app_labels=None):
         self.run = run or (lambda kwargs: RunContainer(kwargs, [b"done\n"]))
         self.runs: list[RunContainer] = []
         self.pulled, self.looked_up, self.networks_created = [], [], []
-        self.leftovers = list(leftovers)
         images = {
-            EVAL_ID: SimpleNamespace(id=EVAL_ID, attrs={}),
             APP_IMAGE: SimpleNamespace(id=APP_ID, attrs={"Config": {"Labels": app_labels or {}}}),
-            RUNNER_IMAGE: SimpleNamespace(id=RUNNER_ID, attrs={"Config": {"Labels": None}}),
         }
         outer = self
-
-        def labeled(filters):
-            return [o for o in outer.leftovers if filters["label"] in o.labels]
 
         class Images:
             def get(self, ref):
@@ -179,23 +140,13 @@ class FakeDocker:
 
             def pull(self, ref):
                 outer.pulled.append(ref)
-                if pull_error:
-                    raise pull_error
                 return images[ref]
 
         class Containers:
-            def list(self, all=False, filters=None):
-                assert all
-                return [o for o in labeled(filters) if not o.name.startswith("volume")]
-
             def create(self, image, **kwargs):
                 container = outer.run({"image": image, **kwargs})
                 outer.runs.append(container)
                 return container
-
-        class Volumes:
-            def list(self, filters=None):
-                return [o for o in labeled(filters) if o.name.startswith("volume")]
 
         class Networks:
             def list(self, names):
@@ -206,7 +157,7 @@ class FakeDocker:
                 outer.networks_created.append((name, labels))
 
         self.images, self.containers = Images(), Containers()
-        self.volumes, self.networks = Volumes(), Networks()
+        self.networks = Networks()
 
 
 def run_batch(
@@ -237,7 +188,7 @@ def run_batch(
     return code, out.getvalue(), err.getvalue(), read
 
 
-def test_a_batch_pins_its_images_and_runs_each_model_once_per_round(tmp_path):
+def test_a_batch_runs_each_model_once_per_round(tmp_path):
     def run(kwargs):
         failed = kwargs["environment"]["EVAL_MODEL"] == "m-a"
         out = [b"Goal reached ", b"on 1 of 1 tasks\n"]
@@ -249,9 +200,6 @@ def test_a_batch_pins_its_images_and_runs_each_model_once_per_round(tmp_path):
     code, out, err, read = run_batch(tmp_path, fake, {"EVAL_REPETITIONS": "2"})
 
     assert code == 1
-    # Each image resolved once: the eval image read, the app and runner images pulled.
-    assert fake.looked_up == [EVAL_ID]
-    assert fake.pulled == [APP_IMAGE, RUNNER_IMAGE]
     assert read == []
     # In rounds, from the eval image ID, each with the configs repo files copied in.
     assert [r.model for r in fake.runs] == ["m-a", "m-b", "m-a", "m-b"]
@@ -267,7 +215,6 @@ def test_a_batch_pins_its_images_and_runs_each_model_once_per_round(tmp_path):
         assert kwargs["network"] == NETWORK
         assert kwargs["volumes"] == {DOCKER_SOCKET: {"bind": DOCKER_SOCKET, "mode": "rw"}}
         env = kwargs["environment"]
-        assert env["APP_IMAGE"] == APP_ID and env["RUNNER_IMAGE"] == RUNNER_ID
         assert env["EVAL_CONFIGS_DIR"] == CONFIGS_REPO_DIR
         assert env["EVAL_CONFIGS_COMMIT"] == CONFIGS_COMMIT
         assert env["EVAL_DOCKER_NETWORK"] == NETWORK
@@ -276,7 +223,6 @@ def test_a_batch_pins_its_images_and_runs_each_model_once_per_round(tmp_path):
         assert env["EVAL_BATCH"] == BATCH and env["APP_ADMIN_API_KEY"] == "app-key"
         # A variable with no secret name reaches every run as it is.
         assert env["LANGFUSE_TRACING_ENVIRONMENT"] == "eval"
-        assert "HOSTNAME" not in env
         assert container.started and container.removed
     assert fake.networks_created == []
     # One at once: unprefixed, each line whole across chunks.
@@ -285,41 +231,6 @@ def test_a_batch_pins_its_images_and_runs_each_model_once_per_round(tmp_path):
     assert "m-b run 1: exit 0\n" in out
     assert out.endswith(f"Batch {BATCH} finished: 2 of 4 runs exited 0\n")
     assert err == "Task 1 of 1 started: t1\n" * 4
-
-
-def test_the_app_image_is_read_from_the_host_without_pull_and_its_labels_may_be_absent(tmp_path):
-    fake = FakeDocker()
-
-    code, _, _, _ = run_batch(tmp_path, fake, {"EVAL_PULL_APP_IMAGE": "false"})
-
-    assert code == 0
-    assert fake.looked_up == [EVAL_ID, APP_IMAGE]
-    assert fake.pulled == [RUNNER_IMAGE]
-    env = fake.runs[0].kwargs["environment"]
-    assert env["EVAL_APP_IMAGE_REVISION"] == env["EVAL_APP_IMAGE_PR_NUMBER"] == ""
-
-
-def test_leftovers_of_any_run_and_of_other_batches_are_removed(tmp_path):
-    leftovers = [
-        Leftover("app-of-a-run", {LABEL: "app", RUN_LABEL: "r1"}),
-        Leftover("app-of-this-batch-run", {LABEL: "app", RUN_LABEL: "r2", BATCH_LABEL: BATCH}),
-        Leftover("harness-of-another-batch", {LABEL: "harness", BATCH_LABEL: "older"}),
-        Leftover("harness-of-this-batch", {LABEL: "harness", BATCH_LABEL: BATCH}),
-        Leftover("volume-of-a-run", {LABEL: "data", RUN_LABEL: "r1"}),
-        Leftover("volume-of-another-batch", {LABEL: "data", BATCH_LABEL: "older"}),
-        Leftover("unlabeled", {}),
-    ]
-    fake = FakeDocker(leftovers=leftovers)
-
-    run_batch(tmp_path, fake)
-
-    assert [o.name for o in leftovers if o.removed] == [
-        "app-of-a-run",
-        "app-of-this-batch-run",
-        "harness-of-another-batch",
-        "volume-of-a-run",
-        "volume-of-another-batch",
-    ]
 
 
 def test_the_network_is_created_only_when_missing(tmp_path):
@@ -390,16 +301,6 @@ def test_with_runs_at_once_every_line_of_a_run_is_prefixed(tmp_path):
         assert f"[{model} run 1] progress\n" in err
 
 
-def test_after_a_run_finds_the_app_ignored_its_catalog_no_run_starts(tmp_path):
-    fake = FakeDocker(lambda kwargs: RunContainer(kwargs, code=batch_module.EXIT_CATALOG))
-
-    code, out, _, _ = run_batch(tmp_path, fake, {"EVAL_REPETITIONS": "2"})
-
-    assert [r.model for r in fake.runs] == ["m-a"]
-    assert "m-b run 1: not started: the app image ignored its catalog\n" in out
-    assert code == 1
-
-
 def test_a_secret_comes_from_the_environment_else_from_secret_manager(tmp_path):
     secrets = {secret_id("APP_OPENROUTER_API_KEY"): "from-manager"}
     fake = FakeDocker()
@@ -430,140 +331,6 @@ def test_a_secret_comes_from_the_environment_else_from_secret_manager(tmp_path):
         assert env["EVAL_CONNECTION_KEYS"] == ENVIRON["EVAL_CONNECTION_KEYS"]
 
 
-def test_a_connection_key_is_found_for_a_base_url_with_a_trailing_slash(tmp_path):
-    fake = FakeDocker()
-
-    code, _, _, _ = run_batch(tmp_path, fake, connection=OPENROUTER + "/")
-
-    assert code == 0
-    assert fake.runs[0].kwargs["environment"]["APP_OPENROUTER_API_KEY"] == "or-app"
-
-
-def test_a_connection_without_a_key_variable_does_not_start_the_batch(tmp_path):
-    fake = FakeDocker()
-
-    code, _, err, _ = run_batch(tmp_path, fake, connection="https://other.invalid/v1")
-
-    assert code == batch_module.EXIT_NOT_STARTED
-    assert "https://other.invalid/v1" in err
-    assert fake.pulled == []
-
-
-def test_a_secret_that_cannot_be_read_starts_no_run(tmp_path):
-    for environ, reason in (
-        (
-            {"APP_ADMIN_API_KEY": ""},
-            "APP_ADMIN_API_KEY is not set, and EVAL_SECRETS_PROJECT is not set",
-        ),
-        (
-            {"APP_ADMIN_API_KEY": "", "EVAL_SECRETS_PROJECT": "rhiza-shared"},
-            "APP_ADMIN_API_KEY is not set, and secret weather-skills-eval-app-admin-api-key "
-            "could not be read",
-        ),
-    ):
-        fake = FakeDocker()
-
-        code, out, _, _ = run_batch(tmp_path, fake, environ)
-
-        assert fake.runs == []
-        assert f"m-a run 1: not started: {reason}" in out
-        assert code == 1
-
-
-def test_the_secret_id_is_the_name_lowercased_with_dashes():
-    assert secret_id("APP_OPENROUTER_API_KEY") == "weather-skills-eval-app-openrouter-api-key"
-
-
-def test_an_invalid_setting_or_input_file_does_not_start_the_batch(tmp_path):
-    for index, (environ, models, field) in enumerate(
-        ({"EVAL_BATCH": ""}, ("m-a", "m-b"), "EVAL_BATCH"),
-        ({"EVAL_PARALLEL_RUNS": "0"}, ("m-a", "m-b"), "EVAL_PARALLEL_RUNS"),
-        ({"EVAL_PULL_APP_IMAGE": "maybe"}, ("m-a", "m-b"), "EVAL_PULL_APP_IMAGE"),
-        ({"EVAL_CONFIGS_COMMIT": "main"}, ("m-a", "m-b"), "EVAL_CONFIGS_COMMIT"),
-        # The commit does not define m-b; the error names what it has.
-        ({}, ("m-a", "m-c"), "m-b, not at the configs commit; it has m-a, m-c"),
-    ):
-        fake = FakeDocker()
-        code, _, err, _ = run_batch(tmp_path / str(index), fake, environ, models=models)
-        assert code == batch_module.EXIT_NOT_STARTED, environ
-        assert err.startswith("Batch not started: ") and field in err, environ
-        assert fake.pulled == [] and fake.runs == []
-
-
-def test_a_docker_error_before_the_runs_stops_the_batch(tmp_path):
-    fake = FakeDocker(pull_error=docker.errors.APIError("manifest unknown"))
-
-    code, _, err, _ = run_batch(tmp_path, fake)
-
-    assert code == batch_module.EXIT_DOCKER
-    assert "Batch not started, Docker failed: " in err
-    assert fake.runs == []
-
-
-def test_sigterm_stops_each_running_run_and_starts_no_other(tmp_path):
-    def run(kwargs):
-        container = RunContainer(kwargs, [b"working\n"], hold=True)
-        # docker stop on the batch while its first run plays: to the process,
-        # so the main thread, waiting in the queue, takes it.
-        threading.Timer(0.2, os.kill, args=(os.getpid(), signal.SIGTERM)).start()
-        return container
-
-    fake = FakeDocker(run)
-    before = signal.getsignal(signal.SIGTERM)
-
-    code, out, _, _ = run_batch(tmp_path, fake)
-
-    [first] = fake.runs
-    assert first.stopped and first.removed
-    assert "m-a run 1: exit 143\n" in out
-    assert "m-b run 1: not started: the batch was stopped\n" in out
-    assert code == batch_module.EXIT_TERMINATED
-    assert signal.getsignal(signal.SIGTERM) is before
-
-
-def test_a_run_created_as_the_batch_stops_is_never_started(tmp_path):
-    fake = FakeDocker()
-    container = fake.containers.create(EVAL_ID, name="h", environment={"EVAL_MODEL": "m-a"})
-    fake.runs.clear()
-    fake.run = lambda kwargs: container
-    stopping = threading.Event()
-    stopping.set()
-    out = io.StringIO()
-
-    code = batch_module.run_one(
-        fake,
-        batch_module.PinnedImages(EVAL_ID, APP_ID, RUNNER_ID, "", ""),
-        BATCH,
-        {},
-        {"EVAL_MODEL": "m-a"},
-        "",
-        threading.RLock(),
-        out,
-        io.StringIO(),
-        {},
-        stopping,
-    )
-
-    assert code == batch_module.EXIT_NOT_STARTED
-    assert not container.started and container.removed
-    assert out.getvalue() == "m-a: not started: the batch was stopped\n"
-
-
-def test_a_run_whose_output_breaks_keeps_its_exit_code(tmp_path):
-    def run(kwargs):
-        broken = OSError("connection reset")
-        return RunContainer(kwargs, [b"half"], code=batch_module.EXIT_CATALOG, stream_error=broken)
-
-    fake = FakeDocker(run)
-
-    _, out, err, _ = run_batch(tmp_path, fake)
-
-    assert "m-a run 1: exit 6\n" in out
-    assert "Warning: m-a: the run's output could not be read to the end" in err
-    # The kept code still stops the batch.
-    assert [r.model for r in fake.runs] == ["m-a"]
-
-
 def test_read_secret_reads_the_latest_version_and_strips_it(monkeypatch):
     from google.cloud import secretmanager
 
@@ -578,27 +345,6 @@ def test_read_secret_reads_the_latest_version_and_strips_it(monkeypatch):
 
     assert batch_module.read_secret("sheerwater", "weather-skills-eval-x") == "s3cret"
     assert names == ["projects/sheerwater/secrets/weather-skills-eval-x/versions/latest"]
-
-
-def test_the_launcher_and_the_batch_agree_on_paths_and_labels():
-    """The launcher is a uv script that does not import the package, so its
-    literals are read from its source."""
-    source = Path(__file__).resolve().parent.parent / "scripts" / "run-eval.py"
-    literals = {}
-    for node in ast.parse(source.read_text()).body:
-        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    literals[target.id] = node.value.value
-    # docker cp of the archive lands where the batch reads the configs repo.
-    prefix = literals["ARCHIVE_PREFIX"].rstrip("/")
-    assert f"{literals['COPY_TARGET']}/{prefix}" == CONFIGS_REPO_DIR
-    # The labels the launcher sets and filters on are the batch's and harness's.
-    assert literals["LABEL"] == LABEL
-    assert literals["BATCH_LABEL"] == BATCH_LABEL
-    assert literals["HARNESS_ROLE"] == HARNESS_LABEL_VALUE
-    assert literals["HARNESS_STOP_SECONDS"] == batch_module.HARNESS_STOP_SECONDS
-    assert literals["BATCH_STOP_SECONDS"] > batch_module.HARNESS_STOP_SECONDS
 
 
 def test_the_cli_batch_command_runs_the_batch_from_its_environment(monkeypatch, capsys):

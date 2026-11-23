@@ -11,8 +11,7 @@ Order of a run:
 3. Pull the app image, read the sandbox emulator from it, pull the runner
    image, start the runner container and its volume, then the app
    container, and wait for /health.
-4. Check that the app's catalog ids are the ids it was given, and make its
-   skill pack and skill state match the configs repo.
+4. Make the app's skill pack and skill state match the configs repo.
    Read the resolved configuration from the app (the catalog model's base
    model, tools, skill pack commits), and ask OpenRouter which model answers
    for that base model; the experiment is named after it, followed by the
@@ -53,7 +52,6 @@ from .configs_repo import (
     AppDefinition,
     ConfigsSource,
     apply_skill_state,
-    check_catalog,
     load_app_definition,
     load_source,
     with_app_definition,
@@ -410,7 +408,6 @@ def _run(
         port=config.port,
         start_timeout=settings.app_start_timeout,
         poll_interval=settings.poll_interval,
-        batch=settings.batch,
         **(instance_options or {}),
     ) as instance:
 
@@ -420,8 +417,7 @@ def _run(
         async def read_resolved():
             app = new_app()
             try:
-                # AD-12, then AD-24, before anything reads what they set.
-                await check_catalog(app, definition)
+                # AD-24, before anything reads what it sets.
                 await apply_skill_state(app, definition)
                 return await _resolved(app, config)
             finally:

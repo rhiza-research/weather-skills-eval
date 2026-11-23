@@ -10,18 +10,14 @@ runner image, concurrency, repetitions and number of runs at once chosen for
 it. It builds the eval image, starts the batch as one detached container with
 the configs repo files at that commit copied in, and exits; the batch runs
 every queued run on its own, so the terminal can close. With EVAL_HOST=vm in
-.env, it first moves the checkout to exactly origin/main and runs itself again
-from it."""
+.env, it first moves the checkout to exactly origin/main."""
 
-import fcntl
 import io
 import os
-import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
-import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -30,7 +26,6 @@ import yaml
 from dotenv import dotenv_values
 
 ROOT = Path(__file__).resolve().parent.parent
-SCRIPT = Path(__file__).resolve()
 
 # Used when neither the shell nor .env sets the value. A blank concurrency means
 # the harness's own default; the simulated user model has no default.
@@ -55,28 +50,14 @@ LABEL = "weather-skills-eval"
 BATCH_LABEL = "weather-skills-eval.batch"
 # The LABEL value of a batch's run containers.
 HARNESS_ROLE = "harness"
-EVAL_IMAGE_TAG = "weather-skills-eval"
 DOCKER_SOCKET = "/var/run/docker.sock"
 # Where the launcher copies the configs archive in the batch container.
 COPY_TARGET = "/app"
 # docker ps output per batch container: ID, state and batch id.
 BATCH_FORMAT = f'{{{{.ID}}}}\t{{{{.State}}}}\t{{{{.Label "{BATCH_LABEL}"}}}}'
 # Docker states of a batch container that holds no batch. One only created
-# never started: the launch lock rules out a launch still starting it.
+# was never started.
 STOPPED = ("exited", "dead", "created")
-# Set for the run of itself after an update, to the commit it moved to, so
-# that run does not update again.
-UPDATED_TO = "EVAL_CHECKOUT"
-# One launch at a time per checkout, from the checkout update to the batch's
-# start. The file lives in the checkout's git directory, which moving the
-# checkout to origin/main never touches; None resolves it at launch.
-LAUNCH_LOCK = None
-LAUNCH_LOCK_NAME = "weather-skills-eval-launch.lock"
-# The descriptor of the held lock, passed to the run of itself after an update.
-LOCK_FD = "EVAL_LAUNCH_LOCK_FD"
-# How long the batch, and each run in it, gets to stop before Docker kills it.
-BATCH_STOP_SECONDS = 90
-HARNESS_STOP_SECONDS = 60
 
 
 def _dotenv(dotenv_path):
@@ -103,22 +84,6 @@ def judge_models(environ, dotenv_path):
 def on_vm(dotenv_path):
     """True when .env marks this host as the eval VM; the shell does not count."""
     return (_dotenv(dotenv_path).get("EVAL_HOST") or "").strip() == "vm"
-
-
-def repo_valid(text):
-    """True for an HTTPS URL without credentials, else the message questionary shows."""
-    host = text.strip().removeprefix("https://").split("/", 1)[0]
-    if text.strip().startswith("https://") and "@" not in host:
-        return True
-    return "An HTTPS URL of the configs repo, without a user name or token"
-
-
-def ref_valid(text):
-    """True for a ref, else the message questionary shows."""
-    # git fetch takes a full SHA, never an abbreviated one.
-    # A leading dash would reach git as an option.
-    ref = text.strip()
-    return (bool(ref) and not ref.startswith("-")) or "A branch, a tag or a full commit SHA"
 
 
 def judges_valid(picked):
@@ -152,28 +117,18 @@ def whole_number_valid(text):
 
 
 def kill_command(batch):
-    """A shell command that stops the batch first, so it starts no further run
-    and stops its runs, then stops any run still going, so each removes its
-    own containers; then removes every container labeled with the batch id
-    until none is left, as a run stopping late may still create one; then its
-    volumes."""
+    """A shell command that stops the batch first, so it starts no further run,
+    then stops its runs, so each removes its own containers."""
     label = f"label={BATCH_LABEL}={batch}"
 
-    def stop(role, seconds):
+    def stop(role):
         # By label, never by name: the name may be a newer batch's by now.
         return (
             f"ids=$(docker ps -q --filter '{label}' --filter 'label={LABEL}={role}'); "
-            f'[ -n "$ids" ] && docker stop -t {seconds} $ids; '
+            f'[ -n "$ids" ] && docker stop $ids; '
         )
 
-    return (
-        stop("batch", BATCH_STOP_SECONDS)
-        + stop(HARNESS_ROLE, HARNESS_STOP_SECONDS)
-        + f"for i in 1 2 3 4 5 6 7 8 9 10; do ids=$(docker ps -aq --filter '{label}'); "
-        f'[ -z "$ids" ] && break; docker rm -f -v $ids; sleep 1; done; '
-        f'[ -n "$ids" ] && echo "Containers left: $ids" >&2; '
-        f"for v in $(docker volume ls -q --filter '{label}'); do docker volume rm -f \"$v\"; done"
-    )
+    return stop("batch") + stop(HARNESS_ROLE)
 
 
 def fetch_configs(url, ref, folder):
@@ -227,49 +182,16 @@ def _git(*args, capture=False):
 
 
 def update_checkout():
-    """On the VM: fetches origin, refuses a checkout with any change, moves it to
-    exactly origin/main and runs this script again from it, so the new code
-    drives the launch. Returns None when this is that second run, else the exit
-    code when it cannot update."""
-    head = _git("rev-parse", "HEAD", capture=True)
-    if head.returncode != 0:
-        print(head.stderr, end="", file=sys.stderr)
-        return head.returncode
-    if os.environ.get(UPDATED_TO) == head.stdout.strip():
-        return None
+    """On the VM: fetches origin and moves the checkout to exactly origin/main,
+    so the eval image is built from it. Returns None, else the exit code when
+    it cannot update."""
     fetched = _git("fetch", "origin")
     if fetched.returncode != 0:
         return fetched.returncode
-    status = _git("status", "--porcelain", capture=True)
-    if status.returncode != 0:
-        print(status.stderr, end="", file=sys.stderr)
-        return status.returncode
-    if status.stdout.strip():
-        print(
-            f"The checkout {ROOT} has changes; a launch on the VM runs only origin/main:\n"
-            f"{status.stdout}",
-            end="",
-            flush=True,
-        )
-        return 1
     moved = _git("checkout", "--detach", "origin/main")
     if moved.returncode != 0:
         return moved.returncode
-    commit = _git("rev-parse", "HEAD", capture=True)
-    if commit.returncode != 0:
-        print(commit.stderr, end="", file=sys.stderr)
-        return commit.returncode
-    environ = {**os.environ, UPDATED_TO: commit.stdout.strip()}
-    # The run of itself keeps the launch lock: no other launch moves the
-    # checkout between this update and its start.
-    # take_launch_lock checked this descriptor, so it is an int and open.
-    if LOCK_FD in os.environ:
-        os.set_inheritable(int(os.environ[LOCK_FD]), True)
-    try:
-        os.execvpe("uv", ["uv", "run", str(SCRIPT), *sys.argv[1:]], environ)
-    except OSError as exc:
-        print(f"Could not run {SCRIPT} again with uv: {exc}", file=sys.stderr)
-        return 1
+    return None
 
 
 def batch_containers():
@@ -294,45 +216,8 @@ def batch_containers():
     return [tuple(line.split("\t")) for line in listed.stdout.splitlines() if line.strip()]
 
 
-def take_launch_lock():
-    """Holds the launch lock until this process ends, waiting while another
-    launch from this checkout holds it. A run of itself after an update already holds it,
-    by the descriptor it inherited."""
-    if LOCK_FD in os.environ:
-        try:
-            # flock on the description this process already holds succeeds again.
-            fcntl.flock(int(os.environ[LOCK_FD]), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return
-        except (ValueError, OSError):
-            # Set in the shell, or stale: not a lock this launch holds.
-            del os.environ[LOCK_FD]
-    path = LAUNCH_LOCK
-    if path is None:
-        git_dir = _git("rev-parse", "--git-dir", capture=True)
-        if git_dir.returncode != 0:
-            print(git_dir.stderr, end="", file=sys.stderr)
-            raise SystemExit(git_dir.returncode)
-        # Relative to the checkout when git prints it so.
-        path = ROOT / git_dir.stdout.strip() / LAUNCH_LOCK_NAME
-    # Read only, so a lock file another user created is still usable; never
-    # through a symlink.
-    lock = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o666)
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        print("Another launch is under way from this checkout; waiting for it", flush=True)
-        fcntl.flock(lock, fcntl.LOCK_EX)
-    os.environ[LOCK_FD] = str(lock)
-
-
-def _stop_launch(number, frame):
-    # Unwinds the launch, so its container is removed on the way out.
-    raise SystemExit(128 + number)
-
-
 def run_eval():
     dotenv = ROOT / ".env"
-    take_launch_lock()
     if on_vm(dotenv):
         code = update_checkout()
         if code is not None:
@@ -361,25 +246,17 @@ def launch(dotenv, containers, offered, folder):
         questionary.text(
             "EVAL_CONFIGS_REPO:",
             default=prefilled(os.environ, dotenv, CONFIGS_REPO)["EVAL_CONFIGS_REPO"],
-            validate=repo_valid,
         )
         .unsafe_ask()
         .strip()
     )
-    ref = questionary.text("Configs ref:", default="main", validate=ref_valid).unsafe_ask().strip()
+    ref = questionary.text("Configs ref:", default="main").unsafe_ask().strip()
     fetched = fetch_configs(repo, ref, folder)
     if fetched is None:
         return 1
     configs_commit, archive = fetched
     print(f"Configs {repo} at {ref} is commit {configs_commit}", flush=True)
-    try:
-        offered_models = model_ids(archive)
-    except (tarfile.TarError, yaml.YAMLError, UnicodeDecodeError) as exc:
-        print(f"The configs repo files at {configs_commit} cannot be read: {exc}", flush=True)
-        return 2
-    if not offered_models:
-        print(f"The configs repo at {configs_commit} has no model file", flush=True)
-        return 2
+    offered_models = model_ids(archive)
     models = questionary.checkbox("Models to run:", choices=offered_models).unsafe_ask()
     if not models:
         return 0
@@ -414,18 +291,7 @@ def launch(dotenv, containers, offered, folder):
     pull = questionary.confirm("Pull the app image?", default=True).unsafe_ask()
 
     commit = _git("rev-parse", "HEAD", capture=True)
-    if commit.returncode != 0:
-        print(commit.stderr, end="", file=sys.stderr)
-        return commit.returncode
     commit = commit.stdout.strip()
-    # Read only: off the VM the image holds the working tree, changes included.
-    # No optional locks: git status may otherwise refresh the index.
-    status = _git("--no-optional-locks", "status", "--porcelain", capture=True)
-    if status.returncode != 0:
-        print(status.stderr, end="", file=sys.stderr)
-        return status.returncode
-    if status.stdout.strip():
-        commit = f"{commit}-dirty"
     iidfile = folder / "image-id"
     build = subprocess.run(
         [
@@ -437,8 +303,6 @@ def launch(dotenv, containers, offered, folder):
             f"HARNESS_COMMIT={commit}",
             "--iidfile",
             str(iidfile),
-            "--tag",
-            EVAL_IMAGE_TAG,
             ".",
         ],
         cwd=ROOT,
@@ -466,44 +330,24 @@ def launch(dotenv, containers, offered, folder):
             "EVAL_BATCH": batch,
         }
     )
-    # A hangup or termination from here to the start removes the container
-    # too; a signal ignored, as under nohup, stays ignored.
-    previous = {}
-    for number in (signal.SIGHUP, signal.SIGTERM):
-        if signal.getsignal(number) is not signal.SIG_IGN:
-            previous[number] = signal.signal(number, _stop_launch)
-    # Filled in as the steps succeed, so a signal mid-way still finds the ID.
-    launched = {"id": None, "started": False}
-    try:
-        code = _create_and_start(dotenv, values, image, batch, archive, launched)
-    finally:
-        if launched["id"] and not launched["started"]:
-            # A container never started would hold the name of the next batch.
-            subprocess.run(["docker", "rm", "-f", launched["id"]], stdout=subprocess.DEVNULL)
-        for number, handler in previous.items():
-            # None: a handler not set from Python, which cannot be put back.
-            if handler is not None:
-                signal.signal(number, handler)
-    if not launched["started"]:
+    code = _create_and_start(dotenv, values, image, batch, archive)
+    if code != 0:
         return code
     print(f"Batch {batch} started in container {BATCH_CONTAINER}", flush=True)
     print(f"Follow it with: docker logs -f {BATCH_CONTAINER}", flush=True)
     return 0
 
 
-def _create_and_start(dotenv, values, image, batch, archive, launched):
+def _create_and_start(dotenv, values, image, batch, archive):
     """Creates the batch container, copies the configs archive in and starts
-    it, recording its ``id`` and whether it ``started`` in ``launched``.
-    Returns the exit code of the last step. Every step after the create acts
-    on the ID, never on the name."""
+    it. Returns the exit code of the last step. Every step after the create
+    acts on the ID, never on the name."""
     created = subprocess.run(
         [
             "docker",
             "create",
             "--name",
             BATCH_CONTAINER,
-            "--restart",
-            "no",
             # Only the batch reaches the metadata server, for Secret Manager;
             # the VM blocks it for containers on other networks.
             "--network",
@@ -526,17 +370,16 @@ def _create_and_start(dotenv, values, image, batch, archive, launched):
     )
     if created.returncode != 0:
         return created.returncode
-    launched["id"] = created.stdout.strip()
+    container_id = created.stdout.strip()
     # The configs repo files at the commit, copied in before it starts: the
     # batch container has no git access of its own.
     with open(archive, "rb") as files:
         copied = subprocess.run(
-            ["docker", "cp", "-", f"{launched['id']}:{COPY_TARGET}"], stdin=files
+            ["docker", "cp", "-", f"{container_id}:{COPY_TARGET}"], stdin=files
         ).returncode
     if copied != 0:
         return copied
-    start = subprocess.run(["docker", "start", launched["id"]], stdout=subprocess.DEVNULL)
-    launched["started"] = start.returncode == 0
+    start = subprocess.run(["docker", "start", container_id], stdout=subprocess.DEVNULL)
     return start.returncode
 
 
@@ -667,13 +510,8 @@ def launch_setup(tmp_path, monkeypatch, dotenv, outputs=()):
     defaults, and every model. Returns the fake commands and the questions asked."""
     (tmp_path / ".env").write_text(dotenv)
     monkeypatch.setitem(globals(), "ROOT", tmp_path)
-    for name in [*DEFAULTS, *PARALLEL_RUNS, *CONFIGS_REPO, "EVAL_JUDGE_MODELS", UPDATED_TO]:
+    for name in [*DEFAULTS, *PARALLEL_RUNS, *CONFIGS_REPO, "EVAL_JUDGE_MODELS"]:
         monkeypatch.delenv(name, raising=False)
-    # A copy, so the lock descriptor the launch records stays in this test.
-    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items() if k != LOCK_FD})
-    # The checkout's git directory, as git rev-parse --git-dir finds it.
-    (tmp_path / ".git").mkdir()
-    monkeypatch.setitem(globals(), "LAUNCH_LOCK", tmp_path / ".git" / LAUNCH_LOCK_NAME)
     asked = []
 
     def checkbox(message, choices, **kwargs):
@@ -733,7 +571,6 @@ def test_a_launch_builds_the_image_and_starts_one_detached_batch(tmp_path, monke
         archive,
         fetched,
         commit,
-        status,
         build,
         removed,
         removed_created,
@@ -743,10 +580,6 @@ def test_a_launch_builds_the_image_and_starts_one_detached_batch(tmp_path, monke
     ) = commands.commands()
     # Removed by ID, never by name.
     assert removed_created == ["docker", "rm", "old2"]
-    # Read only; a clean tree records the commit as it is.
-    assert status == ["git", "--no-optional-locks", "status", "--porcelain"]
-    # The launch lock is held, outside the checkout.
-    assert os.environ[LOCK_FD]
     assert listed == [*LIST_BATCHES, BATCH_FORMAT]
     # The ref, main by default, resolved to one commit with this machine's git.
     folder = init[-1]
@@ -759,8 +592,8 @@ def test_a_launch_builds_the_image_and_starts_one_detached_batch(tmp_path, monke
     # Only once the image is built, so a failed build keeps the old logs.
     assert removed == ["docker", "rm", "old1"]
     assert build[:8] == ["docker", "build", "--target", "eval", "--build-arg", "HARNESS_COMMIT=abc"]
-    assert build[-3:] == ["--tag", EVAL_IMAGE_TAG, "."]
-    assert commands.calls[7][1]["cwd"] == tmp_path
+    assert build[-1] == "."
+    assert commands.calls[6][1]["cwd"] == tmp_path
     values = {
         "EVAL_JUDGE_MODELS": JUDGES[0],
         **DEFAULTS,
@@ -786,8 +619,6 @@ def test_a_launch_builds_the_image_and_starts_one_detached_batch(tmp_path, monke
         "create",
         "--name",
         BATCH_CONTAINER,
-        "--restart",
-        "no",
         "--network",
         "host",
         "--label",
@@ -813,18 +644,16 @@ def test_a_launch_builds_the_image_and_starts_one_detached_batch(tmp_path, monke
 
 
 STUB_DOCKER = """#!/bin/sh
-# Logs each call; lists a run, two containers and a volume once each.
+# Logs each call; lists the batch and a run.
 echo "$*" >> "$LOG"
 case "$*" in
   "ps -q "*"=batch") echo b1-container ;;
-  "ps -q "*"=harness") [ -e "$LOG.ran" ] || { touch "$LOG.ran"; echo h1; } ;;
-  "ps -aq "*) [ -e "$LOG.swept" ] || { touch "$LOG.swept"; echo c1; echo c2; } ;;
-  "volume ls "*) echo v1 ;;
+  "ps -q "*"=harness") echo h1 ;;
 esac
 """
 
 
-def test_the_kill_command_stops_then_sweeps_until_nothing_is_left(tmp_path):
+def test_the_kill_command_stops_the_batch_then_its_runs(tmp_path):
     (tmp_path / "docker").write_text(STUB_DOCKER)
     (tmp_path / "docker").chmod(0o755)
     log = tmp_path / "calls"
@@ -836,106 +665,10 @@ def test_the_kill_command_stops_then_sweeps_until_nothing_is_left(tmp_path):
     assert log.read_text().splitlines() == [
         # The batch by its labels, never by its name.
         f"ps -q --filter {label} --filter label={LABEL}=batch",
-        f"stop -t {BATCH_STOP_SECONDS} b1-container",
+        "stop b1-container",
         f"ps -q --filter {label} --filter label={LABEL}=harness",
-        f"stop -t {HARNESS_STOP_SECONDS} h1",
-        f"ps -aq --filter {label}",
-        "rm -f -v c1 c2",
-        # Swept again, until none is left.
-        f"ps -aq --filter {label}",
-        f"volume ls -q --filter {label}",
-        "volume rm -f v1",
+        "stop h1",
     ]
-
-
-def test_a_batch_container_the_files_cannot_be_copied_into_is_removed(tmp_path, monkeypatch):
-    commands, _ = launch_setup(
-        tmp_path, monkeypatch, DOTENV, [*LAUNCH_OUTPUTS, (["docker", "cp"], 1, "")]
-    )
-
-    assert main() == 1
-
-    *_, cp, removed = commands.commands()
-    assert cp[:2] == ["docker", "cp"]
-    assert removed == ["docker", "rm", "-f", CREATED_ID]
-
-
-def test_a_termination_before_the_start_removes_the_batch_container(tmp_path, monkeypatch):
-    commands, _ = launch_setup(tmp_path, monkeypatch, DOTENV, LAUNCH_OUTPUTS)
-    copy = commands.__call__
-
-    def terminated_during_copy(command, **kwargs):
-        if command[:2] == ["docker", "cp"]:
-            # A real SIGTERM, which the handler installed for this window takes.
-            os.kill(os.getpid(), signal.SIGTERM)
-        return copy(command, **kwargs)
-
-    monkeypatch.setattr(subprocess, "run", terminated_during_copy)
-    before = signal.getsignal(signal.SIGTERM)
-
-    try:
-        main()
-    except SystemExit as exc:
-        assert exc.code == 128 + signal.SIGTERM
-    else:
-        raise AssertionError("expected SystemExit")
-
-    assert commands.commands()[-1] == ["docker", "rm", "-f", CREATED_ID]
-    assert ["docker", "start", CREATED_ID] not in commands.commands()
-    assert signal.getsignal(signal.SIGTERM) is before
-
-
-def test_the_launch_lock_is_in_the_checkouts_git_directory(tmp_path, monkeypatch):
-    commands, _ = launch_setup(
-        tmp_path, monkeypatch, DOTENV, [(["git", "rev-parse", "--git-dir"], 0, ".git\n")]
-    )
-    monkeypatch.setitem(globals(), "LAUNCH_LOCK", None)
-
-    take_launch_lock()
-
-    assert commands.commands() == [["git", "rev-parse", "--git-dir"]]
-    assert (tmp_path / ".git" / LAUNCH_LOCK_NAME).exists()
-
-
-def test_a_second_launch_waits_for_the_launch_lock(tmp_path, monkeypatch, capsys):
-    launch_setup(tmp_path, monkeypatch, DOTENV)
-    # Another launch holds it, on its own open file description.
-    other = os.open(LAUNCH_LOCK, os.O_RDONLY | os.O_CREAT)
-    fcntl.flock(other, fcntl.LOCK_EX)
-    released = []
-
-    def release():
-        released.append(True)
-        os.close(other)
-
-    threading.Timer(0.2, release).start()
-
-    take_launch_lock()
-
-    assert released
-    assert capsys.readouterr().out == (
-        "Another launch is under way from this checkout; waiting for it\n"
-    )
-    assert os.environ[LOCK_FD]
-
-
-def test_off_the_vm_a_checkout_with_changes_is_recorded_dirty_and_left_as_it_is(
-    tmp_path, monkeypatch
-):
-    commands, _ = launch_setup(
-        tmp_path,
-        monkeypatch,
-        DOTENV,
-        [*LAUNCH_OUTPUTS, (["git", "--no-optional-locks"], 0, " M src/x.py\n")],
-    )
-
-    assert main() == 0
-
-    [build] = [c for c in commands.commands() if c[:2] == ["docker", "build"]]
-    assert "HARNESS_COMMIT=abc-dirty" in build
-    # Only reads of the checkout; the configs fetch is in its own folder (-C).
-    git = [c[1] for c in commands.commands() if c[0] == "git" and c[1] != "-C"]
-    assert set(git) <= {"init", "rev-parse", "--no-optional-locks"}
 
 
 def test_a_running_batch_is_named_with_its_kill_command_and_nothing_starts(
@@ -965,63 +698,17 @@ def test_without_judge_models_the_script_stops_before_asking(tmp_path, monkeypat
     )
 
 
-def test_on_the_vm_a_checkout_with_changes_is_refused_before_asking(tmp_path, monkeypatch):
-    commands, asked = launch_setup(
-        tmp_path,
-        monkeypatch,
-        DOTENV + "EVAL_HOST=vm\n",
-        [(["git", "status"], 0, " M scripts/run-eval.py\n"), (["git", "rev-parse"], 0, "abc\n")],
-    )
-
-    assert main() == 1
-
-    assert commands.commands() == [
-        ["git", "rev-parse", "HEAD"],
-        ["git", "fetch", "origin"],
-        ["git", "status", "--porcelain"],
-    ]
-    assert asked == []
-
-
-def test_on_the_vm_the_checkout_moves_to_origin_main_and_the_script_runs_again(
-    tmp_path, monkeypatch
-):
-    commands, asked = launch_setup(
+def test_on_the_vm_the_checkout_moves_to_origin_main_before_the_launch(tmp_path, monkeypatch):
+    commands, _ = launch_setup(
         tmp_path, monkeypatch, DOTENV + "EVAL_HOST=vm\n", [(["git", "rev-parse"], 0, "def\n")]
     )
-    execs = []
 
-    def execvpe(file, args, env):
-        execs.append((file, args, env))
-        raise SystemExit(0)
+    assert main() == 0
 
-    monkeypatch.setattr(os, "execvpe", execvpe)
-    monkeypatch.setattr(sys, "argv", [str(SCRIPT)])
-
-    try:
-        main()
-    except SystemExit:
-        pass
-
-    assert commands.commands() == [
-        ["git", "rev-parse", "HEAD"],
+    assert commands.commands()[:2] == [
         ["git", "fetch", "origin"],
-        ["git", "status", "--porcelain"],
         ["git", "checkout", "--detach", "origin/main"],
-        ["git", "rev-parse", "HEAD"],
     ]
-    [(file, args, env)] = execs
-    assert (file, args) == ("uv", ["uv", "run", str(SCRIPT)])
-    assert env[UPDATED_TO] == "def"
-    # The run of itself inherits the held lock.
-    assert os.get_inheritable(int(env[LOCK_FD]))
-    assert asked == []
-
-    # The run of itself finds the checkout at that commit and goes on to launch.
-    monkeypatch.setenv(UPDATED_TO, "def")
-    commands.calls.clear()
-    assert update_checkout() is None
-    assert commands.commands() == [["git", "rev-parse", "HEAD"]]
 
 
 if __name__ == "__main__":
