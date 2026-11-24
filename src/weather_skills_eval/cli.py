@@ -117,8 +117,8 @@ def keep_runs_off_langwatch() -> None:
 def log_to_stderr():
     """While the run lasts, print the harness's log lines, INFO and above, on
     stderr, one message per line: its progress through the run and its
-    warnings. They stay off stdout, which holds the summary. The lines do not
-    also reach the root logger, so a handler another
+    warnings. They stay off stdout, which ``scripts/run-eval.py`` reads for
+    the summary. The lines do not also reach the root logger, so a handler another
     library put there does not print them twice."""
     logger = logging.getLogger(__package__)
     handler = logging.StreamHandler(sys.stderr)
@@ -193,7 +193,7 @@ COST_LINE = "Cost "
 
 
 def cost_line(config_name: str, served_model: str, agent_cost_usd: float) -> str:
-    """One line, so it can be read from the run's mixed output."""
+    """One line, so ``scripts/run-eval.py`` can read it from the run's mixed output."""
     cost = {
         "config_name": config_name,
         "served_model": served_model,

@@ -50,7 +50,7 @@ DEFAULTS = {
     "EVAL_CONCURRENCY": "",
 }
 
-# How many runs the batch keeps going at once; prefilled like DEFAULTS, but
+# How many runs the script keeps going at once; prefilled like DEFAULTS, but
 # not passed with -e, and the harness does not read it.
 PARALLEL_RUNS = {"EVAL_PARALLEL_RUNS": "1"}
 
@@ -351,7 +351,7 @@ def estimate_lines(models, repetitions, costs, judges, user_model, prices):
 def show_estimate(models, repetitions, judges, user_model):
     """Prints the batch's estimated cost from the saved costs and OpenRouter's
     prices. A cost file or price list that cannot be read makes the estimate
-    unavailable; it never stops the batch."""
+    unavailable; it never stops the run."""
     try:
         costs = read_costs(ROOT / COSTS_FILE)
     except (OSError, ValueError) as exc:
@@ -880,6 +880,20 @@ class _Answer:
         return self.value
 
 
+def cost_line(model, cost, served_model="provider/model"):
+    """A cost line as the harness prints it."""
+    data = {"config_name": model, "served_model": served_model, "agent_cost_usd": cost}
+    return COST_LINE + json.dumps(data)
+
+
+# USD per token, (input, output), of the models the tests price.
+PRICES = {
+    JUDGES[0].removeprefix("openrouter/"): (1e-6, 2e-6),
+    JUDGES[1].removeprefix("openrouter/"): (1e-6, 2e-6),
+    "test/user": (1e-6, 1e-6),
+}
+
+
 CONFIGS_COMMIT = "c" * 40
 REPO_URL = "https://github.com/rhiza-research/weather-skills-configs"
 LABELS = {REVISION_LABEL: "8dd46ed4", PR_NUMBER_LABEL: "42"}
@@ -1020,7 +1034,7 @@ def test_a_launch_asks_estimates_and_starts_the_batch_in_a_new_session(
     assert f"tail -f {tmp_path / LOG_FILE}" in out
 
 
-def test_without_judge_models_the_script_stops_before_asking(tmp_path, monkeypatch, capsys):
+def test_without_judge_models_the_script_stops_before_asking_more(tmp_path, monkeypatch, capsys):
     commands, asked = launch_setup(tmp_path, monkeypatch, "")
 
     assert main() == 2
@@ -1224,20 +1238,6 @@ def test_read_secret_reads_the_latest_version_and_strips_it(monkeypatch):
 
     assert read_secret("test-project", "weather-skills-eval-x") == "s3cret"
     assert names == ["projects/test-project/secrets/weather-skills-eval-x/versions/latest"]
-
-
-def cost_line(model, cost, served_model="provider/model"):
-    """A cost line as the harness prints it."""
-    data = {"config_name": model, "served_model": served_model, "agent_cost_usd": cost}
-    return COST_LINE + json.dumps(data)
-
-
-# USD per token, (input, output), of the models the tests price.
-PRICES = {
-    JUDGES[0].removeprefix("openrouter/"): (1e-6, 2e-6),
-    JUDGES[1].removeprefix("openrouter/"): (1e-6, 2e-6),
-    "test/user": (1e-6, 1e-6),
-}
 
 
 class FakeRun:

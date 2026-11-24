@@ -125,7 +125,7 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         max_turns=_whole(environ, "EVAL_MAX_TURNS", DEFAULT_MAX_TURNS, minimum=1),
         # Set at image build time from the harness checkout; see compose.yaml.
         harness_commit=environ.get("EVAL_HARNESS_COMMIT", "").strip(),
-        # Groups the runs one batch starts.
+        # Groups the runs one scripts/run-eval.py invocation starts.
         batch=environ.get("EVAL_BATCH", "").strip(),
         app_image_revision=environ.get("EVAL_APP_IMAGE_REVISION", "").strip(),
         app_image_pr_number=environ.get("EVAL_APP_IMAGE_PR_NUMBER", "").strip(),
