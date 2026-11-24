@@ -28,6 +28,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import types
@@ -56,8 +57,13 @@ PARALLEL_RUNS = {"EVAL_PARALLEL_RUNS": "1"}
 
 # The configs repo; no default, since it is set in .env or the shell.
 CONFIGS_REPO = {"EVAL_CONFIGS_REPO": ""}
-# Where each run reads the configs repo files, mounted read-only.
+# Where each run reads the configs repo files.
 CONFIGS_DIR = "/configs-repo"
+# Each run's container command: unpacks the tar of the configs repo files it
+# gets on stdin, so no host path is mounted and a remote Docker context works.
+UNPACK_AND_RUN = (
+    f"mkdir -p {CONFIGS_DIR} && tar -x -f - -C {CONFIGS_DIR} && exec weather-skills-eval run"
+)
 
 # The batch's output, at the repo root; not checked in.
 LOG_FILE = "run-eval.log"
@@ -213,6 +219,11 @@ def fetch_configs(url, ref, folder):
         print(commit.stderr, end="", file=sys.stderr)
         return None
     return commit.stdout.strip()
+
+
+def configs_archive(folder):
+    """The tar of the configs repo checkout in ``folder``, next to it."""
+    return Path(f"{folder}.tar")
 
 
 def model_ids(folder):
@@ -547,6 +558,7 @@ def run_detached(answers):
         return 143
     finally:
         shutil.rmtree(batch["configs_dir"], ignore_errors=True)
+        configs_archive(batch["configs_dir"]).unlink(missing_ok=True)
 
 
 def run_batch(batch, results):
@@ -580,6 +592,19 @@ def run_batch(batch, results):
         if secrets is None:
             return 1
 
+    archive = configs_archive(batch["configs_dir"])
+    # Readable only by this user, like the checkout; without the checkout's
+    # .git, which the harness does not read.
+    with (
+        open(os.open(archive, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as out,
+        tarfile.open(fileobj=out, mode="w") as tar,
+    ):
+        tar.add(
+            batch["configs_dir"],
+            arcname=".",
+            filter=lambda member: None if member.name == "./.git" else member,
+        )
+
     batch_id = new_batch()
     print(f"Batch {batch_id}", flush=True)
     command = [
@@ -588,8 +613,8 @@ def run_batch(batch, results):
         "run",
         "--rm",
         "-T",
-        "-v",
-        f"{batch['configs_dir']}:{CONFIGS_DIR}:ro",
+        "--entrypoint",
+        "sh",
         *env_args(
             {
                 **values,
@@ -611,7 +636,7 @@ def run_batch(batch, results):
         for repetition in range(1, batch["repetitions"] + 1)
         for model in batch["models"]
     ]
-    run_queue(command, queue, batch["parallel"], results)
+    run_queue(command, queue, archive, batch["parallel"], results)
     return 1 if any(returncode != 0 for _, returncode in results) else 0
 
 
@@ -644,10 +669,11 @@ def pass_on(stream, out, prefix, lock, seen=None):
     return error
 
 
-def run_queue(command, queue, parallel, results):
+def run_queue(command, queue, archive, parallel, results):
     """Runs ``command`` once per queued run, a (model, round) pair, with
-    ``-e EVAL_MODEL=<model> eval run`` added, starting the runs in queue order
-    with at most ``parallel`` going at once: the next starts when one ends.
+    ``-e EVAL_MODEL=<model> eval -c UNPACK_AND_RUN`` added and the tar file
+    ``archive`` on stdin, starting the runs in queue order with at most
+    ``parallel`` going at once: the next starts when one ends.
 
     Each run's stdout is passed on line by line. With ``parallel`` above 1, its
     stderr is read and passed on too, and every line of both is prefixed with
@@ -760,22 +786,24 @@ def run_queue(command, queue, parallel, results):
     try:
         for name, repetition in queue:
             slots.acquire()
-            started.append(
-                Started(
-                    subprocess.Popen(
-                        [*command, "-e", f"EVAL_MODEL={name}", "eval", "run"],
-                        cwd=ROOT,
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.PIPE,
-                        **({"stderr": subprocess.PIPE} if prefixed else {}),
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                    ),
-                    name,
-                    repetition,
+            # Opened per run, so runs at once never share a file offset.
+            with open(archive, "rb") as configs:
+                started.append(
+                    Started(
+                        subprocess.Popen(
+                            [*command, "-e", f"EVAL_MODEL={name}", "eval", "-c", UNPACK_AND_RUN],
+                            cwd=ROOT,
+                            stdin=configs,
+                            stdout=subprocess.PIPE,
+                            **({"stderr": subprocess.PIPE} if prefixed else {}),
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                        ),
+                        name,
+                        repetition,
+                    )
                 )
-            )
             threading.Thread(target=started[-1].finish_once).start()
         for run in started:
             run.done.wait()
@@ -1080,6 +1108,10 @@ def detached_setup(tmp_path, monkeypatch, dotenv="", **answers):
     (tmp_path / ".git").mkdir()
     configs = tmp_path / "configs"
     configs.mkdir()
+    (configs / "settings.yaml").write_text("schema_version: 1\n")
+    # The checkout's git repository, left out of each run's tar.
+    (configs / ".git").mkdir()
+    (configs / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
     monkeypatch.setitem(globals(), "ROOT", tmp_path)
     monkeypatch.setitem(globals(), "new_batch", lambda: "2026-10-22T20:00:00Z")
     # The SIGTERM handler stays out of the test process.
@@ -1119,6 +1151,10 @@ def test_the_batch_runs_each_model_once_per_round_and_saves_its_cost(tmp_path, m
     def popen(command, **kwargs):
         # The pid file holds this process's pid while the batch runs.
         assert (tmp_path / ".git" / PID_FILE).read_text() == f"{os.getpid()}\n"
+        # Each run gets the configs repo files as a tar on stdin.
+        with tarfile.open(fileobj=kwargs["stdin"]) as tar:
+            files = [member for member in tar.getmembers() if member.isfile()]
+            kwargs["stdin"] = {member.name: tar.extractfile(member).read() for member in files}
         runs.append((command, kwargs))
         failed = model_of(command) == "a"
         return FakeRun("" if failed else b_output, code=2 if failed else 0)
@@ -1145,13 +1181,17 @@ def test_the_batch_runs_each_model_once_per_round_and_saves_its_cost(tmp_path, m
         "EVAL_APP_IMAGE_REVISION": "8dd46ed4",
         "EVAL_APP_IMAGE_PR_NUMBER": "42",
     }
-    command = ["docker", "compose", "run", "--rm", "-T", "-v", f"{configs}:{CONFIGS_DIR}:ro"]
+    # No host path is mounted into a run.
+    command = ["docker", "compose", "run", "--rm", "-T", "--entrypoint", "sh"]
     command += env_args(values)
     # Two rounds of every model.
     assert [run for run, _ in runs] == [
-        [*command, "-e", f"EVAL_MODEL={model}", "eval", "run"] for model in ("a", "b", "a", "b")
+        [*command, "-e", f"EVAL_MODEL={model}", "eval", "-c", UNPACK_AND_RUN]
+        for model in ("a", "b", "a", "b")
     ]
-    assert runs[0][1]["stdin"] is subprocess.DEVNULL
+    assert [kwargs["stdin"] for _, kwargs in runs] == [
+        {"./settings.yaml": b"schema_version: 1\n"}
+    ] * 4
     assert "a run 2: exit 2\n" in capsys.readouterr().out
     # a's failed runs printed no cost line, and b's run's line for a is not a's,
     # so a's saved cost stays; b's run's cost is saved.
@@ -1159,9 +1199,10 @@ def test_the_batch_runs_each_model_once_per_round_and_saves_its_cost(tmp_path, m
         "a": {"served_model": "provider/model", "agent_cost_usd": 1.5},
         "b": {"served_model": "provider/model", "agent_cost_usd": 0.75},
     }
-    # The pid file and the configs checkout are gone once the batch ends.
+    # The pid file, the configs checkout and its tar are gone once the batch ends.
     assert not (tmp_path / ".git" / PID_FILE).exists()
     assert not Path(configs).exists()
+    assert not configs_archive(configs).exists()
 
 
 def test_on_the_vm_each_secret_is_read_and_passed_by_name_only(tmp_path, monkeypatch):
@@ -1272,13 +1313,16 @@ class FakeRun:
 
 
 def queue_setup(tmp_path, monkeypatch, models):
-    """ROOT at ``tmp_path``; returns the queue of one round of ``models``."""
+    """ROOT at ``tmp_path``; returns the queue of one round of ``models`` and
+    an empty configs tar."""
     monkeypatch.setitem(globals(), "ROOT", tmp_path)
-    return [(model, 1) for model in models]
+    archive = tmp_path / "configs.tar"
+    tarfile.open(archive, "w").close()
+    return [(model, 1) for model in models], archive
 
 
 def test_runs_start_in_queue_order_with_at_most_the_runs_at_once(tmp_path, monkeypatch, capsys):
-    queue = queue_setup(tmp_path, monkeypatch, "abcde")
+    queue, archive = queue_setup(tmp_path, monkeypatch, "abcde")
     lock = threading.Lock()
     started, held = [], []
     # Runs started and not yet waited for, now and at most.
@@ -1308,7 +1352,7 @@ def test_runs_start_in_queue_order_with_at_most_the_runs_at_once(tmp_path, monke
     monkeypatch.setattr(subprocess, "Popen", popen)
     results = []
 
-    run_queue(["docker"], queue, 3, results)
+    run_queue(["docker"], queue, archive, 3, results)
 
     assert started == list("abcde")
     assert going["most"] == 3
@@ -1324,7 +1368,7 @@ def test_runs_start_in_queue_order_with_at_most_the_runs_at_once(tmp_path, monke
 
 
 def test_with_runs_at_once_every_line_of_a_run_is_prefixed(tmp_path, monkeypatch, capsys):
-    queue = queue_setup(tmp_path, monkeypatch, "ab")
+    queue, archive = queue_setup(tmp_path, monkeypatch, "ab")
     runs = {
         # a's last stdout line has no newline.
         "a": FakeRun("one\ntwo", err="Task 1 of 1 started: t1\n", code=2),
@@ -1333,7 +1377,7 @@ def test_with_runs_at_once_every_line_of_a_run_is_prefixed(tmp_path, monkeypatch
     monkeypatch.setattr(subprocess, "Popen", lambda command, **kwargs: runs[model_of(command)])
     results = []
 
-    run_queue(["docker"], queue, 2, results)
+    run_queue(["docker"], queue, archive, 2, results)
 
     captured = capsys.readouterr()
     # Whole lines, in each run's order; the two runs' lines may interleave.
@@ -1351,7 +1395,7 @@ def test_with_runs_at_once_every_line_of_a_run_is_prefixed(tmp_path, monkeypatch
 
 
 def test_sigterm_passes_on_to_every_running_run_and_records_none(tmp_path, monkeypatch, capsys):
-    queue = queue_setup(tmp_path, monkeypatch, "abc")
+    queue, archive = queue_setup(tmp_path, monkeypatch, "abc")
     runs = []
 
     def popen(command, **kwargs):
@@ -1366,7 +1410,7 @@ def test_sigterm_passes_on_to_every_running_run_and_records_none(tmp_path, monke
     results = []
 
     try:
-        run_queue(["docker"], queue, 3, results)
+        run_queue(["docker"], queue, archive, 3, results)
     except KeyboardInterrupt:
         pass
     else:
@@ -1386,7 +1430,7 @@ def test_sigterm_passes_on_to_every_running_run_and_records_none(tmp_path, monke
 
 
 def test_sigterm_keeps_a_finished_run_and_waits_for_the_running_one(tmp_path, monkeypatch, capsys):
-    queue = queue_setup(tmp_path, monkeypatch, "abc")
+    queue, archive = queue_setup(tmp_path, monkeypatch, "abc")
     runs = {}
 
     def popen(command, **kwargs):
@@ -1403,7 +1447,7 @@ def test_sigterm_keeps_a_finished_run_and_waits_for_the_running_one(tmp_path, mo
     results = []
 
     try:
-        run_queue(["docker"], queue, 2, results)
+        run_queue(["docker"], queue, archive, 2, results)
     except KeyboardInterrupt:
         pass
     else:
@@ -1424,7 +1468,7 @@ def test_sigterm_keeps_a_finished_run_and_waits_for_the_running_one(tmp_path, mo
 def test_a_run_whose_output_the_script_fails_on_is_recorded_as_failed(
     tmp_path, monkeypatch, capsys
 ):
-    queue = queue_setup(tmp_path, monkeypatch, "a")
+    queue, archive = queue_setup(tmp_path, monkeypatch, "a")
 
     def failing(line):
         raise RuntimeError("cannot parse")
@@ -1434,7 +1478,7 @@ def test_a_run_whose_output_the_script_fails_on_is_recorded_as_failed(
     monkeypatch.setattr(subprocess, "Popen", lambda command, **kwargs: run)
     results = []
 
-    run_queue(["docker"], queue, 1, results)
+    run_queue(["docker"], queue, archive, 1, results)
 
     # Read to the end and waited for, and recorded as failed though it exited 0.
     assert run.waited

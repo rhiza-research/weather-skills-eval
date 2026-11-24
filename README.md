@@ -15,10 +15,14 @@ Everything runs in Docker.
 ```sh
 cp .env.example .env        # fill in the harness settings and secrets
 HARNESS_COMMIT=$(git rev-parse HEAD) docker compose build eval
-docker compose run --rm -T -v <configs repo checkout at the commit>:/configs-repo:ro \
-  -e EVAL_CONFIGS_DIR=/configs-repo -e EVAL_CONFIGS_COMMIT=<its SHA> -e EVAL_MODEL=<model id> \
-  -e APP_IMAGE=<image> -e RUNNER_IMAGE=<image> [-e EVAL_CONCURRENCY=<n>] eval run
+git -C <configs repo checkout> archive <commit SHA> | docker compose run --rm -T --entrypoint sh \
+  -e EVAL_CONFIGS_REPO=<configs repo URL> -e EVAL_CONFIGS_COMMIT=<commit SHA> \
+  -e EVAL_CONFIGS_DIR=/configs-repo -e EVAL_MODEL=<model id> \
+  -e APP_IMAGE=<image> -e RUNNER_IMAGE=<image> [-e EVAL_CONCURRENCY=<n>] \
+  eval -c 'mkdir -p /configs-repo && tar -x -f - -C /configs-repo && exec weather-skills-eval run'
 ```
+
+The configs repo files reach the run as a tar on stdin, which the container unpacks at `/configs-repo` before the harness starts, so it works with a remote Docker context, where a bind mount from this machine would not reach the daemon.
 
 `.env.example` sets `EVAL_PULL_APP_IMAGE=false`, so run `docker pull <APP_IMAGE>` first when running by hand. A batch (below) does all of this for you.
 
@@ -26,25 +30,23 @@ docker compose run --rm -T -v <configs repo checkout at the commit>:/configs-rep
 
 ### A batch
 
-`uv run scripts/run-eval.py` runs a batch of runs for the models you pick from one configs repo commit, on the Docker host it runs on, the same way on a member's machine and on the eval VM. It asks its questions in the terminal, then starts a copy of itself in the background and exits, so the terminal can close. It never changes the weather-skills-eval checkout.
+`uv run scripts/run-eval.py` runs a batch of runs for the models you pick from one configs repo commit, on the Docker host it runs on, the same way on a member's machine and on the eval VM. It asks its questions in the terminal, then starts a copy of itself in the background and exits, so the terminal can close. In the weather-skills-eval checkout it writes only `run-eval.log` and `.costs.json` at the repo root and `run-eval.pid` in the git directory.
 
 1. It reads the pid in `<git dir>/run-eval.pid` (the git dir from `git rev-parse --git-dir`). When that process is alive, it prints `A batch is running: pid <pid>` and `Kill it with: kill <pid>` and exits 1. A pid file whose process is not alive is ignored.
 2. It asks for `EVAL_CONFIGS_REPO`, an HTTPS URL prefilled from the shell, else from `.env`, and a ref, default `main`: a branch, a tag or a full commit SHA. It fetches that ref with `git fetch --depth 1` into a new repository in a temporary folder, with this machine's git access (the VM's configured credentials on the VM), checks it out there, and prints `Configs <repo> at <ref> is commit <SHA>`. A failed git command prints its error and exits 1. It offers the ids of the commit's model files as a checklist; none picked exits 0. Then it offers the judge models `EVAL_JUDGE_MODELS` names in the shell, else in `.env` (comma-separated; spaces trimmed, empty names and repeats dropped), as a checklist with each ticked. At least one must be picked. When `EVAL_JUDGE_MODELS` names none, the script prints `EVAL_JUDGE_MODELS names no judge model; set it in the shell or .env` and exits 2 before asking anything.
 3. It asks for `EVAL_SIMULATED_USER_MODEL`, `APP_IMAGE`, `RUNNER_IMAGE` and `EVAL_CONCURRENCY`, each prefilled from the shell, else from `.env`, else from its default: blank for the simulated user model, `ghcr.io/rhiza-research/weather-skills-chat:prod`, `ghcr.io/rhiza-research/weather-skills-sandbox-runner:prod`, and blank for the concurrency. A blank simulated user model is not accepted.
 4. It asks for the number of repetitions, a whole number of at least 1, default 1, and "Runs at once:", how many runs the batch keeps going at once, a whole number of at least 1, prefilled from `EVAL_PARALLEL_RUNS` in the shell, else in `.env`, else 1.
-5. It prints the batch's estimated cost (below), then asks "Pull the app image?", default yes.
+5. It prints the batch's estimated cost (see [Cost estimate](#cost-estimate)), then asks "Pull the app image?", default yes.
 6. It starts a copy of itself in a new session (`setsid`), with stdin from `/dev/null` and stdout and stderr in `run-eval.log` at the repo root, which it empties first. It prints the copy's pid, the log's path and `Follow it with: tail -f <log path>`, and exits 0. Closing the terminal or the SSH session does not stop the copy.
 
-The copy writes its pid to `<git dir>/run-eval.pid`, and removes it and the configs repo folder when it ends. It:
+The copy writes its pid to `<git dir>/run-eval.pid`, and removes it, the configs repo folder and its tar when it ends. It:
 
 1. Builds the eval image with `docker compose build eval`, `HARNESS_COMMIT` set to `git rev-parse HEAD`; pulls `APP_IMAGE` with `docker pull` when the answer was yes; and reads the app image's labels `org.opencontainers.image.revision` and `weather-skills-chat.pr-number` (absent on an image not built for a PR) with `docker image inspect`. A failed command ends the batch.
 2. Only when `.env` sets `EVAL_HOST=vm` (the shell does not count): reads `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `OPENROUTER_API_KEY`, `APP_WEBUI_SECRET_KEY`, `APP_ADMIN_PASSWORD`, `APP_ADMIN_API_KEY` and each variable `EVAL_CONNECTION_KEYS` names in `.env` from Secret Manager in the project `EVAL_SECRETS_PROJECT` names in `.env`: the latest version of the secret `weather-skills-eval-<name>` (the variable name lowercased, underscores as dashes: `APP_OPENROUTER_API_KEY` is `weather-skills-eval-app-openrouter-api-key`), with the application default credentials, the VM's service account on the VM. It puts each in its own environment and passes it to each run by name only (`-e NAME`), so no secret value is on a command line. A secret that cannot be read ends the batch, naming it, before any run starts. Elsewhere `.env`, which compose reads for the eval service, holds the secrets.
-3. Prints `Batch <batch id>`, the batch id being the UTC time (`2026-10-22T20:07:57Z`), and queues the picked models in rounds, each model once per round, as many rounds as the repetitions, and starts them in that order, keeping the runs at once going: when one ends, the next starts. Each run is `docker compose run --rm -T` of the eval service, with the configs repo folder mounted read-only at `/configs-repo`, and with `-e` the picked judges as `EVAL_JUDGE_MODELS`, the prefilled values, `EVAL_BATCH`, `EVAL_CONFIGS_REPO`, `EVAL_CONFIGS_COMMIT` (the SHA), `EVAL_CONFIGS_DIR=/configs-repo`, `EVAL_PULL_APP_IMAGE=false`, `EVAL_APP_IMAGE_REVISION` and `EVAL_APP_IMAGE_PR_NUMBER` (empty when the label is absent), and `EVAL_MODEL`, the run's model id.
+3. Prints `Batch <batch id>`, the batch id being the UTC time (`2026-10-22T20:07:57Z`), and queues the picked models in rounds, each model once per round, as many rounds as the repetitions, and starts them in that order, keeping the runs at once going: when one ends, the next starts. Each run is `docker compose run --rm -T --entrypoint sh` of the eval service with the command `-c 'mkdir -p /configs-repo && tar -x -f - -C /configs-repo && exec weather-skills-eval run'`, given on stdin a tar of the configs repo folder, written once next to the folder, so no host path is mounted and a remote Docker context works, and with `-e` the picked judges as `EVAL_JUDGE_MODELS`, the prefilled values, `EVAL_BATCH`, `EVAL_CONFIGS_REPO`, `EVAL_CONFIGS_COMMIT` (the SHA), `EVAL_CONFIGS_DIR=/configs-repo`, `EVAL_PULL_APP_IMAGE=false`, `EVAL_APP_IMAGE_REVISION` and `EVAL_APP_IMAGE_PR_NUMBER` (empty when the label is absent), and `EVAL_MODEL`, the run's model id.
 4. Prints each run's stdout and stderr in the log, line by line, prefixed with `[<model> run <round>] ` when more than one runs at once, and each run's exit code when it ends (`<model> run <round>: exit <code>`). When a run ends, the agent cost on its cost line (see [Sandbox runner](#sandbox-runner)) is saved to `.costs.json` at the repo root as that model's latest cost.
 
 `kill <pid>` sends the copy SIGTERM: it starts no further run, sends SIGTERM to each `docker compose run` still going, so each run removes its containers, waits for them, and prints `Stopped. Results so far:` with the exit code of each run that ended before.
-
-The estimate is the sum of each picked model's agent cost saved in `.costs.json`, times the repetitions, plus, for each run, each judge model's and the simulated user model's OpenRouter price, from OpenRouter's public models list, times rough per-run token counts. A model without a saved cost, or a judge or simulated user model without a price, is named and left out of the total. When `.costs.json` or the price list cannot be read, the script prints that the estimate is unavailable and goes on.
 
 `EVAL_CONCURRENCY` sets how many tasks each run plays at once, so up to `EVAL_PARALLEL_RUNS` × `EVAL_CONCURRENCY` tasks are in flight at once.
 
