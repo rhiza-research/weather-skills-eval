@@ -105,10 +105,10 @@ env:
     - git_url: https://github.com/rhiza-research/chc-skills.git
       ref: 2a6581b861bb6f54f8cdefa6a120f70f4d50f474
       enabled_by_default: false
-    - git_url: https://github.com/rhiza-research/weather-skills.git
+    - git_url: https://github.com/weather-skills/weather-skills.git
       ref: 84d6d8e4097321fb542d089a3593a82599434771
       enabled_by_default: true
-    - git_url: https://github.com/rhiza-research/weather-skills-plotting.git
+    - git_url: https://github.com/weather-skills/weather-skills-plotting.git
       ref: c422994ae2a0f14ab3484a6ceb7091ffe321edbd
       enabled_by_default: true
 
