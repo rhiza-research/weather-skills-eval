@@ -8,7 +8,7 @@ Exit codes:
   summary gives their number.
 - 1: the run failed for any other reason.
 - 2: the run did not start: a harness setting is invalid, a configs repo
-  file cannot be read or is of another schema version, a connection at the
+  file cannot be read or parsed or is of another schema version, a connection at the
   commit has no key, the dataset or a dataset item is
   invalid, the dataset is missing, empty or
   could not be read from Langfuse (any error, a Langfuse error included), or
