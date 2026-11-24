@@ -15,8 +15,8 @@ image, runner image, concurrency, repetitions, number of runs at once and
 whether to pull the app image, and prints the batch's estimated cost from the
 agent costs saved in .costs.json and OpenRouter's prices. Then it starts a copy
 of itself in a new session, which runs the batch with its output in
-run-eval.log, and exits, so the terminal can close. With EVAL_HOST=vm in .env,
-the copy reads each secret a run needs from Secret Manager."""
+run-eval.log, and exits, so the terminal can close. The copy reads each secret
+a run needs that the shell and .env leave empty from Secret Manager."""
 
 import contextlib
 import http.client
@@ -121,11 +121,6 @@ def judge_models(environ, dotenv_path):
     current = environ.get("EVAL_JUDGE_MODELS") or _dotenv(dotenv_path).get("EVAL_JUDGE_MODELS")
     named = (model.strip() for model in (current or "").split(","))
     return list(dict.fromkeys(model for model in named if model))
-
-
-def on_vm(dotenv_path):
-    """True when .env marks this host as the eval VM; the shell does not count."""
-    return (_dotenv(dotenv_path).get("EVAL_HOST") or "").strip() == "vm"
 
 
 def judges_valid(picked):
@@ -384,8 +379,9 @@ def secret_id(name):
 
 def read_secret(project, secret):
     """The latest version of ``secret`` in ``project``, read with the
-    application default credentials: the VM's service account on the VM."""
-    # Imported here: only a batch on the VM reads Secret Manager.
+    application default credentials: the machine's Google login, or the VM's
+    service account on the VM."""
+    # Imported here: only a batch with an empty secret reads Secret Manager.
     from google.cloud import secretmanager
 
     client = secretmanager.SecretManagerServiceClient()
@@ -395,20 +391,25 @@ def read_secret(project, secret):
 
 
 def load_secrets(dotenv_path):
-    """Reads each secret a run needs from Secret Manager in the project
-    EVAL_SECRETS_PROJECT names in .env into this process's environment, and
-    returns their names; None, after printing why, when one cannot be read."""
+    """Puts each secret a run needs into this process's environment: its value
+    from the shell, else from .env, when one sets it, else its latest version
+    from Secret Manager in the project EVAL_SECRETS_PROJECT names in .env.
+    Returns their names; None, after printing why, when one cannot be read."""
     dotenv = _dotenv(dotenv_path)
     project = (dotenv.get("EVAL_SECRETS_PROJECT") or "").strip()
-    if not project:
-        print("EVAL_SECRETS_PROJECT is not set in .env", flush=True)
-        return None
     keys = (
         pair.rpartition("=")[2].strip()
         for pair in (dotenv.get("EVAL_CONNECTION_KEYS") or "").split(",")
     )
     names = list(dict.fromkeys([*SECRETS, *(name for name in keys if name)]))
     for name in names:
+        value = os.environ.get(name) or dotenv.get(name)
+        if value:
+            os.environ[name] = value
+            continue
+        if not project:
+            print(f"Secret {name} is empty and EVAL_SECRETS_PROJECT is not set in .env", flush=True)
+            return None
         try:
             os.environ[name] = read_secret(project, secret_id(name))
         except Exception as exc:
@@ -583,14 +584,10 @@ def run_batch(batch, results):
     labels = image_labels(values["APP_IMAGE"])
     if labels is None:
         return 1
-    # Locally the dotenv file, which compose reads for the eval service, holds
-    # the secrets. On the VM it holds none: each is read here and passed by name,
-    # so its value is never on a command line.
-    secrets = []
-    if on_vm(ROOT / ".env"):
-        secrets = load_secrets(ROOT / ".env")
-        if secrets is None:
-            return 1
+    # Each secret is passed by name, so its value is never on a command line.
+    secrets = load_secrets(ROOT / ".env")
+    if secrets is None:
+        return 1
 
     archive = configs_archive(batch["configs_dir"])
     # Readable only by this user, like the checkout; without the checkout's
@@ -1116,6 +1113,9 @@ def detached_setup(tmp_path, monkeypatch, dotenv="", **answers):
     monkeypatch.setitem(globals(), "new_batch", lambda: "2026-10-22T20:00:00Z")
     # The SIGTERM handler stays out of the test process.
     monkeypatch.setattr(signal, "signal", lambda signum, handler: None)
+    # Each secret set in the shell, so none is read; restored after the test.
+    for name in SECRETS:
+        monkeypatch.setenv(name, f"test-{name}")
     commands = FakeCommands([(["git", "rev-parse"], 0, "abc\n")])
     monkeypatch.setattr(subprocess, "run", commands)
     batch = {
@@ -1184,6 +1184,7 @@ def test_the_batch_runs_each_model_once_per_round_and_saves_its_cost(tmp_path, m
     # No host path is mounted into a run.
     command = ["docker", "compose", "run", "--rm", "-T", "--entrypoint", "sh"]
     command += env_args(values)
+    command += [arg for name in SECRETS for arg in ("-e", name)]
     # Two rounds of every model.
     assert [run for run, _ in runs] == [
         [*command, "-e", f"EVAL_MODEL={model}", "eval", "-c", UNPACK_AND_RUN]
@@ -1205,16 +1206,21 @@ def test_the_batch_runs_each_model_once_per_round_and_saves_its_cost(tmp_path, m
     assert not configs_archive(configs).exists()
 
 
-def test_on_the_vm_each_secret_is_read_and_passed_by_name_only(tmp_path, monkeypatch):
+def test_a_set_secret_is_used_an_empty_one_is_read_and_each_is_passed_by_name_only(
+    tmp_path, monkeypatch
+):
     dotenv = (
-        "EVAL_HOST=vm\nEVAL_SECRETS_PROJECT=test-project\nLANGFUSE_SECRET_KEY=\n"
+        "EVAL_SECRETS_PROJECT=test-project\nLANGFUSE_SECRET_KEY=\n"
+        "LANGFUSE_PUBLIC_KEY=from-dotenv\n"
         "EVAL_CONNECTION_KEYS=https://openrouter.ai/api/v1=APP_OPENROUTER_API_KEY\n"
     )
     _, answers = detached_setup(tmp_path, monkeypatch, dotenv)
     names = [*SECRETS, "APP_OPENROUTER_API_KEY"]
+    # Set in .env and in the shell; every other secret is empty, so it is read.
+    given = {"LANGFUSE_PUBLIC_KEY": "from-dotenv", "OPENROUTER_API_KEY": "from-shell"}
     for name in names:
         # Restored after the test; the batch sets each.
-        monkeypatch.setenv(name, "")
+        monkeypatch.setenv(name, "from-shell" if name == "OPENROUTER_API_KEY" else "")
     read = []
 
     def reader(project, secret):
@@ -1232,13 +1238,13 @@ def test_on_the_vm_each_secret_is_read_and_passed_by_name_only(tmp_path, monkeyp
 
     assert main([DETACHED, answers]) == 0
 
-    assert read == [("test-project", secret_id(name)) for name in names]
+    assert read == [("test-project", secret_id(name)) for name in names if name not in given]
     for command in runs:
         for name in names:
-            assert os.environ[name] == f"value-of-{secret_id(name)}"
+            assert os.environ[name] == given.get(name, f"value-of-{secret_id(name)}")
             index = command.index(name)
             assert command[index - 1] == "-e"
-        assert not any("value-of-" in arg for arg in command)
+        assert not any("value-of-" in arg or "from-" in arg for arg in command)
 
 
 def test_sigterm_stops_the_batch_with_the_results_so_far(tmp_path, monkeypatch, capsys):
