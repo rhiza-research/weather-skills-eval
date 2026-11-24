@@ -10,7 +10,6 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "docker>=7.2.0",
-    "google-cloud-secret-manager>=2.32.0",
     "httpx>=0.28.1",
     "langfuse>=5.0.1",
     "langwatch-scenario>=1.6.0",

@@ -1,23 +1,37 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["python-dotenv>=1.2.4", "pyyaml>=6.0.3", "questionary>=2.1.1"]
+# dependencies = [
+#     "google-cloud-secret-manager>=2.32.0",
+#     "python-dotenv>=1.2.4",
+#     "pyyaml>=6.0.3",
+#     "questionary>=2.1.1",
+# ]
 # ///
-"""Launches one eval batch on the Docker host it runs on: it resolves the configs
-repo ref given to one commit with git, and runs the models picked from that
-commit with the judge models, simulated user model, app image,
-runner image, concurrency, repetitions and number of runs at once chosen for
-it. It builds the eval image, starts the batch as one detached container with
-the configs repo files at that commit copied in, and exits; the batch runs
-every queued run on its own, so the terminal can close. With EVAL_HOST=vm in
-.env, it first moves the checkout to exactly origin/main."""
+"""Runs one eval batch on the Docker host it runs on. In the terminal it asks
+for the configs repo and a ref, which it resolves to one commit with git, the
+models at that commit to run, the judge models, simulated user model, app
+image, runner image, concurrency, repetitions, number of runs at once and
+whether to pull the app image, and prints the batch's estimated cost from the
+agent costs saved in .costs.json and OpenRouter's prices. Then it starts a copy
+of itself in a new session, which runs the batch with its output in
+run-eval.log, and exits, so the terminal can close. With EVAL_HOST=vm in .env,
+the copy reads each secret a run needs from Secret Manager."""
 
+import contextlib
+import http.client
 import io
+import json
+import math
 import os
+import shutil
+import signal
 import subprocess
 import sys
-import tarfile
 import tempfile
+import threading
+import types
+import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -36,28 +50,50 @@ DEFAULTS = {
     "EVAL_CONCURRENCY": "",
 }
 
-# How many runs the batch keeps going at once; prefilled like DEFAULTS.
+# How many runs the batch keeps going at once; prefilled like DEFAULTS, but
+# not passed with -e, and the harness does not read it.
 PARALLEL_RUNS = {"EVAL_PARALLEL_RUNS": "1"}
 
 # The configs repo; no default, since it is set in .env or the shell.
 CONFIGS_REPO = {"EVAL_CONFIGS_REPO": ""}
-# Where the batch reads the configs repo files: <ARCHIVE_PREFIX> under /app.
-ARCHIVE_PREFIX = "configs-repo/"
+# Where each run reads the configs repo files, mounted read-only.
+CONFIGS_DIR = "/configs-repo"
 
-# The fixed name is the lock: Docker refuses a second container with it.
-BATCH_CONTAINER = "weather-skills-eval-batch"
-LABEL = "weather-skills-eval"
-BATCH_LABEL = "weather-skills-eval.batch"
-# The LABEL value of a batch's run containers.
-HARNESS_ROLE = "harness"
-DOCKER_SOCKET = "/var/run/docker.sock"
-# Where the launcher copies the configs archive in the batch container.
-COPY_TARGET = "/app"
-# docker ps output per batch container: ID, state and batch id.
-BATCH_FORMAT = f'{{{{.ID}}}}\t{{{{.State}}}}\t{{{{.Label "{BATCH_LABEL}"}}}}'
-# Docker states of a batch container that holds no batch. One only created
-# was never started.
-STOPPED = ("exited", "dead", "created")
+# The batch's output, at the repo root; not checked in.
+LOG_FILE = "run-eval.log"
+# In the git directory: the running batch's pid.
+PID_FILE = "run-eval.pid"
+# The first argument of the copy that runs the batch; the answers follow as JSON.
+DETACHED = "--detached"
+
+# The app image labels each run records.
+REVISION_LABEL = "org.opencontainers.image.revision"
+PR_NUMBER_LABEL = "weather-skills-chat.pr-number"
+
+# The secrets every run needs: the harness's own and those it sets the app's
+# from. The variables EVAL_CONNECTION_KEYS names are needed too.
+SECRETS = (
+    "LANGFUSE_PUBLIC_KEY",
+    "LANGFUSE_SECRET_KEY",
+    "OPENROUTER_API_KEY",
+    "APP_WEBUI_SECRET_KEY",
+    "APP_ADMIN_PASSWORD",
+    "APP_ADMIN_API_KEY",
+)
+# Secret Manager secret id of an environment variable: this prefix, then the
+# name lowercased with underscores as dashes. Shared with the VM's Terraform.
+SECRET_PREFIX = "weather-skills-eval-"
+
+# Each model's agent cost from its latest run, by model id; not checked in.
+COSTS_FILE = ".costs.json"
+# The line a run's summary reports its agent cost on.
+COST_LINE = "Cost "
+# Public, no key needed; prices are USD per token.
+OPENROUTER_MODELS = "https://openrouter.ai/api/v1/models"
+# Rough tokens per run of a model, (input, output), measured over the
+# 2026-10-22 runs: per judge model, and for the simulated user.
+JUDGE_TOKENS = (102_000, 14_000)
+SIMULATED_USER_TOKENS = (48_000, 15_000)
 
 
 def _dotenv(dotenv_path):
@@ -105,7 +141,7 @@ def env_args(values):
 
 
 def new_batch():
-    """The current UTC time, taken once at launch and recorded by each run as ``batch``."""
+    """The current UTC time, taken once before the runs and recorded by each as ``batch``."""
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -116,39 +152,55 @@ def whole_number_valid(text):
     return (text.isdecimal() and int(text) >= 1) or "A whole number, at least 1"
 
 
-def kill_command(batch):
-    """A shell command that stops the batch first, so it starts no further run,
-    then stops its runs, so each removes its own containers."""
-    label = f"label={BATCH_LABEL}={batch}"
+def pid_file():
+    """PID_FILE in the checkout's git directory."""
+    git_dir = subprocess.run(
+        ["git", "rev-parse", "--git-dir"], cwd=ROOT, capture_output=True, text=True, check=True
+    )
+    return ROOT / git_dir.stdout.strip() / PID_FILE
 
-    def stop(role):
-        # By label, never by name: the name may be a newer batch's by now.
-        return (
-            f"ids=$(docker ps -q --filter '{label}' --filter 'label={LABEL}={role}'); "
-            f'[ -n "$ids" ] && docker stop $ids; '
-        )
 
-    return stop("batch") + stop(HARNESS_ROLE)
+def running_batch(path):
+    """The pid in ``path`` when that process is alive; None when there is no
+    such file, or its pid is not alive."""
+    try:
+        pid = int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    if pid < 1:
+        return None
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, OverflowError):
+        return None
+    except PermissionError:
+        # Alive, as another user.
+        pass
+    return pid
+
+
+@contextlib.contextmanager
+def holding(path):
+    """``path`` holds this process's pid while the block runs, and is removed
+    after unless another batch's pid has replaced it."""
+    pid = f"{os.getpid()}\n"
+    path.write_text(pid)
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            if path.read_text() == pid:
+                path.unlink()
 
 
 def fetch_configs(url, ref, folder):
     """Fetches ``ref`` of the configs repo ``url`` with the git access of this
-    machine into a new repository in ``folder``, and writes its files to
-    ``folder/configs.tar`` under ARCHIVE_PREFIX. Returns the commit SHA and the
-    archive's path, or None after printing why it failed."""
-    archive = Path(folder) / "configs.tar"
+    machine into a new repository in ``folder`` and checks it out there.
+    Returns the commit SHA, or None after printing why it failed."""
     for args in (
         ["init", "-q", str(folder)],
         ["-C", str(folder), "fetch", "-q", "--depth", "1", url, ref],
-        [
-            "-C",
-            str(folder),
-            "archive",
-            f"--prefix={ARCHIVE_PREFIX}",
-            "-o",
-            str(archive),
-            "FETCH_HEAD",
-        ],
+        ["-C", str(folder), "checkout", "-q", "--detach", "FETCH_HEAD"],
     ):
         done = subprocess.run(["git", *args], capture_output=True, text=True)
         if done.returncode != 0:
@@ -160,88 +212,251 @@ def fetch_configs(url, ref, folder):
     if commit.returncode != 0:
         print(commit.stderr, end="", file=sys.stderr)
         return None
-    return commit.stdout.strip(), archive
+    return commit.stdout.strip()
 
 
-def model_ids(archive):
-    """The id of each model file in the configs archive, sorted."""
+def model_ids(folder):
+    """The id of each model file in the configs repo checkout in ``folder``, sorted."""
     ids = []
-    with tarfile.open(archive) as tar:
-        for member in tar.getmembers():
-            folder, _, name = member.name.removeprefix(ARCHIVE_PREFIX).rpartition("/")
-            if member.isfile() and folder == "models" and name.endswith(".yaml"):
-                data = yaml.safe_load(tar.extractfile(member).read())
-                model = data.get("model") if isinstance(data, dict) else None
-                if isinstance(model, dict) and isinstance(model.get("id"), str):
-                    ids.append(model["id"])
+    for path in (Path(folder) / "models").glob("*.yaml"):
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        model = data.get("model") if isinstance(data, dict) else None
+        if isinstance(model, dict) and isinstance(model.get("id"), str):
+            ids.append(model["id"])
     return sorted(ids)
 
 
-def _git(*args, capture=False):
-    return subprocess.run(["git", *args], cwd=ROOT, capture_output=capture, text=True)
+def parse_cost_line(line):
+    """The model id, served model and agent cost on a cost line; None for any other line."""
+    if not line.startswith(COST_LINE):
+        return None
+    try:
+        cost = json.loads(line[len(COST_LINE) :])
+    except ValueError:
+        return None
+    if not isinstance(cost, dict) or not isinstance(cost.get("config_name"), str):
+        return None
+    if _usd(cost.get("agent_cost_usd")) is None:
+        return None
+    return cost
 
 
-def update_checkout():
-    """On the VM: fetches origin and moves the checkout to exactly origin/main,
-    so the eval image is built from it. Returns None, else the exit code when
-    it cannot update."""
-    fetched = _git("fetch", "origin")
-    if fetched.returncode != 0:
-        return fetched.returncode
-    moved = _git("checkout", "--detach", "origin/main")
-    if moved.returncode != 0:
-        return moved.returncode
-    return None
+def read_costs(path):
+    """The saved costs by model id; none when the file does not exist.
+    Raises OSError or ValueError when it cannot be read."""
+    if not path.exists():
+        return {}
+    costs = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(costs, dict):
+        raise ValueError("it is not a JSON object")
+    return costs
 
 
-def batch_containers():
-    """(name, state, batch id) of each batch container, running or not; None
-    when Docker cannot list them."""
-    listed = subprocess.run(
-        [
-            "docker",
-            "ps",
-            "--all",
-            "--filter",
-            f"label={LABEL}=batch",
-            "--format",
-            BATCH_FORMAT,
-        ],
+def save_cost(path, cost):
+    """Saves ``cost``, a parsed cost line, as its model's latest cost. A file
+    that cannot be read is left as it is; a failed write is reported, never raised."""
+    try:
+        costs = read_costs(path)
+    except (OSError, ValueError) as exc:
+        print(f"Cost not saved: {path.name} could not be read: {exc}", flush=True)
+        return
+    costs[cost["config_name"]] = {
+        "served_model": cost.get("served_model"),
+        "agent_cost_usd": cost["agent_cost_usd"],
+    }
+    try:
+        path.write_text(json.dumps(costs, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"Cost not saved: {path.name} could not be written: {exc}", flush=True)
+
+
+def _usd(value):
+    """``value`` as a float when it is a finite number; None otherwise, booleans included."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) else None
+
+
+def agent_cost(costs, model):
+    """The saved agent cost of ``model``; None when there is none."""
+    saved = costs.get(model)
+    return _usd(saved.get("agent_cost_usd")) if isinstance(saved, dict) else None
+
+
+def _price(value):
+    """A per-token price sent as a string, as a float; None when it is absent,
+    unparsable, not finite or negative (OpenRouter sends "-1" for a variable price)."""
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        return None
+    try:
+        price = float(value)
+    except ValueError:
+        return None
+    return price if math.isfinite(price) and price >= 0 else None
+
+
+def openrouter_prices():
+    """USD per input and per output token of each model OpenRouter lists, by
+    model id. An entry without a usable price is left out; only a list that is
+    not one raises ValueError."""
+    with urllib.request.urlopen(OPENROUTER_MODELS, timeout=30) as response:
+        listed = json.load(response)
+    models = listed.get("data") if isinstance(listed, dict) else None
+    if not isinstance(models, list):
+        raise ValueError("unexpected models list: no data list")
+    prices = {}
+    for model in models:
+        if not isinstance(model, dict) or not isinstance(model.get("id"), str):
+            continue
+        pricing = model.get("pricing")
+        if not isinstance(pricing, dict):
+            continue
+        price = (_price(pricing.get("prompt")), _price(pricing.get("completion")))
+        if None not in price:
+            prices[model["id"]] = price
+    return prices
+
+
+def grading_cost(model, tokens, prices):
+    """One run's cost of a judge or simulated-user model; None when OpenRouter
+    lists no price for it."""
+    price = prices.get(model.removeprefix("openrouter/"))
+    if price is None:
+        return None
+    return price[0] * tokens[0] + price[1] * tokens[1]
+
+
+def estimate_lines(models, repetitions, costs, judges, user_model, prices):
+    """The batch's estimated cost of running ``models``, as lines to print. A
+    model without a saved cost, or a judge or simulated user model without a
+    price, is named and left out of the total."""
+    agents = sum(agent_cost(costs, model) or 0.0 for model in models) * repetitions
+    graders = [(model, JUDGE_TOKENS) for model in judges]
+    graders.append((user_model, SIMULATED_USER_TOKENS))
+    per_run = [(model, grading_cost(model, tokens, prices)) for model, tokens in graders]
+    grading = sum(cost for _, cost in per_run if cost is not None) * len(models) * repetitions
+    lines = [
+        f"Estimated cost: ${agents + grading:.2f} "
+        f"(agents ${agents:.2f}, judges and simulated user ${grading:.2f})"
+    ]
+    unknown = [model for model in models if agent_cost(costs, model) is None]
+    if unknown:
+        lines.append(f"Agent cost unknown, not counted: {', '.join(unknown)}")
+    unpriced = list(dict.fromkeys(model for model, cost in per_run if cost is None))
+    if unpriced:
+        lines.append(f"No OpenRouter price, not counted: {', '.join(unpriced)}")
+    return lines
+
+
+def show_estimate(models, repetitions, judges, user_model):
+    """Prints the batch's estimated cost from the saved costs and OpenRouter's
+    prices. A cost file or price list that cannot be read makes the estimate
+    unavailable; it never stops the batch."""
+    try:
+        costs = read_costs(ROOT / COSTS_FILE)
+    except (OSError, ValueError) as exc:
+        print(f"Cost estimate unavailable: {COSTS_FILE} could not be read: {exc}", flush=True)
+        return
+    try:
+        prices = openrouter_prices()
+    except (OSError, ValueError, http.client.HTTPException) as exc:
+        print(f"Cost estimate unavailable: OpenRouter prices could not be read: {exc}", flush=True)
+        return
+    for line in estimate_lines(models, repetitions, costs, judges, user_model, prices):
+        print(line, flush=True)
+
+
+def secret_id(name):
+    """``APP_OPENROUTER_API_KEY`` -> ``weather-skills-eval-app-openrouter-api-key``."""
+    return SECRET_PREFIX + name.lower().replace("_", "-")
+
+
+def read_secret(project, secret):
+    """The latest version of ``secret`` in ``project``, read with the
+    application default credentials: the VM's service account on the VM."""
+    # Imported here: only a batch on the VM reads Secret Manager.
+    from google.cloud import secretmanager
+
+    client = secretmanager.SecretManagerServiceClient()
+    name = f"projects/{project}/secrets/{secret}/versions/latest"
+    # Stripped: a secret added with echo ends in a newline no key holds.
+    return client.access_secret_version(name=name).payload.data.decode("utf-8").strip()
+
+
+def load_secrets(dotenv_path):
+    """Reads each secret a run needs from Secret Manager in the project
+    EVAL_SECRETS_PROJECT names in .env into this process's environment, and
+    returns their names; None, after printing why, when one cannot be read."""
+    dotenv = _dotenv(dotenv_path)
+    project = (dotenv.get("EVAL_SECRETS_PROJECT") or "").strip()
+    if not project:
+        print("EVAL_SECRETS_PROJECT is not set in .env", flush=True)
+        return None
+    keys = (
+        pair.rpartition("=")[2].strip()
+        for pair in (dotenv.get("EVAL_CONNECTION_KEYS") or "").split(",")
+    )
+    names = list(dict.fromkeys([*SECRETS, *(name for name in keys if name)]))
+    for name in names:
+        try:
+            os.environ[name] = read_secret(project, secret_id(name))
+        except Exception as exc:
+            print(
+                f"Secret {secret_id(name)} could not be read from project {project}: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return None
+    return names
+
+
+def image_labels(image):
+    """The labels of ``image`` on the Docker host; None, after printing why,
+    when Docker cannot read them."""
+    inspected = subprocess.run(
+        ["docker", "image", "inspect", "--format", "{{json .Config.Labels}}", image],
         capture_output=True,
         text=True,
     )
-    if listed.returncode != 0:
-        print(listed.stderr, end="", file=sys.stderr)
+    if inspected.returncode != 0:
+        print(inspected.stderr, end="", flush=True)
         return None
-    return [tuple(line.split("\t")) for line in listed.stdout.splitlines() if line.strip()]
+    return json.loads(inspected.stdout) or {}
 
 
 def run_eval():
     dotenv = ROOT / ".env"
-    if on_vm(dotenv):
-        code = update_checkout()
-        if code is not None:
-            return code
-    containers = batch_containers()
-    if containers is None:
-        return 1
-    # Paused, restarting or only created counts as running: it still holds the name.
-    running = [batch for _, state, batch in containers if state not in STOPPED]
-    if running:
-        print(f"A batch is running: {running[0]}", flush=True)
-        print(f"Kill it with: {kill_command(running[0])}", flush=True)
+    running = running_batch(pid_file())
+    if running is not None:
+        print(f"A batch is running: pid {running}", flush=True)
+        print(f"Kill it with: kill {running}", flush=True)
         return 1
     offered = judge_models(os.environ, dotenv)
     if not offered:
         print("EVAL_JUDGE_MODELS names no judge model; set it in the shell or .env", flush=True)
         return 2
-    with tempfile.TemporaryDirectory() as folder:
-        return launch(dotenv, containers, offered, Path(folder))
+    # The configs repo checkout; the copy that runs the batch removes it.
+    folder = Path(tempfile.mkdtemp(prefix="run-eval-configs-"))
+    started = False
+    try:
+        batch = ask(dotenv, offered, folder)
+        if isinstance(batch, int):
+            return batch
+        pid = detach(batch)
+        started = True
+    finally:
+        if not started:
+            shutil.rmtree(folder, ignore_errors=True)
+    log = ROOT / LOG_FILE
+    print(f"Batch started in the background: pid {pid}", flush=True)
+    print(f"Log: {log}", flush=True)
+    print(f"Follow it with: tail -f {log}", flush=True)
+    return 0
 
 
-def launch(dotenv, containers, offered, folder):
-    """Asks for the batch, builds the eval image and starts the batch, with
-    the configs repo files fetched into ``folder``."""
+def ask(dotenv, offered, folder):
+    """Asks for the batch, with the configs repo checked out in ``folder``,
+    and prints its estimated cost. Returns the answers, or an exit code."""
     repo = (
         questionary.text(
             "EVAL_CONFIGS_REPO:",
@@ -251,13 +466,11 @@ def launch(dotenv, containers, offered, folder):
         .strip()
     )
     ref = questionary.text("Configs ref:", default="main").unsafe_ask().strip()
-    fetched = fetch_configs(repo, ref, folder)
-    if fetched is None:
+    configs_commit = fetch_configs(repo, ref, folder)
+    if configs_commit is None:
         return 1
-    configs_commit, archive = fetched
     print(f"Configs {repo} at {ref} is commit {configs_commit}", flush=True)
-    offered_models = model_ids(archive)
-    models = questionary.checkbox("Models to run:", choices=offered_models).unsafe_ask()
+    models = questionary.checkbox("Models to run:", choices=model_ids(folder)).unsafe_ask()
     if not models:
         return 0
     judges = questionary.checkbox(
@@ -274,12 +487,12 @@ def launch(dotenv, containers, offered, folder):
             for name, value in prefilled(os.environ, dotenv).items()
         },
     }
-    repetitions = (
+    repetitions = int(
         questionary.text("Repetitions:", default="1", validate=whole_number_valid)
         .unsafe_ask()
         .strip()
     )
-    parallel = (
+    parallel = int(
         questionary.text(
             "Runs at once:",
             default=prefilled(os.environ, dotenv, PARALLEL_RUNS)["EVAL_PARALLEL_RUNS"],
@@ -288,102 +501,304 @@ def launch(dotenv, containers, offered, folder):
         .unsafe_ask()
         .strip()
     )
+    show_estimate(models, repetitions, judges, values["EVAL_SIMULATED_USER_MODEL"])
     pull = questionary.confirm("Pull the app image?", default=True).unsafe_ask()
+    return {
+        "values": values,
+        "models": models,
+        "repetitions": repetitions,
+        "parallel": parallel,
+        "pull": pull,
+        "configs_repo": repo,
+        "configs_commit": configs_commit,
+        "configs_dir": str(folder),
+    }
 
-    commit = _git("rev-parse", "HEAD", capture=True)
-    commit = commit.stdout.strip()
-    iidfile = folder / "image-id"
+
+def detach(batch):
+    """Starts a copy of this script in a new session, so closing the terminal
+    does not stop it, that runs ``batch``, with stdin from /dev/null and
+    stdout and stderr in LOG_FILE. Returns its pid."""
+    with open(ROOT / LOG_FILE, "w") as log:
+        process = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), DETACHED, json.dumps(batch)],
+            cwd=ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    return process.pid
+
+
+def run_detached(answers):
+    """The copy: runs the batch ``answers`` describes while the pid file holds
+    its pid. SIGTERM stops it as Ctrl-C stopped the batch in a terminal."""
+    batch = json.loads(answers)
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    results = []
+    try:
+        with holding(pid_file()):
+            return run_batch(batch, results)
+    except KeyboardInterrupt:
+        print("\nStopped. Results so far:", flush=True)
+        for name, returncode in results:
+            print(f"{name}: exit {returncode}", flush=True)
+        return 143
+    finally:
+        shutil.rmtree(batch["configs_dir"], ignore_errors=True)
+
+
+def run_batch(batch, results):
+    """Builds the eval image, pulls the app image when asked to, reads its
+    labels, and runs each model once per round, as many rounds as the
+    repetitions, with ``docker compose run``."""
+    values = batch["values"]
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
+    ).stdout.strip()
     build = subprocess.run(
-        [
-            "docker",
-            "build",
-            "--target",
-            "eval",
-            "--build-arg",
-            f"HARNESS_COMMIT={commit}",
-            "--iidfile",
-            str(iidfile),
-            ".",
-        ],
+        ["docker", "compose", "build", "eval"],
         cwd=ROOT,
+        env={**os.environ, "HARNESS_COMMIT": commit},
     )
     if build.returncode != 0:
         return build.returncode
-    image = iidfile.read_text().strip()
+    if batch["pull"]:
+        pulled = subprocess.run(["docker", "pull", values["APP_IMAGE"]])
+        if pulled.returncode != 0:
+            return pulled.returncode
+    labels = image_labels(values["APP_IMAGE"])
+    if labels is None:
+        return 1
+    # Locally the dotenv file, which compose reads for the eval service, holds
+    # the secrets. On the VM it holds none: each is read here and passed by name,
+    # so its value is never on a command line.
+    secrets = []
+    if on_vm(ROOT / ".env"):
+        secrets = load_secrets(ROOT / ".env")
+        if secrets is None:
+            return 1
 
-    # A batch container that has stopped keeps its logs until a launch
-    # replaces it. By ID: the name may already be another container's.
-    for container_id, _, _ in containers:
-        removed = subprocess.run(["docker", "rm", container_id])
-        if removed.returncode != 0:
-            return removed.returncode
-    batch = new_batch()
-    values.update(
-        {
-            "EVAL_REPETITIONS": str(int(repetitions)),
-            "EVAL_PARALLEL_RUNS": str(int(parallel)),
-            "EVAL_PULL_APP_IMAGE": "true" if pull else "false",
-            "EVAL_MODELS": ",".join(models),
-            "EVAL_CONFIGS_REPO": repo,
-            "EVAL_CONFIGS_COMMIT": configs_commit,
-            "EVAL_IMAGE": image,
-            "EVAL_BATCH": batch,
-        }
-    )
-    code = _create_and_start(dotenv, values, image, batch, archive)
-    if code != 0:
-        return code
-    print(f"Batch {batch} started in container {BATCH_CONTAINER}", flush=True)
-    print(f"Follow it with: docker logs -f {BATCH_CONTAINER}", flush=True)
-    return 0
-
-
-def _create_and_start(dotenv, values, image, batch, archive):
-    """Creates the batch container, copies the configs archive in and starts
-    it. Returns the exit code of the last step. Every step after the create
-    acts on the ID, never on the name."""
-    created = subprocess.run(
-        [
-            "docker",
-            "create",
-            "--name",
-            BATCH_CONTAINER,
-            # Only the batch reaches the metadata server, for Secret Manager;
-            # the VM blocks it for containers on other networks.
-            "--network",
-            "host",
-            "--label",
-            f"{LABEL}=batch",
-            "--label",
-            f"{BATCH_LABEL}={batch}",
-            "--volume",
-            f"{DOCKER_SOCKET}:{DOCKER_SOCKET}",
-            *(["--env-file", str(dotenv)] if dotenv.exists() else []),
-            *env_args(values),
-            "--entrypoint",
-            "weather-skills-eval",
-            image,
-            "batch",
-        ],
-        stdout=subprocess.PIPE,
-        text=True,
-    )
-    if created.returncode != 0:
-        return created.returncode
-    container_id = created.stdout.strip()
-    # The configs repo files at the commit, copied in before it starts: the
-    # batch container has no git access of its own.
-    with open(archive, "rb") as files:
-        copied = subprocess.run(
-            ["docker", "cp", "-", f"{container_id}:{COPY_TARGET}"], stdin=files
-        ).returncode
-    if copied != 0:
-        return copied
-    start = subprocess.run(["docker", "start", container_id], stdout=subprocess.DEVNULL)
-    return start.returncode
+    batch_id = new_batch()
+    print(f"Batch {batch_id}", flush=True)
+    command = [
+        "docker",
+        "compose",
+        "run",
+        "--rm",
+        "-T",
+        "-v",
+        f"{batch['configs_dir']}:{CONFIGS_DIR}:ro",
+        *env_args(
+            {
+                **values,
+                "EVAL_BATCH": batch_id,
+                "EVAL_CONFIGS_REPO": batch["configs_repo"],
+                "EVAL_CONFIGS_COMMIT": batch["configs_commit"],
+                "EVAL_CONFIGS_DIR": CONFIGS_DIR,
+                # Each run uses the app image whose labels were read above.
+                "EVAL_PULL_APP_IMAGE": "false",
+                "EVAL_APP_IMAGE_REVISION": labels.get(REVISION_LABEL, ""),
+                "EVAL_APP_IMAGE_PR_NUMBER": labels.get(PR_NUMBER_LABEL, ""),
+            }
+        ),
+        *(arg for name in secrets for arg in ("-e", name)),
+    ]
+    # In rounds, each picked model once per round.
+    queue = [
+        (model, repetition)
+        for repetition in range(1, batch["repetitions"] + 1)
+        for model in batch["models"]
+    ]
+    run_queue(command, queue, batch["parallel"], results)
+    return 1 if any(returncode != 0 for _, returncode in results) else 0
 
 
-def main():
+def _describe(exc):
+    return f"{type(exc).__name__}: {exc}"
+
+
+def pass_on(stream, out, prefix, lock, seen=None):
+    """Prints each line of a run's ``stream`` on ``out`` as the run prints it,
+    whole, under ``lock``, after ``prefix``; with a prefix, a last line without
+    a newline gets one, so the next line printed starts on its own. ``seen``
+    gets each line as the run printed it. A line that cannot be printed, or
+    that ``seen`` fails on, is skipped and reading goes on to the end, so the
+    run never blocks on a full pipe. Returns the first error as text, or None."""
+    error = None
+    try:
+        for line in stream:
+            try:
+                newline = "" if not prefix or line.endswith("\n") else "\n"
+                shown = prefix + line + newline
+                with lock:
+                    print(shown, end="", file=out, flush=True)
+                if seen:
+                    seen(line)
+            except Exception as exc:
+                error = error or _describe(exc)
+    except Exception as exc:
+        # The stream itself could not be read.
+        error = error or _describe(exc)
+    return error
+
+
+def run_queue(command, queue, parallel, results):
+    """Runs ``command`` once per queued run, a (model, round) pair, with
+    ``-e EVAL_MODEL=<model> eval run`` added, starting the runs in queue order
+    with at most ``parallel`` going at once: the next starts when one ends.
+
+    Each run's stdout is passed on line by line. With ``parallel`` above 1, its
+    stderr is read and passed on too, and every line of both is prefixed with
+    ``[<model> run <round>] ``; with 1, stderr is not read and reaches this
+    process's stderr as the run prints it. When a run ends, its model's cost
+    line is saved, and its exit code is added to ``results`` and printed. A run
+    whose output or exit the script fails to handle is still added, as failed,
+    after a line saying what failed.
+
+    On SIGTERM, or when a run cannot be started, no further run starts; on
+    SIGTERM each started run is sent SIGTERM; every run started is read to the
+    end and waited for, and is not added to ``results``; then the exception is
+    raised."""
+    prefixed = parallel > 1
+    # Held to print a line, and to save a cost, record and print an exit.
+    lock = threading.Lock()
+    slots = threading.Semaphore(parallel)
+    interrupted = threading.Event()
+
+    def finish(process, name, repetition):
+        """Reads the run's output to the end, waits for it and records it."""
+        label = f"{name} run {repetition}"
+        prefix = f"[{label}] " if prefixed else ""
+        # The run's cost line, saved once the run has ended.
+        run_cost = None
+        # What the script failed to do for the run, as text.
+        problems = []
+        returncode = None
+
+        def keep_cost(line):
+            nonlocal run_cost
+            cost = parse_cost_line(line)
+            # Only the started model's own cost line.
+            if cost and cost["config_name"] == name:
+                run_cost = cost
+
+        def drain(stream, out, seen=None):
+            error = pass_on(stream, out, prefix, lock, seen)
+            if error:
+                problems.append(error)
+
+        stderr_reader = None
+        if prefixed:
+            try:
+                stderr_reader = threading.Thread(target=drain, args=(process.stderr, sys.stderr))
+                stderr_reader.start()
+            except Exception as exc:
+                problems.append(_describe(exc))
+                stderr_reader = None
+        drain(process.stdout, sys.stdout, keep_cost)
+        if stderr_reader:
+            stderr_reader.join()
+        elif prefixed:
+            # Its reader did not start, so it is read here.
+            drain(process.stderr, sys.stderr)
+        try:
+            returncode = process.wait()
+        except Exception as exc:
+            problems.append(_describe(exc))
+        for stream in (process.stdout, process.stderr) if prefixed else (process.stdout,):
+            try:
+                stream.close()
+            except Exception as exc:
+                problems.append(_describe(exc))
+        with lock:
+            if interrupted.is_set():
+                return
+            if run_cost:
+                try:
+                    save_cost(ROOT / COSTS_FILE, run_cost)
+                except Exception as exc:
+                    problems.append(_describe(exc))
+            # Failed, with its own code when that is one, when anything failed.
+            code = (returncode or 1) if problems else returncode
+            results.append((label, code))
+            try:
+                for problem in problems:
+                    print(f"{label}: failed in run-eval.py: {problem}", flush=True)
+                print(f"{label}: exit {code}", flush=True)
+            except Exception:
+                # stdout cannot be written; the run is recorded all the same.
+                pass
+
+    class Started:
+        """A started run, finished once: by its own thread, or by the main
+        thread when that thread never began."""
+
+        def __init__(self, process, name, repetition):
+            self.args = (process, name, repetition)
+            self.claim = threading.Lock()
+            self.done = threading.Event()
+
+        def stop(self):
+            try:
+                self.args[0].send_signal(signal.SIGTERM)
+            except OSError:
+                # It has already ended.
+                pass
+
+        def finish_once(self):
+            if not self.claim.acquire(blocking=False):
+                return
+            try:
+                finish(*self.args)
+            finally:
+                slots.release()
+                self.done.set()
+
+    started = []
+    try:
+        for name, repetition in queue:
+            slots.acquire()
+            started.append(
+                Started(
+                    subprocess.Popen(
+                        [*command, "-e", f"EVAL_MODEL={name}", "eval", "run"],
+                        cwd=ROOT,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        **({"stderr": subprocess.PIPE} if prefixed else {}),
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    ),
+                    name,
+                    repetition,
+                )
+            )
+            threading.Thread(target=started[-1].finish_once).start()
+        for run in started:
+            run.done.wait()
+    except BaseException as exc:
+        # SIGTERM, or a run that could not be started. Each started run is
+        # finished here when its thread never began, its output read to the
+        # end so it never blocks on a full pipe.
+        with lock:
+            interrupted.set()
+        if isinstance(exc, KeyboardInterrupt):
+            # Only this process got SIGTERM: each docker compose run gets it
+            # too, so each removes its run's containers.
+            for run in started:
+                run.stop()
+        for run in started:
+            run.finish_once()
+            run.done.wait()
+        raise
+
+
+def main(argv=()):
+    if argv[:1] == [DETACHED]:
+        return run_detached(argv[1])
     try:
         return run_eval()
     except KeyboardInterrupt:
@@ -466,36 +881,35 @@ class _Answer:
 
 
 CONFIGS_COMMIT = "c" * 40
+REPO_URL = "https://github.com/rhiza-research/weather-skills-configs"
+LABELS = {REVISION_LABEL: "8dd46ed4", PR_NUMBER_LABEL: "42"}
 
 
 class FakeCommands:
     """``subprocess.run``: records each command and answers it from
     ``outputs``, (command prefix, exit code, stdout) entries matched in order.
-    ``docker build`` writes ``image`` to its --iidfile; ``git archive`` writes
-    a configs archive with models m-b and m-a; ``git rev-parse FETCH_HEAD``
-    answers CONFIGS_COMMIT; ``docker cp`` records the archive it reads."""
+    ``git rev-parse --git-dir`` answers ``.git``; ``git checkout`` of
+    FETCH_HEAD writes model files m-b and m-a; ``git rev-parse FETCH_HEAD``
+    answers CONFIGS_COMMIT; ``docker image inspect`` answers LABELS."""
 
-    def __init__(self, outputs=(), image="sha256:eval"):
+    def __init__(self, outputs=()):
         self.outputs = list(outputs)
-        self.image = image
         self.calls = []
-        self.copied = None
 
     def __call__(self, command, **kwargs):
         self.calls.append((command, kwargs))
-        if command[:2] == ["docker", "build"]:
-            Path(command[command.index("--iidfile") + 1]).write_text(f"{self.image}\n")
-        if "archive" in command:
-            with tarfile.open(command[command.index("-o") + 1], "w") as tar:
-                for model in ("m-b", "m-a"):
-                    data = f"schema_version: 1\nmodel:\n  id: {model}\n".encode()
-                    info = tarfile.TarInfo(f"{ARCHIVE_PREFIX}models/{model}.yaml")
-                    info.size = len(data)
-                    tar.addfile(info, io.BytesIO(data))
+        if command[:3] == ["git", "rev-parse", "--git-dir"]:
+            return subprocess.CompletedProcess(command, 0, stdout=".git\n", stderr="")
+        if "checkout" in command and command[-1] == "FETCH_HEAD":
+            models = Path(command[2]) / "models"
+            models.mkdir()
+            for model in ("m-b", "m-a"):
+                data = f"schema_version: 1\nmodel:\n  id: {model}\n"
+                (models / f"{model}.yaml").write_text(data)
         if command[-1] == "FETCH_HEAD" and "rev-parse" in command:
             return subprocess.CompletedProcess(command, 0, stdout=f"{CONFIGS_COMMIT}\n", stderr="")
-        if command[:2] == ["docker", "cp"]:
-            self.copied = kwargs["stdin"].read()
+        if command[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps(LABELS), stderr="")
         for prefix, code, stdout in self.outputs:
             if command[: len(prefix)] == prefix:
                 return subprocess.CompletedProcess(command, code, stdout=stdout, stderr="")
@@ -505,11 +919,18 @@ class FakeCommands:
         return [command for command, _ in self.calls]
 
 
+DOTENV = (
+    f"EVAL_JUDGE_MODELS={JUDGES[0]}\nEVAL_SIMULATED_USER_MODEL=openrouter/test/user\n"
+    f"EVAL_CONFIGS_REPO={REPO_URL}\n"
+)
+
+
 def launch_setup(tmp_path, monkeypatch, dotenv, outputs=()):
     """ROOT at ``tmp_path`` with ``dotenv`` as .env; the questions take their
     defaults, and every model. Returns the fake commands and the questions asked."""
     (tmp_path / ".env").write_text(dotenv)
     monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    monkeypatch.setitem(globals(), "openrouter_prices", lambda: PRICES)
     for name in [*DEFAULTS, *PARALLEL_RUNS, *CONFIGS_REPO, "EVAL_JUDGE_MODELS"]:
         monkeypatch.delenv(name, raising=False)
     asked = []
@@ -531,160 +952,72 @@ def launch_setup(tmp_path, monkeypatch, dotenv, outputs=()):
     monkeypatch.setattr(questionary, "checkbox", checkbox)
     monkeypatch.setattr(questionary, "text", text)
     monkeypatch.setattr(questionary, "confirm", confirm)
-    monkeypatch.setitem(globals(), "new_batch", lambda: "2026-11-23T10:00:00Z")
+
+    def mkdtemp(prefix):
+        (tmp_path / "configs").mkdir()
+        return str(tmp_path / "configs")
+
+    monkeypatch.setattr(tempfile, "mkdtemp", mkdtemp)
     commands = FakeCommands(outputs)
     monkeypatch.setattr(subprocess, "run", commands)
     return commands, asked
 
 
-REPO_URL = "https://github.com/rhiza-research/weather-skills-configs"
-DOTENV = (
-    f"EVAL_JUDGE_MODELS={JUDGES[0]}\nEVAL_SIMULATED_USER_MODEL=openrouter/test/user\n"
-    f"EVAL_CONFIGS_REPO={REPO_URL}\n"
-)
-LIST_BATCHES = ["docker", "ps", "--all", "--filter", f"label={LABEL}=batch", "--format"]
+def test_a_launch_asks_estimates_and_starts_the_batch_in_a_new_session(
+    tmp_path, monkeypatch, capsys
+):
+    commands, asked = launch_setup(tmp_path, monkeypatch, DOTENV + "EVAL_PARALLEL_RUNS=2\n")
+    (tmp_path / COSTS_FILE).write_text(json.dumps({"m-a": {"agent_cost_usd": 1.5}}))
+    started = []
 
+    def popen(command, **kwargs):
+        # The estimate is printed before the batch starts.
+        assert "Estimated cost:" in capsys.readouterr().out
+        started.append((command, kwargs))
+        return types.SimpleNamespace(pid=4321)
 
-CREATED_ID = "f00d" * 16
-LAUNCH_OUTPUTS = [
-    (["git", "rev-parse"], 0, "abc\n"),
-    (["docker", "create"], 0, f"{CREATED_ID}\n"),
-]
-
-
-def test_a_launch_builds_the_image_and_starts_one_detached_batch(tmp_path, monkeypatch, capsys):
-    # Batch containers from earlier batches: one stopped, one created and never started.
-    old = "old1\texited\t2026-11-22T09:00:00Z\nold2\tcreated\t2026-11-22T10:00:00Z\n"
-    commands, asked = launch_setup(
-        tmp_path,
-        monkeypatch,
-        DOTENV + "EVAL_PARALLEL_RUNS=2\n",
-        [(LIST_BATCHES, 0, old), *LAUNCH_OUTPUTS],
-    )
+    monkeypatch.setattr(subprocess, "Popen", popen)
 
     assert main() == 0
 
-    (
-        listed,
-        init,
-        fetch,
-        archive,
-        fetched,
-        commit,
-        build,
-        removed,
-        removed_created,
-        create,
-        cp,
-        start,
-    ) = commands.commands()
-    # Removed by ID, never by name.
-    assert removed_created == ["docker", "rm", "old2"]
-    assert listed == [*LIST_BATCHES, BATCH_FORMAT]
+    git_dir, init, fetch, checkout, fetched = commands.commands()
+    assert git_dir == ["git", "rev-parse", "--git-dir"]
     # The ref, main by default, resolved to one commit with this machine's git.
     folder = init[-1]
     assert init == ["git", "init", "-q", folder]
     assert fetch == ["git", "-C", folder, "fetch", "-q", "--depth", "1", REPO_URL, "main"]
-    assert archive[2:5] == [folder, "archive", f"--prefix={ARCHIVE_PREFIX}"]
+    assert checkout == ["git", "-C", folder, "checkout", "-q", "--detach", "FETCH_HEAD"]
     assert fetched == ["git", "-C", folder, "rev-parse", "FETCH_HEAD"]
-    # Locally the checkout is only read.
-    assert commit == ["git", "rev-parse", "HEAD"]
-    # Only once the image is built, so a failed build keeps the old logs.
-    assert removed == ["docker", "rm", "old1"]
-    assert build[:6] == ["docker", "build", "--target", "eval", "--build-arg", "HARNESS_COMMIT=abc"]
-    assert build[-1] == "."
-    assert commands.calls[6][1]["cwd"] == tmp_path
-    values = {
-        "EVAL_JUDGE_MODELS": JUDGES[0],
-        **DEFAULTS,
-        "EVAL_SIMULATED_USER_MODEL": "openrouter/test/user",
-        "EVAL_REPETITIONS": "1",
-        "EVAL_PARALLEL_RUNS": "2",
-        "EVAL_PULL_APP_IMAGE": "true",
+    assert asked[-1] == "Pull the app image?"
+    [(command, kwargs)] = started
+    assert command[:3] == [sys.executable, str(Path(__file__).resolve()), DETACHED]
+    assert json.loads(command[3]) == {
+        "values": {
+            "EVAL_JUDGE_MODELS": JUDGES[0],
+            **DEFAULTS,
+            "EVAL_SIMULATED_USER_MODEL": "openrouter/test/user",
+        },
         # Every model at the commit was picked, offered in id order.
-        "EVAL_MODELS": "m-a,m-b",
-        "EVAL_CONFIGS_REPO": REPO_URL,
-        "EVAL_CONFIGS_COMMIT": CONFIGS_COMMIT,
-        "EVAL_IMAGE": "sha256:eval",
-        "EVAL_BATCH": "2026-11-23T10:00:00Z",
+        "models": ["m-a", "m-b"],
+        "repetitions": 1,
+        "parallel": 2,
+        "pull": True,
+        "configs_repo": REPO_URL,
+        "configs_commit": CONFIGS_COMMIT,
+        "configs_dir": folder,
     }
-    # The configs files at the commit go in before the batch starts, both by
-    # the ID docker create printed.
-    assert cp == ["docker", "cp", "-", f"{CREATED_ID}:{COPY_TARGET}"]
-    with tarfile.open(fileobj=io.BytesIO(commands.copied)) as tar:
-        assert f"{ARCHIVE_PREFIX}models/m-a.yaml" in tar.getnames()
-    assert start == ["docker", "start", CREATED_ID]
-    assert create == [
-        "docker",
-        "create",
-        "--name",
-        BATCH_CONTAINER,
-        "--network",
-        "host",
-        "--label",
-        f"{LABEL}=batch",
-        "--label",
-        f"{BATCH_LABEL}=2026-11-23T10:00:00Z",
-        "--volume",
-        f"{DOCKER_SOCKET}:{DOCKER_SOCKET}",
-        "--env-file",
-        str(tmp_path / ".env"),
-        *env_args(values),
-        "--entrypoint",
-        "weather-skills-eval",
-        "sha256:eval",
-        "batch",
-    ]
-    assert "Pull the app image?" in asked
-    assert capsys.readouterr().out == (
-        f"Configs {REPO_URL} at main is commit {CONFIGS_COMMIT}\n"
-        f"Batch 2026-11-23T10:00:00Z started in container {BATCH_CONTAINER}\n"
-        f"Follow it with: docker logs -f {BATCH_CONTAINER}\n"
-    )
-
-
-STUB_DOCKER = """#!/bin/sh
-# Logs each call; lists the batch and a run.
-echo "$*" >> "$LOG"
-case "$*" in
-  "ps -q "*"=batch") echo b1-container ;;
-  "ps -q "*"=harness") echo h1 ;;
-esac
-"""
-
-
-def test_the_kill_command_stops_the_batch_then_its_runs(tmp_path):
-    (tmp_path / "docker").write_text(STUB_DOCKER)
-    (tmp_path / "docker").chmod(0o755)
-    log = tmp_path / "calls"
-    env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}", "LOG": str(log)}
-    # The real subprocess.run: the command runs in sh against the stub.
-    subprocess.run(["sh", "-c", kill_command("b1")], env=env, check=True)
-
-    label = f"label={BATCH_LABEL}=b1"
-    assert log.read_text().splitlines() == [
-        # The batch by its labels, never by its name.
-        f"ps -q --filter {label} --filter label={LABEL}=batch",
-        "stop b1-container",
-        f"ps -q --filter {label} --filter label={LABEL}=harness",
-        "stop h1",
-    ]
-
-
-def test_a_running_batch_is_named_with_its_kill_command_and_nothing_starts(
-    tmp_path, monkeypatch, capsys
-):
-    running = f"{BATCH_CONTAINER}\trunning\t2026-11-23T08:00:00Z\n"
-    commands, asked = launch_setup(tmp_path, monkeypatch, DOTENV, [(LIST_BATCHES, 0, running)])
-
-    assert main() == 1
-
-    assert len(commands.calls) == 1
-    assert asked == []
-    assert capsys.readouterr().out == (
-        "A batch is running: 2026-11-23T08:00:00Z\n"
-        f"Kill it with: {kill_command('2026-11-23T08:00:00Z')}\n"
-    )
+    # The copy is in its own session, without the terminal: closing it does
+    # not stop the batch.
+    assert kwargs["start_new_session"] is True
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["stdout"].name == str(tmp_path / LOG_FILE)
+    assert kwargs["stderr"] is subprocess.STDOUT
+    assert kwargs["cwd"] == tmp_path
+    # The checkout is the copy's to remove.
+    assert Path(folder, "models", "m-a.yaml").exists()
+    out = capsys.readouterr().out
+    assert "4321" in out
+    assert f"tail -f {tmp_path / LOG_FILE}" in out
 
 
 def test_without_judge_models_the_script_stops_before_asking(tmp_path, monkeypatch, capsys):
@@ -698,18 +1031,613 @@ def test_without_judge_models_the_script_stops_before_asking(tmp_path, monkeypat
     )
 
 
-def test_on_the_vm_the_checkout_moves_to_origin_main_before_the_launch(tmp_path, monkeypatch):
-    commands, _ = launch_setup(
-        tmp_path, monkeypatch, DOTENV + "EVAL_HOST=vm\n", [(["git", "rev-parse"], 0, "def\n")]
+def test_a_running_batch_is_named_with_its_kill_command_and_nothing_starts(
+    tmp_path, monkeypatch, capsys
+):
+    commands, asked = launch_setup(tmp_path, monkeypatch, DOTENV)
+    (tmp_path / ".git").mkdir()
+    # This test's own process: alive.
+    (tmp_path / ".git" / PID_FILE).write_text(f"{os.getpid()}\n")
+
+    assert main() == 1
+
+    assert len(commands.calls) == 1
+    assert asked == []
+    out = capsys.readouterr().out
+    assert f"kill {os.getpid()}\n" in out
+
+
+def test_a_stale_pid_file_is_ignored_and_replaced_while_the_batch_runs(tmp_path):
+    ended = subprocess.Popen([sys.executable, "-c", ""])
+    ended.wait()
+    path = tmp_path / PID_FILE
+    path.write_text(f"{ended.pid}\n")
+
+    assert running_batch(path) is None
+    with holding(path):
+        assert running_batch(path) == os.getpid()
+    assert not path.exists()
+
+
+def detached_setup(tmp_path, monkeypatch, dotenv="", **answers):
+    """ROOT at ``tmp_path`` with ``dotenv`` as .env and a configs checkout;
+    returns the fake commands and the answers, as JSON, the copy is given."""
+    (tmp_path / ".env").write_text(dotenv)
+    (tmp_path / ".git").mkdir()
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    monkeypatch.setitem(globals(), "new_batch", lambda: "2026-10-22T20:00:00Z")
+    # The SIGTERM handler stays out of the test process.
+    monkeypatch.setattr(signal, "signal", lambda signum, handler: None)
+    commands = FakeCommands([(["git", "rev-parse"], 0, "abc\n")])
+    monkeypatch.setattr(subprocess, "run", commands)
+    batch = {
+        "values": {**DEFAULTS, "EVAL_JUDGE_MODELS": JUDGES[0]},
+        "models": ["a", "b"],
+        "repetitions": 1,
+        "parallel": 1,
+        "pull": True,
+        "configs_repo": REPO_URL,
+        "configs_commit": CONFIGS_COMMIT,
+        "configs_dir": str(configs),
+        **answers,
+    }
+    return commands, json.dumps(batch)
+
+
+def model_of(command):
+    """The model a run's command names with EVAL_MODEL."""
+    [model] = [arg.removeprefix("EVAL_MODEL=") for arg in command if arg.startswith("EVAL_MODEL=")]
+    return model
+
+
+def test_the_batch_runs_each_model_once_per_round_and_saves_its_cost(tmp_path, monkeypatch, capsys):
+    commands, answers = detached_setup(tmp_path, monkeypatch, repetitions=2)
+    # A saved cost for a, from an earlier run.
+    (tmp_path / COSTS_FILE).write_text(
+        json.dumps({"a": {"served_model": "provider/model", "agent_cost_usd": 1.5}})
+    )
+    # b's run also prints a cost line of another model, which is not saved.
+    b_output = f"Goal reached on 1 of 1 tasks\n{cost_line('a', 9.0)}\n{cost_line('b', 0.75)}\n"
+    runs = []
+
+    def popen(command, **kwargs):
+        # The pid file holds this process's pid while the batch runs.
+        assert (tmp_path / ".git" / PID_FILE).read_text() == f"{os.getpid()}\n"
+        runs.append((command, kwargs))
+        failed = model_of(command) == "a"
+        return FakeRun("" if failed else b_output, code=2 if failed else 0)
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+
+    assert main([DETACHED, answers]) == 1
+
+    _, commit, build, pull, inspect = commands.commands()
+    assert commit == ["git", "rev-parse", "HEAD"]
+    assert build == ["docker", "compose", "build", "eval"]
+    assert commands.calls[2][1]["env"]["HARNESS_COMMIT"] == "abc"
+    assert pull == ["docker", "pull", DEFAULTS["APP_IMAGE"]]
+    assert inspect[-1] == DEFAULTS["APP_IMAGE"]
+    configs = str(tmp_path / "configs")
+    values = {
+        **DEFAULTS,
+        "EVAL_JUDGE_MODELS": JUDGES[0],
+        "EVAL_BATCH": "2026-10-22T20:00:00Z",
+        "EVAL_CONFIGS_REPO": REPO_URL,
+        "EVAL_CONFIGS_COMMIT": CONFIGS_COMMIT,
+        "EVAL_CONFIGS_DIR": CONFIGS_DIR,
+        "EVAL_PULL_APP_IMAGE": "false",
+        "EVAL_APP_IMAGE_REVISION": "8dd46ed4",
+        "EVAL_APP_IMAGE_PR_NUMBER": "42",
+    }
+    command = ["docker", "compose", "run", "--rm", "-T", "-v", f"{configs}:{CONFIGS_DIR}:ro"]
+    command += env_args(values)
+    # Two rounds of every model.
+    assert [run for run, _ in runs] == [
+        [*command, "-e", f"EVAL_MODEL={model}", "eval", "run"] for model in ("a", "b", "a", "b")
+    ]
+    assert runs[0][1]["stdin"] is subprocess.DEVNULL
+    assert "a run 2: exit 2\n" in capsys.readouterr().out
+    # a's failed runs printed no cost line, and b's run's line for a is not a's,
+    # so a's saved cost stays; b's run's cost is saved.
+    assert json.loads((tmp_path / COSTS_FILE).read_text()) == {
+        "a": {"served_model": "provider/model", "agent_cost_usd": 1.5},
+        "b": {"served_model": "provider/model", "agent_cost_usd": 0.75},
+    }
+    # The pid file and the configs checkout are gone once the batch ends.
+    assert not (tmp_path / ".git" / PID_FILE).exists()
+    assert not Path(configs).exists()
+
+
+def test_on_the_vm_each_secret_is_read_and_passed_by_name_only(tmp_path, monkeypatch):
+    dotenv = (
+        "EVAL_HOST=vm\nEVAL_SECRETS_PROJECT=test-project\nLANGFUSE_SECRET_KEY=\n"
+        "EVAL_CONNECTION_KEYS=https://openrouter.ai/api/v1=APP_OPENROUTER_API_KEY\n"
+    )
+    _, answers = detached_setup(tmp_path, monkeypatch, dotenv)
+    names = [*SECRETS, "APP_OPENROUTER_API_KEY"]
+    for name in names:
+        # Restored after the test; the batch sets each.
+        monkeypatch.setenv(name, "")
+    read = []
+
+    def reader(project, secret):
+        read.append((project, secret))
+        return f"value-of-{secret}"
+
+    monkeypatch.setitem(globals(), "read_secret", reader)
+    runs = []
+
+    def popen(command, **kwargs):
+        runs.append(command)
+        return FakeRun("")
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+
+    assert main([DETACHED, answers]) == 0
+
+    assert read == [("test-project", secret_id(name)) for name in names]
+    for command in runs:
+        for name in names:
+            assert os.environ[name] == f"value-of-{secret_id(name)}"
+            index = command.index(name)
+            assert command[index - 1] == "-e"
+        assert not any("value-of-" in arg for arg in command)
+
+
+def test_sigterm_stops_the_batch_with_the_results_so_far(tmp_path, monkeypatch, capsys):
+    install, previous = signal.signal, signal.getsignal(signal.SIGTERM)
+    _, answers = detached_setup(tmp_path, monkeypatch)
+    # The real handler, this once.
+    monkeypatch.setattr(signal, "signal", install)
+
+    def popen(command, **kwargs):
+        if model_of(command) == "b":
+            # kill <pid>, while b starts.
+            os.kill(os.getpid(), signal.SIGTERM)
+        return FakeRun("")
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+
+    try:
+        assert main([DETACHED, answers]) == 143
+    finally:
+        install(signal.SIGTERM, previous)
+
+    assert capsys.readouterr().out.endswith("\nStopped. Results so far:\na run 1: exit 0\n")
+    assert not (tmp_path / ".git" / PID_FILE).exists()
+    assert not (tmp_path / "configs").exists()
+
+
+def test_read_secret_reads_the_latest_version_and_strips_it(monkeypatch):
+    from google.cloud import secretmanager
+
+    names = []
+
+    class Client:
+        def access_secret_version(self, name):
+            names.append(name)
+            return types.SimpleNamespace(payload=types.SimpleNamespace(data=b" s3cret\n"))
+
+    monkeypatch.setattr(secretmanager, "SecretManagerServiceClient", Client)
+
+    assert read_secret("test-project", "weather-skills-eval-x") == "s3cret"
+    assert names == ["projects/test-project/secrets/weather-skills-eval-x/versions/latest"]
+
+
+def cost_line(model, cost, served_model="provider/model"):
+    """A cost line as the harness prints it."""
+    data = {"config_name": model, "served_model": served_model, "agent_cost_usd": cost}
+    return COST_LINE + json.dumps(data)
+
+
+# USD per token, (input, output), of the models the tests price.
+PRICES = {
+    JUDGES[0].removeprefix("openrouter/"): (1e-6, 2e-6),
+    JUDGES[1].removeprefix("openrouter/"): (1e-6, 2e-6),
+    "test/user": (1e-6, 1e-6),
+}
+
+
+class FakeRun:
+    """A run's process: prints ``out`` on stdout and ``err`` on stderr, and exits
+    with ``code``. A held run's stdout ends only once ``release`` is set, or
+    once it gets a signal; ``on_wait`` is called when the run is waited for."""
+
+    def __init__(self, out, err="", code=0, hold=False, on_wait=None):
+        self.release = threading.Event()
+        if not hold:
+            self.release.set()
+        self.stdout = self._stdout(out)
+        self.stderr = io.StringIO(err)
+        self.code = code
+        self.on_wait = on_wait
+        self.waited = False
+        self.signals = []
+
+    def _stdout(self, out):
+        yield from io.StringIO(out)
+        self.release.wait(10)
+
+    def send_signal(self, signum):
+        self.signals.append(signum)
+        self.release.set()
+
+    def wait(self):
+        self.waited = True
+        if self.on_wait:
+            self.on_wait()
+        return self.code
+
+
+def queue_setup(tmp_path, monkeypatch, models):
+    """ROOT at ``tmp_path``; returns the queue of one round of ``models``."""
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    return [(model, 1) for model in models]
+
+
+def test_runs_start_in_queue_order_with_at_most_the_runs_at_once(tmp_path, monkeypatch, capsys):
+    queue = queue_setup(tmp_path, monkeypatch, "abcde")
+    lock = threading.Lock()
+    started, held = [], []
+    # Runs started and not yet waited for, now and at most.
+    going = {"now": 0, "most": 0}
+
+    def ended():
+        with lock:
+            going["now"] -= 1
+
+    def popen(command, **kwargs):
+        assert kwargs["stdout"] is kwargs["stderr"] is subprocess.PIPE
+        name = model_of(command)
+        process = FakeRun(f"{cost_line(name, 1.0)}\n", hold=True, on_wait=ended)
+        with lock:
+            started.append(name)
+            held.append(process)
+            going["now"] += 1
+            going["most"] = max(going["most"], going["now"])
+            # With every slot taken the oldest run ends; after the last start, all do.
+            releasing = held if len(started) == len(queue) else held[:1]
+            if going["now"] == 3 or len(started) == len(queue):
+                for run in releasing:
+                    run.release.set()
+                del held[: len(releasing)]
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    results = []
+
+    run_queue(["docker"], queue, 3, results)
+
+    assert started == list("abcde")
+    assert going["most"] == 3
+    assert sorted(results) == [(f"{name} run 1", 0) for name in "abcde"]
+    out = capsys.readouterr().out
+    for name in "abcde":
+        assert f"[{name} run 1] {cost_line(name, 1.0)}\n" in out
+        assert f"\n{name} run 1: exit 0\n" in f"\n{out}"
+    # Each run's cost is saved.
+    assert read_costs(tmp_path / COSTS_FILE) == {
+        name: {"served_model": "provider/model", "agent_cost_usd": 1.0} for name in "abcde"
+    }
+
+
+def test_with_runs_at_once_every_line_of_a_run_is_prefixed(tmp_path, monkeypatch, capsys):
+    queue = queue_setup(tmp_path, monkeypatch, "ab")
+    runs = {
+        # a's last stdout line has no newline.
+        "a": FakeRun("one\ntwo", err="Task 1 of 1 started: t1\n", code=2),
+        "b": FakeRun("three\n", err="Dataset weather-tasks read: 1 items\n"),
+    }
+    monkeypatch.setattr(subprocess, "Popen", lambda command, **kwargs: runs[model_of(command)])
+    results = []
+
+    run_queue(["docker"], queue, 2, results)
+
+    captured = capsys.readouterr()
+    # Whole lines, in each run's order; the two runs' lines may interleave.
+    out = captured.out.splitlines(keepends=True)
+    a_lines = [line for line in out if "a run" in line]
+    assert a_lines == ["[a run 1] one\n", "[a run 1] two\n", "a run 1: exit 2\n"]
+    b_lines = [line for line in out if "b run" in line]
+    assert b_lines == ["[b run 1] three\n", "b run 1: exit 0\n"]
+    assert len(out) == 5
+    assert sorted(captured.err.splitlines(keepends=True)) == [
+        "[a run 1] Task 1 of 1 started: t1\n",
+        "[b run 1] Dataset weather-tasks read: 1 items\n",
+    ]
+    assert sorted(results) == [("a run 1", 2), ("b run 1", 0)]
+
+
+def test_sigterm_passes_on_to_every_running_run_and_records_none(tmp_path, monkeypatch, capsys):
+    queue = queue_setup(tmp_path, monkeypatch, "abc")
+    runs = []
+
+    def popen(command, **kwargs):
+        name = model_of(command)
+        if name == "c":
+            # SIGTERM while the third run starts.
+            raise KeyboardInterrupt
+        runs.append(FakeRun(f"{name} working\n{cost_line(name, 1.0)}\n", code=143, hold=True))
+        return runs[-1]
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    results = []
+
+    try:
+        run_queue(["docker"], queue, 3, results)
+    except KeyboardInterrupt:
+        pass
+    else:
+        raise AssertionError("expected KeyboardInterrupt")
+
+    # Both got SIGTERM, were read to the end and waited for, and neither is
+    # recorded or has its cost saved.
+    assert [run.signals for run in runs] == [[signal.SIGTERM], [signal.SIGTERM]]
+    assert [run.waited for run in runs] == [True, True]
+    out = capsys.readouterr().out
+    for name in "ab":
+        assert f"[{name} run 1] {name} working\n" in out
+        assert f"[{name} run 1] {cost_line(name, 1.0)}\n" in out
+    assert "exit" not in out
+    assert results == []
+    assert not (tmp_path / COSTS_FILE).exists()
+
+
+def test_sigterm_keeps_a_finished_run_and_waits_for_the_running_one(tmp_path, monkeypatch, capsys):
+    queue = queue_setup(tmp_path, monkeypatch, "abc")
+    runs = {}
+
+    def popen(command, **kwargs):
+        name = model_of(command)
+        if name == "c":
+            # With 2 at once, c starts only once a has ended and been recorded;
+            # SIGTERM then, while b runs.
+            raise KeyboardInterrupt
+        held = name == "b"
+        runs[name] = FakeRun(f"{cost_line(name, 1.0)}\n", code=143 if held else 0, hold=held)
+        return runs[name]
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    results = []
+
+    try:
+        run_queue(["docker"], queue, 2, results)
+    except KeyboardInterrupt:
+        pass
+    else:
+        raise AssertionError("expected KeyboardInterrupt")
+
+    assert results == [("a run 1", 0)]
+    assert read_costs(tmp_path / COSTS_FILE) == {
+        "a": {"served_model": "provider/model", "agent_cost_usd": 1.0}
+    }
+    # b got SIGTERM, was read to the end and waited for, and is not recorded.
+    assert runs["b"].signals == [signal.SIGTERM]
+    assert runs["b"].waited
+    out = capsys.readouterr().out
+    assert f"[b run 1] {cost_line('b', 1.0)}\n" in out
+    assert "b run 1: exit" not in out
+
+
+def test_a_run_whose_output_the_script_fails_on_is_recorded_as_failed(
+    tmp_path, monkeypatch, capsys
+):
+    queue = queue_setup(tmp_path, monkeypatch, "a")
+
+    def failing(line):
+        raise RuntimeError("cannot parse")
+
+    monkeypatch.setitem(globals(), "parse_cost_line", failing)
+    run = FakeRun("one\ntwo\n")
+    monkeypatch.setattr(subprocess, "Popen", lambda command, **kwargs: run)
+    results = []
+
+    run_queue(["docker"], queue, 1, results)
+
+    # Read to the end and waited for, and recorded as failed though it exited 0.
+    assert run.waited
+    assert results == [("a run 1", 1)]
+    assert capsys.readouterr().out == (
+        "one\ntwo\na run 1: failed in run-eval.py: RuntimeError: cannot parse\na run 1: exit 1\n"
     )
 
-    assert main() == 0
 
-    assert commands.commands()[:2] == [
-        ["git", "fetch", "origin"],
-        ["git", "checkout", "--detach", "origin/main"],
+def test_a_line_that_cannot_be_printed_is_skipped_and_reading_goes_on():
+    class Broken:
+        def __init__(self):
+            self.written = []
+
+        def write(self, text):
+            if "bad" in text:
+                raise OSError("closed")
+            self.written.append(text)
+
+        def flush(self):
+            pass
+
+    out = Broken()
+    stream = io.StringIO("bad\ngood\n")
+
+    assert pass_on(stream, out, "[a run 1] ", threading.Lock()) == "OSError: closed"
+    assert "".join(out.written) == "[a run 1] good\n"
+    assert stream.read() == ""
+
+
+def test_the_estimate_is_one_total_with_agents_and_grading_apart():
+    costs = {"a": {"agent_cost_usd": 2.0}, "b": {"agent_cost_usd": 0.5}}
+    lines = estimate_lines(["a", "b"], 3, costs, JUDGES[:2], "openrouter/test/user", PRICES)
+    # Agents: (2.0 + 0.5) * 3. Grading: (0.13 * 2 + 0.063) * 2 models * 3 rounds.
+    assert lines == ["Estimated cost: $9.44 (agents $7.50, judges and simulated user $1.94)"]
+
+
+def test_a_model_without_a_saved_cost_and_a_model_without_a_price_are_named():
+    costs = {"a": {"agent_cost_usd": 1.0}, "c": {"agent_cost_usd": "1.0"}}
+    lines = estimate_lines(["a", "b", "c"], 1, costs, [JUDGES[0], JUDGES[2]], "test/user", PRICES)
+    # Agents: a. Grading: (0.13 + 0.063) * 3 models; judge-c has no price in PRICES.
+    assert lines == [
+        "Estimated cost: $1.58 (agents $1.00, judges and simulated user $0.58)",
+        "Agent cost unknown, not counted: b, c",
+        f"No OpenRouter price, not counted: {JUDGES[2]}",
     ]
 
 
+def test_only_a_cost_line_is_read_as_a_cost():
+    assert parse_cost_line(cost_line("a", 1.25) + "\n") == {
+        "config_name": "a",
+        "served_model": "provider/model",
+        "agent_cost_usd": 1.25,
+    }
+    for line in (
+        "Goal reached on 1 of 1 tasks\n",
+        "Cost not json\n",
+        'Cost ["a"]\n',
+        'Cost {"agent_cost_usd": 1}\n',
+        'Cost {"config_name": "a", "agent_cost_usd": "1"}\n',
+        'Cost {"config_name": "a", "agent_cost_usd": true}\n',
+        'Cost {"config_name": "a", "agent_cost_usd": NaN}\n',
+        'Cost {"config_name": "a", "agent_cost_usd": Infinity}\n',
+        " " + cost_line("a", 1.25),
+    ):
+        assert parse_cost_line(line) is None, line
+
+
+def test_costs_are_saved_by_model_latest_first(tmp_path):
+    path = tmp_path / COSTS_FILE
+    assert read_costs(path) == {}
+    save_cost(path, parse_cost_line(cost_line("a", 1.0)))
+    save_cost(path, parse_cost_line(cost_line("b", 2.0, "m/b")))
+    save_cost(path, parse_cost_line(cost_line("a", 3.0, "m/a")))
+    assert read_costs(path) == {
+        "a": {"served_model": "m/a", "agent_cost_usd": 3.0},
+        "b": {"served_model": "m/b", "agent_cost_usd": 2.0},
+    }
+
+
+def test_an_unreadable_cost_file_is_never_overwritten(tmp_path, capsys):
+    path = tmp_path / COSTS_FILE
+    path.write_text("[1, 2]")
+    save_cost(path, parse_cost_line(cost_line("a", 1.0)))
+    assert path.read_text() == "[1, 2]"
+    assert "Cost not saved: .costs.json could not be read" in capsys.readouterr().out
+
+
+def test_a_failed_cost_file_write_is_reported_and_the_run_goes_on(tmp_path, capsys):
+    path = tmp_path / "missing" / COSTS_FILE
+    save_cost(path, parse_cost_line(cost_line("a", 1.0)))
+    assert not path.exists()
+    assert "Cost not saved: .costs.json could not be written" in capsys.readouterr().out
+
+
+def test_openrouter_prices_are_read_from_its_models_list(monkeypatch):
+    # Shaped as OpenRouter sends it: prices are strings in USD per token.
+    body = {
+        "data": [
+            {"id": "test/judge", "pricing": {"prompt": "0.000001", "completion": "0.000002"}},
+            {"id": "test/free", "pricing": {"prompt": "0", "completion": "0"}},
+            {"id": "test/no-pricing"},
+            {"id": "openrouter/auto", "pricing": {"prompt": "-1", "completion": "-1"}},
+            {"id": "test/unparsable", "pricing": {"prompt": "n/a", "completion": "0.1"}},
+            {"id": "test/partial", "pricing": {"prompt": "0.000001"}},
+            "not an entry",
+        ]
+    }
+    opened = []
+
+    def urlopen(url, timeout):
+        opened.append(url)
+        return io.BytesIO(json.dumps(body).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    # An entry without a usable price is left out; the rest are still read.
+    assert openrouter_prices() == {"test/judge": (1e-6, 2e-6), "test/free": (0.0, 0.0)}
+    assert opened == [OPENROUTER_MODELS]
+
+
+def test_a_models_list_without_data_is_unreadable(monkeypatch):
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout: io.BytesIO(b"[]"))
+    try:
+        openrouter_prices()
+    except ValueError as exc:
+        assert "no data list" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def estimate_setup(tmp_path, monkeypatch):
+    """ROOT at ``tmp_path`` and OpenRouter's prices; returns the questions asked
+    and the commands run, which must stay empty."""
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    monkeypatch.setitem(globals(), "openrouter_prices", lambda: PRICES)
+    asked, ran = [], []
+
+    def confirm(message, default):
+        asked.append((message, default))
+        return _Answer(default)
+
+    def run(command, **kwargs):
+        ran.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="")
+
+    monkeypatch.setattr(questionary, "confirm", confirm)
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(subprocess, "Popen", run)
+    return asked, ran
+
+
+def test_with_every_cost_saved_the_estimate_is_one_total(tmp_path, monkeypatch, capsys):
+    asked, ran = estimate_setup(tmp_path, monkeypatch)
+    (tmp_path / COSTS_FILE).write_text(json.dumps({"a": {"agent_cost_usd": 1.0}}))
+
+    show_estimate(["a"], 1, [JUDGES[0]], "test/user")
+
+    assert asked == [] and ran == []
+    assert capsys.readouterr().out == (
+        "Estimated cost: $1.19 (agents $1.00, judges and simulated user $0.19)\n"
+    )
+
+
+def test_a_model_without_a_saved_cost_is_named_unknown(tmp_path, monkeypatch, capsys):
+    asked, ran = estimate_setup(tmp_path, monkeypatch)
+
+    show_estimate(["a"], 1, [JUDGES[0]], "test/user")
+
+    assert asked == [] and ran == []
+    assert capsys.readouterr().out == (
+        "Estimated cost: $0.19 (agents $0.00, judges and simulated user $0.19)\n"
+        "Agent cost unknown, not counted: a\n"
+    )
+    assert not (tmp_path / COSTS_FILE).exists()
+
+
+def test_an_unreadable_cost_file_makes_the_estimate_unavailable(tmp_path, monkeypatch, capsys):
+    asked, ran = estimate_setup(tmp_path, monkeypatch)
+    (tmp_path / COSTS_FILE).write_text("not json")
+
+    show_estimate(["a"], 1, [JUDGES[0]], "test/user")
+
+    assert asked == [] and ran == []
+    assert capsys.readouterr().out.startswith(
+        "Cost estimate unavailable: .costs.json could not be read: "
+    )
+
+
+def test_failed_prices_make_the_estimate_unavailable(tmp_path, monkeypatch, capsys):
+    estimate_setup(tmp_path, monkeypatch)
+    for error in (OSError, ValueError, http.client.HTTPException):
+
+        def offline(error=error):
+            raise error("no network")
+
+        monkeypatch.setitem(globals(), "openrouter_prices", offline)
+
+        show_estimate(["a"], 1, [JUDGES[0]], "test/user")
+
+        assert capsys.readouterr().out == (
+            "Cost estimate unavailable: OpenRouter prices could not be read: no network\n"
+        ), error
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

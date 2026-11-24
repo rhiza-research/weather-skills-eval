@@ -7,8 +7,9 @@ Exit codes:
   were not scored because the sandbox runner restarted during them; the
   summary gives their number.
 - 1: the run failed for any other reason.
-- 2: the run did not start: a harness setting, the configs repo files (another schema version, a
-  connection without a key), the dataset or a dataset item is
+- 2: the run did not start: a harness setting is invalid, a configs repo
+  file cannot be read or is of another schema version, a connection at the
+  commit has no key, the dataset or a dataset item is
   invalid, the dataset is missing, empty or
   could not be read from Langfuse (any error, a Langfuse error included), or
   the dataset needs a skill pack the configs repo commit does not turn on.
@@ -26,9 +27,6 @@ Exit codes:
 - 5: Langfuse returned an error response after the dataset was read.
 - 143: the harness was stopped with SIGTERM; the app and runner containers
   and the volume were removed.
-
-``weather-skills-eval batch`` runs one batch from its environment; see
-``batch.py`` for its exit codes.
 
 ``weather-skills-eval delete [--yes] <experiment-id>`` deletes every trace of
 one run, after ``yes`` on stdin unless ``--yes`` is given. Exit codes:
@@ -53,9 +51,7 @@ import docker.errors
 import httpx
 from langfuse.api.core.api_error import ApiError as LangfuseApiError
 
-from . import batch
 from .app_client import ChatError
-from .config import ConfigError
 from .configs_repo import ConfigsRepoError, SkillStateError
 from .instance import AppStartError, RunnerStartError
 from .langfuse_gateway import ExperimentNotFound, LangfuseRuns
@@ -217,7 +213,6 @@ def main(
     commands.add_parser(
         "run", help="Play every task in the dataset against one model, as the environment says"
     )
-    commands.add_parser("batch", help="Run one batch, as its environment describes it")
     delete_parser = commands.add_parser("delete", help="Delete every trace of one run")
     delete_parser.add_argument(
         "experiment_id", help="The experiment id: the baseline= value in the experiment URL"
@@ -229,8 +224,6 @@ def main(
 
     if args.command == "delete":
         return delete(args.experiment_id, yes=args.yes, runs_factory=runs_factory)
-    if args.command == "batch":
-        return batch.main(os.environ, docker_client_factory=docker_client_factory)
 
     signal.signal(signal.SIGTERM, _terminate)
     silence_langwatch()
@@ -240,7 +233,7 @@ def main(
     try:
         with log_to_stderr():
             summary = run(environ, docker_client_factory=docker_client_factory)
-    except (SettingsError, ConfigError, ConfigsRepoError, TaskError, DatasetError) as exc:
+    except (SettingsError, ConfigsRepoError, TaskError, DatasetError) as exc:
         return _fail(EXIT_NOT_STARTED, f"Run not started: {exc}")
     except SkillStateError as exc:
         return _fail(EXIT_APP_FAILED, f"Run stopped, the app's skill state: {exc}")

@@ -9,7 +9,7 @@ WORKDIR /app
 
 COPY pyproject.toml uv.lock README.md ./
 
-# The image the eval service and the batch run: no dev dependencies.
+# The image the eval service runs: no dev dependencies.
 FROM base AS eval
 RUN uv sync --locked --no-dev --no-install-project
 COPY src ./src

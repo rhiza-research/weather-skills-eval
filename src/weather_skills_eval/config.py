@@ -2,16 +2,9 @@
 run, the dataset, and the app's environment the eval owns, its secrets
 included. The configs repo adds the rest of the app's environment (see
 ``configs_repo.py``).
-
-A name looks like a secret when one of its words is key, secret, password or
-token, singular or plural, except "tokens". Words are separated by
-underscores, hyphens, dots and case changes, so ``OPENAI_API_KEYS`` and
-``apiKey`` are secret names and ``max_tokens`` and ``TIKTOKEN_ENCODING_NAME``
-are not.
 """
 
 import json
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -41,18 +34,8 @@ APP_ENV = {
     "LANGFUSE_SECRET_KEY": "LANGFUSE_SECRET_KEY",
 }
 
-SECRET_WORDS = {"key", "keys", "secret", "secrets", "password", "passwords", "token", "apikey"}
-_WORD = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
 # The image listens on PORT, 8080 unless its environment sets it.
 DEFAULT_APP_PORT = "8080"
-
-
-class ConfigError(Exception):
-    """The app's environment is invalid. The message names the field."""
-
-    def __init__(self, field: str, message: str):
-        super().__init__(f"{field}: {message}")
-        self.field = field
 
 
 @dataclass(frozen=True)
@@ -101,51 +84,13 @@ def pack_name(git_url: str) -> str:
 
 
 def _skill_packs(text: str | None) -> list[dict]:
-    """The pack entries of ``SKILL_PACKS``, with ``git_url`` and
-    ``enabled_by_default`` checked for their types."""
-    if text is None:
-        return []
-    field = "env.SKILL_PACKS"
-    try:
-        packs = json.loads(text)
-    except ValueError as exc:
-        raise ConfigError(field, f"is not JSON: {exc}") from exc
-    if not isinstance(packs, list) or not all(isinstance(p, dict) for p in packs):
-        raise ConfigError(field, "must be a list of pack objects")
-    for index, pack in enumerate(packs):
-        git_url = pack.get("git_url")
-        if not isinstance(git_url, str) or not git_url.strip():
-            raise ConfigError(field, f"entry {index} needs a non-empty string git_url")
-        if not isinstance(pack.get("enabled_by_default", True), bool):
-            raise ConfigError(field, f"entry {index} enabled_by_default must be true or false")
-    return packs
+    """The pack entries of ``SKILL_PACKS``."""
+    return json.loads(text) if text is not None else []
 
 
 def _connections(text: str | None) -> list[dict]:
-    """Each connection's ``enable``, ``prefix_id`` and ``model_ids``, the keys
-    the app reads to pick a connection, checked for their types."""
-    if text is None:
-        return []
-    field = "env.OPENAI_API_CONFIGS"
-    try:
-        configs = json.loads(text)
-    except ValueError as exc:
-        raise ConfigError(field, f"is not JSON: {exc}") from exc
-    if not isinstance(configs, dict) or not all(isinstance(c, dict) for c in configs.values()):
-        raise ConfigError(field, "must map each connection to an object")
-    for key, config in configs.items():
-        if not isinstance(config.get("enable", True), bool):
-            raise ConfigError(f"{field}.{key}.enable", "must be true or false")
-        if not isinstance(config.get("prefix_id") or "", str):
-            raise ConfigError(f"{field}.{key}.prefix_id", "must be a string")
-        model_ids = config.get("model_ids") or []
-        if not isinstance(model_ids, list) or not all(isinstance(m, str) for m in model_ids):
-            raise ConfigError(f"{field}.{key}.model_ids", "must be a list of model ids")
-    return list(configs.values())
-
-
-def is_secret_name(name: str) -> bool:
-    return any(word.lower() in SECRET_WORDS for word in _WORD.findall(name))
+    """The connection entries of ``OPENAI_API_CONFIGS``, in the order written."""
+    return list(json.loads(text).values()) if text is not None else []
 
 
 def run_config(environ: Mapping[str, str]) -> RunConfig:

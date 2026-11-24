@@ -56,7 +56,7 @@ from weather_skills_eval.checks import (
     collect_evidence,
     reply_files,
 )
-from weather_skills_eval.config import ConfigError, RunConfig
+from weather_skills_eval.config import RunConfig
 from weather_skills_eval.configs_repo import (
     ConfigsRepoError,
     SkillStateError,
@@ -88,22 +88,6 @@ def parse(env_extra=None):
 
 def test_valid_port_is_used():
     assert parse({"PORT": "3000"}).port == "3000"
-
-
-@pytest.mark.parametrize(
-    "configs, field",
-    [
-        ("not json", "env.OPENAI_API_CONFIGS"),
-        ('["a"]', "env.OPENAI_API_CONFIGS"),
-        ({"0": {"prefix_id": 1}}, "env.OPENAI_API_CONFIGS.0.prefix_id"),
-        ({"0": {"enable": "no"}}, "env.OPENAI_API_CONFIGS.0.enable"),
-        ({"0": {"model_ids": "m"}}, "env.OPENAI_API_CONFIGS.0.model_ids"),
-    ],
-)
-def test_invalid_connection_configs_stop_the_run(configs, field):
-    with pytest.raises(ConfigError) as error:
-        _ = parse({"OPENAI_API_CONFIGS": configs}).connections
-    assert error.value.field == field
 
 
 ROUTER = {"prefix_id": "open-router-"}

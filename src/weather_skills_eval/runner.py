@@ -417,7 +417,7 @@ def _run(
         async def read_resolved():
             app = new_app()
             try:
-                # AD-24, before anything reads what it sets.
+                # Before anything reads the skill state it sets.
                 await apply_skill_state(app, definition)
                 return await _resolved(app, config)
             finally:

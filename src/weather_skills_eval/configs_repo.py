@@ -40,8 +40,8 @@ SCHEMAS = (
 
 
 class ConfigsRepoError(Exception):
-    """The configs repo files cannot be read, are of another schema version,
-    or do not define what a run needs. The message names the file or setting."""
+    """A configs repo file cannot be read or is of another schema version, or
+    a connection at the commit has no key. The message names the file or setting."""
 
 
 class SkillStateError(Exception):
@@ -243,7 +243,7 @@ def _skill_differences(wanted: list[dict], listed: list) -> tuple[list[str], lis
 
 async def apply_skill_state(app, definition: AppDefinition) -> None:
     """Makes the app's pack and skill ``is_active`` and skill
-    ``enabled_by_default`` match the configs repo (AD-24). The toggle routes
+    ``enabled_by_default`` match the configs repo. The toggle routes
     flip the state, so each is called only on a difference. Raises
     ``SkillStateError`` when a recorded pack or skill is not in the app."""
     missing, changes = _skill_differences(definition.skill_packs, await app.platform_skill_packs())

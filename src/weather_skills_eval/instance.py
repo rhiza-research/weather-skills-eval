@@ -63,7 +63,6 @@ EMULATOR_LABEL_VALUE = "emulator"
 VOLUME_SETUP_LABEL_VALUE = "volume-setup"
 VOLUME_LABEL_VALUE = "data"
 RUN_LABEL = "weather-skills-eval.run"
-BATCH_LABEL = "weather-skills-eval.batch"
 
 # The app mounts the whole volume at its data directory. The runner mounts
 # only the volume's artifacts folder, at the path its emulator reads as

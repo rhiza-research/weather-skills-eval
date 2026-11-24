@@ -7,7 +7,7 @@ from fakes import display_image, display_page, tool_call
 from weather_skills_eval import runner
 from weather_skills_eval.app_client import highest_skill_versions, version_key, visible_text
 from weather_skills_eval.checks import ReplyFiles, reply_files
-from weather_skills_eval.config import ConfigError, RunConfig, pack_name
+from weather_skills_eval.config import RunConfig, pack_name
 from weather_skills_eval.judge import JudgeRuling, PanelRuling
 from weather_skills_eval.runner import comparability_hash
 from weather_skills_eval.scoring import split_usage, trace_metrics
@@ -44,23 +44,6 @@ def test_pack_name_is_the_repository_name(git_url):
     assert pack_name(git_url) == "chc-skills"
     assert with_skill_packs([{"git_url": git_url}]).skill_packs_on == ["chc-skills"]
     assert RunConfig("x", "img:tag", "runner:tag", "m", "d", {}).skill_packs_on == []
-
-
-@pytest.mark.parametrize(
-    "packs",
-    [
-        "not json",
-        {"git_url": "https://example.invalid/pack.git"},
-        ["https://example.invalid/pack.git"],
-        [{"ref": "main"}],
-        [{"git_url": ""}],
-        [{"git_url": "https://example.invalid/pack.git", "enabled_by_default": "no"}],
-    ],
-)
-def test_invalid_skill_packs_are_refused(packs):
-    with pytest.raises(ConfigError) as error:
-        _ = with_skill_packs(packs).skill_packs_on
-    assert error.value.field == "env.SKILL_PACKS"
 
 
 def settings_env(**overrides):
