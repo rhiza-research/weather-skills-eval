@@ -1,3 +1,5 @@
+name: weather-skills-eval
+
 services:
   test:
     build:
@@ -8,6 +10,8 @@ services:
     command: ["sh", "-c", "ruff format --check . && ruff check . && pytest"]
 
   eval:
+    # A batch sets EVAL_IMAGE to the eval image it runs in, already on the Docker host.
+    image: ${EVAL_IMAGE:-weather-skills-eval}
     build:
       context: .
       target: eval
