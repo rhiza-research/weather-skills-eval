@@ -24,7 +24,7 @@ git -C <configs repo checkout> archive <commit SHA> | docker compose run --rm -T
 
 The configs repo files reach the run as a tar on stdin, which the container unpacks at `/configs-repo` before the harness starts, so it works with a remote Docker context, where a bind mount from this machine would not reach the daemon.
 
-`.env.example` sets `EVAL_PULL_APP_IMAGE=false`, so run `docker pull <APP_IMAGE>` first when running by hand. A batch (below) does all of this for you.
+`.env.example` sets `EVAL_PULL_APP_IMAGE=true`, so a run by hand pulls the app image before it starts. A batch (below) does all of this for you.
 
 `APP_IMAGE`, `RUNNER_IMAGE` and `EVAL_CONCURRENCY` are chosen per run with `-e`, as is `EVAL_BATCH`, optional. An empty or absent `EVAL_CONCURRENCY` means the harness's default. `EVAL_JUDGE_MODELS` and `EVAL_SIMULATED_USER_MODEL` are read from `.env` unless passed with `-e`.
 
