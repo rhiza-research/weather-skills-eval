@@ -11,9 +11,8 @@ COPY pyproject.toml uv.lock README.md ./
 
 # The image the eval service runs: no dev dependencies. The configuration is
 # piped in on stdin at run time, so editing one does not rebuild the image.
-# It also runs scripts/run-eval.py's non-interactive mode and scripts/vm-entry.py,
-# which run each run with the Docker CLI and compose plugin through the Docker
-# host's socket.
+# It also runs scripts/run-eval.py's non-interactive mode, which runs each run
+# with the Docker CLI and compose plugin through the Docker host's socket.
 FROM base AS eval
 COPY --from=docker:29.10.0-cli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=docker:29.10.0-cli /usr/local/libexec/docker/cli-plugins/docker-compose \

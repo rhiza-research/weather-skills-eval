@@ -26,7 +26,6 @@ each secret the environment leaves empty from Secret Manager."""
 
 import argparse
 import http.client
-import importlib.util
 import io
 import json
 import math
@@ -229,11 +228,6 @@ def metadata_key(name):
 def flag(name):
     """``EVAL_IMAGE_TAG`` -> ``--eval-image-tag``: the flag of a batch value."""
     return "--" + metadata_key(name)
-
-
-def metadata_keys():
-    """The VM metadata key of every batch value."""
-    return [metadata_key(name) for name in (*ANSWERS, *SETTINGS, *OPTIONAL_SETTINGS)]
 
 
 def batch_flags(values):
@@ -1698,82 +1692,6 @@ def test_the_read_token_is_an_unredirected_header(tmp_path, monkeypatch):
     # urllib copies only request.headers to a redirect's request.
     assert request.unredirected_hdrs == {"Authorization": "Bearer t0ken"}
     assert "Authorization" not in request.headers
-
-
-def vm_entry():
-    """scripts/vm-entry.py, loaded as a module."""
-    path = Path(__file__).resolve().parent / "vm-entry.py"
-    spec = importlib.util.spec_from_file_location("vm_entry", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_the_vm_runs_its_metadata_s_batch_and_is_deleted_whatever_the_exit(monkeypatch, capsys):
-    entry = vm_entry()
-    # cloud-init's own key is not a batch value.
-    attributes = {"user-data": "#cloud-config", "eval-image-tag": "main", "app-image": "a:1"}
-    monkeypatch.setattr(entry, "metadata", lambda path: json.dumps(attributes))
-    runs, deleted = [], []
-    # No main: vm-entry runs non-interactive mode directly, never interactive mode.
-    batch = types.SimpleNamespace(metadata_keys=metadata_keys, parse_batch=lambda argv: argv)
-    monkeypatch.setattr(entry, "load_run_eval", lambda: batch)
-    monkeypatch.setattr(entry, "delete_instance", lambda: deleted.append(True))
-
-    def fails(values):
-        runs.append(values)
-        return 1
-
-    batch.run_noninteractive = fails
-    assert entry.main() == 1
-    assert runs == [["--app-image=a:1", "--eval-image-tag=main"]]
-    # A missing value: parsing exits 2.
-    batch.parse_batch = lambda argv: sys.exit(2)
-    assert entry.main() == 2
-
-    def raises(values):
-        raise RuntimeError("broken")
-
-    def forbidden():
-        raise OSError("forbidden")
-
-    batch.parse_batch = lambda argv: argv
-    batch.run_noninteractive = raises
-    monkeypatch.setattr(entry, "delete_instance", forbidden)
-    assert entry.main() == 1
-
-    assert deleted == [True, True]
-    err = capsys.readouterr().err
-    assert "Batch failed in vm-entry.py: RuntimeError: broken\n" in err
-    assert "VM not deleted: OSError: forbidden\n" in err
-
-
-def test_the_vm_deletes_itself_through_the_compute_api(monkeypatch):
-    entry = vm_entry()
-    answers = {
-        "project/project-id": "test-project",
-        "instance/zone": "projects/123/zones/us-central1-a",
-        "instance/name": "weather-skills-eval-test",
-        "instance/service-accounts/default/token": json.dumps({"access_token": "t0ken"}),
-    }
-    monkeypatch.setattr(entry, "metadata", lambda path: answers[path])
-    requests = []
-
-    def urlopen(request, timeout):
-        requests.append(request)
-        return io.BytesIO(b"{}")
-
-    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
-
-    entry.delete_instance()
-
-    [request] = requests
-    assert request.get_method() == "DELETE"
-    assert request.full_url == (
-        "https://compute.googleapis.com/compute/v1/projects/test-project"
-        "/zones/us-central1-a/instances/weather-skills-eval-test"
-    )
-    assert request.get_header("Authorization") == "Bearer t0ken"
 
 
 def test_read_secret_reads_the_latest_version_and_strips_it(monkeypatch):
