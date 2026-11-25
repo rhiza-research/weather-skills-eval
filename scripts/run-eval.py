@@ -8,21 +8,25 @@
 #     "questionary>=2.1.1",
 # ]
 # ///
-"""Launches and runs eval batches, in one of two modes.
+"""Launches and runs eval batches, in one of two modes. Both take the same
+flags; each value comes from its flag, else the shell, else .env, else its
+built-in default.
 
-Interactive mode, with no arguments, runs with uv on a member's machine. It
-asks for the configs repo and a ref, which it resolves to one commit with git,
-the models at that commit to run, the judge models, simulated user model, app
-image, runner image, concurrency, repetitions, number of runs at once, whether
-to pull the app image and the eval image tag, and prints the batch's estimated
-cost from the agent costs saved in .costs.json and OpenRouter's prices. Then it
-prints two ways to launch the batch, the two gcloud commands that create a VM
-that runs it and the docker run command of the eval image, and runs the one
-the member picks, if any.
+The default mode runs with uv on a member's machine. It asks for each value
+given no flag, prefilled: the configs repo and a ref, which it resolves to one
+commit with git (a --eval-configs-commit flag skips both), the models at that
+commit to run, the judge models, simulated user model, app image, runner
+image, concurrency, repetitions, number of runs at once, whether to pull the
+app image and the eval image tag, and prints the batch's estimated cost from
+the agent costs saved in .costs.json and OpenRouter's prices. Then it prints
+two ways to launch the batch, the two gcloud commands that create a VM that
+runs it and the docker run command of the eval image, and asks last for
+EVAL_LAUNCH: vm, docker or none, and runs that launch.
 
-Non-interactive mode, with every batch value as a flag, runs in the eval
-container and runs the batch on the Docker host whose socket it has. It reads
-each secret the environment leaves empty from Secret Manager."""
+Background mode, --background, asks nothing. It runs in the eval container and
+runs the batch on the Docker host whose socket it has. A required value with no
+flag, shell or .env value or default exits 2, naming it. It reads each secret
+the environment leaves empty from Secret Manager."""
 
 import argparse
 import http.client
@@ -49,7 +53,7 @@ from dotenv import dotenv_values
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# Used when neither the shell nor .env sets the value. A blank concurrency means
+# Used when neither a flag, the shell nor .env sets the value. A blank concurrency means
 # the harness's own default; the simulated user model has no default.
 DEFAULTS = {
     "EVAL_SIMULATED_USER_MODEL": "",
@@ -66,6 +70,23 @@ IMAGE_TAG = {"EVAL_IMAGE_TAG": "main"}
 
 # The configs repo; no default, since it is set in .env or the shell.
 CONFIGS_REPO = {"EVAL_CONFIGS_REPO": ""}
+# How many rounds of the models the batch runs; prefilled like DEFAULTS.
+REPETITIONS = {"EVAL_REPETITIONS": "1"}
+# Whether the batch pulls the app image; prefilled like DEFAULTS.
+PULL_APP_IMAGE = {"EVAL_PULL_APP_IMAGE": "true"}
+# Default mode only, never batch values: the configs ref it resolves to
+# EVAL_CONFIGS_COMMIT, and the launch it runs, one of LAUNCHES.
+DEFAULT_MODE_ONLY = {"EVAL_CONFIGS_REF": "main", "EVAL_LAUNCH": "vm"}
+# Each value's built-in default; a value not here has none.
+BUILT_IN = {
+    **DEFAULTS,
+    **PARALLEL_RUNS,
+    **IMAGE_TAG,
+    **CONFIGS_REPO,
+    **REPETITIONS,
+    **PULL_APP_IMAGE,
+    **DEFAULT_MODE_ONLY,
+}
 # Where each run reads the configs repo files.
 CONFIGS_DIR = "/configs-repo"
 # Each run's container command: unpacks the tar of the configs repo files it
@@ -75,7 +96,8 @@ UNPACK_AND_RUN = (
 )
 
 # Batch values. A variable NAME is the flag --name-lowercase-dashes and the VM
-# metadata key name-lowercase-dashes. Each is required; an empty value is a value.
+# metadata key name-lowercase-dashes. Each is required; only EVAL_CONCURRENCY
+# may be empty.
 # The questions' answers.
 ANSWERS = (
     "EVAL_CONFIGS_REPO",
@@ -175,11 +197,25 @@ def prefilled(environ, dotenv_path, defaults=DEFAULTS):
     }
 
 
+def resolved(given, environ, dotenv_path, names):
+    """Each of ``names`` from its flag in ``given``, else from the shell, else
+    from .env, else its built-in default, else empty."""
+    values = prefilled(environ, dotenv_path, {name: BUILT_IN.get(name, "") for name in names})
+    values.update((name, given[name]) for name in names if name in given)
+    return values
+
+
 def judge_models(environ, dotenv_path):
     """The models EVAL_JUDGE_MODELS names, from the shell, else from .env, in its
     order, spaces trimmed, without empty names or repeats."""
     current = environ.get("EVAL_JUDGE_MODELS") or _dotenv(dotenv_path).get("EVAL_JUDGE_MODELS")
-    named = (model.strip() for model in (current or "").split(","))
+    return model_names(current or "")
+
+
+def model_names(text):
+    """The models comma-separated ``text`` names, in its order, spaces
+    trimmed, without empty names or repeats."""
+    named = (model.strip() for model in text.split(","))
     return list(dict.fromkeys(model for model in named if model))
 
 
@@ -258,7 +294,7 @@ def vm_commands(vm, values):
 
 def docker_command(values, secrets):
     """The docker run command that runs the batch in the eval image in
-    non-interactive mode, on the current Docker context's host. Each secret is
+    background mode, on the current Docker context's host. Each secret is
     passed by name only, from the environment docker run is given."""
     return [
         "docker",
@@ -278,6 +314,7 @@ def docker_command(values, secrets):
         f"{EVAL_IMAGE}:{values['EVAL_IMAGE_TAG']}",
         IMAGE_PYTHON,
         IMAGE_SCRIPT,
+        "--background",
         *batch_flags(values),
     ]
 
@@ -574,30 +611,45 @@ def image_labels(image):
     return json.loads(inspected.stdout) or {}
 
 
-# The launch choices interactive mode offers.
+# The EVAL_LAUNCH values, each with its title in the default mode's question.
 VM_LAUNCH = "On a new VM"
 LOCAL_LAUNCH = "On the current Docker context's host"
 NO_LAUNCH = "Neither"
+LAUNCHES = {"vm": VM_LAUNCH, "docker": LOCAL_LAUNCH, "none": NO_LAUNCH}
 
 
-def run_interactive():
-    """Interactive mode: asks for the batch, prints its launch commands and
-    runs the one picked. Returns the exit code."""
+def run_default(given):
+    """The default mode: asks for each value ``given`` has no flag for, prints
+    the batch's launch commands and runs the launch EVAL_LAUNCH names. Returns
+    the exit code."""
     dotenv = ROOT / ".env"
-    offered = judge_models(os.environ, dotenv)
-    if not offered:
-        print("EVAL_JUDGE_MODELS names no judge model; set it in the shell or .env", flush=True)
-        return 2
-    settings = prefilled(os.environ, dotenv, dict.fromkeys(SETTINGS, ""))
+    offered = None
+    if "EVAL_JUDGE_MODELS" not in given:
+        offered = judge_models(os.environ, dotenv)
+        if not offered:
+            print("EVAL_JUDGE_MODELS names no judge model; set it in the shell or .env", flush=True)
+            return 2
+    settings = resolved(given, os.environ, dotenv, SETTINGS)
     unset = [name for name, value in settings.items() if not value]
     if unset:
-        print(f"Not set in the shell or .env: {', '.join(unset)}", flush=True)
+        print(f"Not set by flag, in the shell or .env: {', '.join(unset)}", flush=True)
         return 2
-    optional = prefilled(os.environ, dotenv, dict.fromkeys(OPTIONAL_SETTINGS, ""))
+    # Each prefill checked as its flag would check it; an empty one is no prefill.
+    # EVAL_CONFIGS_COMMIT is never prefilled: the ref question resolves it.
+    asked = [name for name in (*ANSWERS, *DEFAULT_MODE_ONLY) if name != "EVAL_CONFIGS_COMMIT"]
+    for name, value in resolved({}, os.environ, dotenv, asked).items():
+        if name in given or not value:
+            continue
+        try:
+            checked(name, value)
+        except argparse.ArgumentTypeError as exc:
+            print(f"{name} from the shell or .env: {exc}", flush=True)
+            return 2
+    optional = resolved(given, os.environ, dotenv, OPTIONAL_SETTINGS)
     # The configs repo checkout, only read for its model ids.
     folder = Path(tempfile.mkdtemp(prefix="run-eval-configs-"))
     try:
-        answers = ask(dotenv, offered, folder)
+        answers = ask(given, dotenv, offered, folder)
     finally:
         shutil.rmtree(folder, ignore_errors=True)
     if isinstance(answers, int):
@@ -605,11 +657,12 @@ def run_interactive():
     values = {name: answers[name] for name in ANSWERS}
     values.update(settings)
     values.update((name, value) for name, value in optional.items() if value)
-    return launch(values, dotenv)
+    return launch(values, dotenv, given)
 
 
-def launch(values, dotenv):
-    """Prints the batch's two launch commands and runs the one picked."""
+def launch(values, dotenv, given):
+    """Prints the batch's two launch commands, then runs the launch the
+    EVAL_LAUNCH flag in ``given`` names, else the one picked."""
     secrets = run_secrets(values["EVAL_CONNECTION_KEYS"])
     vm = vm_name(datetime.now(UTC))
     try:
@@ -623,10 +676,16 @@ def launch(values, dotenv):
         print(f"  {shlex.join(command)}", flush=True)
     print("To run it on the current Docker context's host, with each secret set:", flush=True)
     print(f"  {shlex.join(docker)}", flush=True)
-    choice = questionary.select(
-        "Launch:", choices=[VM_LAUNCH, LOCAL_LAUNCH, NO_LAUNCH]
-    ).unsafe_ask()
-    if choice == VM_LAUNCH:
+    choice = given.get("EVAL_LAUNCH")
+    if choice is None:
+        # Checked by run_default.
+        prefill = resolved({}, os.environ, dotenv, ("EVAL_LAUNCH",))["EVAL_LAUNCH"]
+        choice = questionary.select(
+            "EVAL_LAUNCH:",
+            choices=[questionary.Choice(title, value=key) for key, title in LAUNCHES.items()],
+            default=prefill,
+        ).unsafe_ask()
+    if choice == "vm":
         for index, command in enumerate(gcloud):
             done = subprocess.run(command)
             if done.returncode != 0:
@@ -639,7 +698,7 @@ def launch(values, dotenv):
         print(f"VM {vm} runs the batch and deletes itself when the batch ends.", flush=True)
         print(f"Stop it with: gcloud compute instances delete {vm} --zone {VM_ZONE}", flush=True)
         return 0
-    if choice == LOCAL_LAUNCH:
+    if choice == "docker":
         if batch_running():
             print(f"A batch is running: container {BATCH_CONTAINER}", flush=True)
             print(f"Stop it with: docker stop {BATCH_CONTAINER}", flush=True)
@@ -657,68 +716,79 @@ def launch(values, dotenv):
     return 0
 
 
-def ask(dotenv, offered, folder):
-    """Asks for the batch, with the configs repo checked out in ``folder``,
-    and prints its estimated cost. Returns the answers by batch value name,
-    or an exit code."""
-    repo = (
-        questionary.text(
-            "EVAL_CONFIGS_REPO:",
-            default=prefilled(os.environ, dotenv, CONFIGS_REPO)["EVAL_CONFIGS_REPO"],
+def ask(given, dotenv, offered, folder):
+    """Asks for each batch value ``given`` has no flag for, prefilled from the
+    shell, else .env, else its built-in default, with the configs repo checked
+    out in ``folder``, and prints the batch's
+    estimated cost. ``offered`` are the judge models offered, when asked.
+    Returns the batch values by name, or an exit code."""
+    prefills = resolved({}, os.environ, dotenv, (*ANSWERS, "EVAL_CONFIGS_REF"))
+
+    def text(name, message=None, validate=None):
+        if name in given:
+            return given[name]
+        return (
+            questionary.text(message or f"{name}:", default=prefills[name], validate=validate)
+            .unsafe_ask()
+            .strip()
         )
-        .unsafe_ask()
-        .strip()
-    )
+
+    repo = text("EVAL_CONFIGS_REPO")
     # The batch downloads the commit from GitHub, so only that form is accepted.
     if github_repo(repo) is None:
         return 2
-    ref = questionary.text("Configs ref:", default="main").unsafe_ask().strip()
-    configs_commit = fetch_configs(repo, ref, folder)
-    if configs_commit is None:
-        return 1
-    print(f"Configs {repo} at {ref} is commit {configs_commit}", flush=True)
-    models = questionary.checkbox("Models to run:", choices=model_ids(folder)).unsafe_ask()
-    if not models:
-        return 0
-    judges = questionary.checkbox(
-        "Judge models:",
-        choices=[questionary.Choice(model, checked=True) for model in offered],
-        validate=judges_valid,
-    ).unsafe_ask()
+    if "EVAL_CONFIGS_COMMIT" in given:
+        # Used as is; fetched, so a commit the repo lacks fails before the launch.
+        configs_commit = given["EVAL_CONFIGS_COMMIT"]
+        if fetch_configs(repo, configs_commit, folder) is None:
+            return 1
+    else:
+        ref = text("EVAL_CONFIGS_REF", "Configs ref:")
+        configs_commit = fetch_configs(repo, ref, folder)
+        if configs_commit is None:
+            return 1
+        print(f"Configs {repo} at {ref} is commit {configs_commit}", flush=True)
+    if "EVAL_MODELS" in given:
+        models = given["EVAL_MODELS"].split(",")
+        unknown = [model for model in models if model not in model_ids(folder)]
+        if unknown:
+            print(f"Not a model of commit {configs_commit}: {', '.join(unknown)}", flush=True)
+            return 2
+    else:
+        saved = {model.strip() for model in prefills["EVAL_MODELS"].split(",")}
+        models = questionary.checkbox(
+            "Models to run:",
+            choices=[
+                questionary.Choice(model, checked=model in saved) for model in model_ids(folder)
+            ],
+        ).unsafe_ask()
+        if not models:
+            return 0
+    if "EVAL_JUDGE_MODELS" in given:
+        judges = model_names(given["EVAL_JUDGE_MODELS"])
+        if not judges:
+            print("--eval-judge-models names no judge model", flush=True)
+            return 2
+    else:
+        judges = questionary.checkbox(
+            "Judge models:",
+            choices=[questionary.Choice(model, checked=True) for model in offered],
+            validate=judges_valid,
+        ).unsafe_ask()
     values = {
         "EVAL_JUDGE_MODELS": ",".join(judges),
-        **{
-            name: questionary.text(f"{name}:", default=value, validate=VALIDATORS.get(name))
-            .unsafe_ask()
-            .strip()
-            for name, value in prefilled(os.environ, dotenv).items()
-        },
+        **{name: text(name, validate=VALIDATORS.get(name)) for name in DEFAULTS},
     }
-    repetitions = int(
-        questionary.text("Repetitions:", default="1", validate=whole_number_valid)
-        .unsafe_ask()
-        .strip()
-    )
-    parallel = int(
-        questionary.text(
-            "Runs at once:",
-            default=prefilled(os.environ, dotenv, PARALLEL_RUNS)["EVAL_PARALLEL_RUNS"],
-            validate=whole_number_valid,
-        )
-        .unsafe_ask()
-        .strip()
-    )
+    repetitions = int(text("EVAL_REPETITIONS", "Repetitions:", whole_number_valid))
+    parallel = int(text("EVAL_PARALLEL_RUNS", "Runs at once:", whole_number_valid))
     show_estimate(models, repetitions, judges, values["EVAL_SIMULATED_USER_MODEL"])
-    pull = questionary.confirm("Pull the app image?", default=True).unsafe_ask()
-    image_tag = (
-        questionary.text(
-            "EVAL_IMAGE_TAG:",
-            default=prefilled(os.environ, dotenv, IMAGE_TAG)["EVAL_IMAGE_TAG"],
-            validate=image_tag_valid,
-        )
-        .unsafe_ask()
-        .strip()
-    )
+    if "EVAL_PULL_APP_IMAGE" in given:
+        pull = given["EVAL_PULL_APP_IMAGE"] == "true"
+    else:
+        pull = questionary.confirm(
+            "Pull the app image?", default=prefills["EVAL_PULL_APP_IMAGE"] == "true"
+        ).unsafe_ask()
+    image_tag = text("EVAL_IMAGE_TAG", validate=image_tag_valid)
     return {
         **values,
         "EVAL_CONFIGS_REPO": repo,
@@ -746,8 +816,8 @@ def _model_list(text):
 
 
 def _non_empty(text):
-    if not text:
-        raise argparse.ArgumentTypeError("must not be empty")
+    if not text.strip():
+        raise argparse.ArgumentTypeError("must not be blank")
     return text
 
 
@@ -757,8 +827,9 @@ def _commit(text):
     return text
 
 
-# Checks of the required batch values. Every other one must not be empty,
-# but EVAL_CONCURRENCY, which is empty for the harness's default.
+# How each flag checks its value. A flag not named here must not be blank,
+# except an optional setting, which takes any value. EVAL_CONCURRENCY may be
+# empty, for the harness's default.
 FLAG_OPTIONS = {
     "EVAL_CONFIGS_COMMIT": {"type": _commit},
     "EVAL_MODELS": {"type": _model_list},
@@ -766,38 +837,71 @@ FLAG_OPTIONS = {
     "EVAL_REPETITIONS": {"type": _whole_number},
     "EVAL_PARALLEL_RUNS": {"type": _whole_number},
     "EVAL_PULL_APP_IMAGE": {"choices": ("true", "false")},
+    "EVAL_LAUNCH": {"choices": tuple(LAUNCHES)},
 }
 
 
-def batch_parser():
-    """The non-interactive mode's flags: every batch value, the optional
-    settings not required. A missing or invalid flag exits 2, naming it."""
+def checked(name, value):
+    """``value`` of ``name`` as its flag would take it; ArgumentTypeError when
+    the flag would refuse it."""
+    options = FLAG_OPTIONS.get(name, {"type": _non_empty})
+    if "choices" in options and value not in options["choices"]:
+        raise argparse.ArgumentTypeError(f"one of {', '.join(options['choices'])}")
+    return options.get("type", str)(value)
+
+
+def flag_parser():
+    """The flags of both modes: --background and every value, each optional.
+    An invalid flag value exits 2, naming the flag."""
     parser = argparse.ArgumentParser(
         prog="run-eval.py",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    for name in (*ANSWERS, *SETTINGS):
-        options = FLAG_OPTIONS.get(name, {"type": _non_empty})
-        parser.add_argument(flag(name), dest=name, required=True, **options)
+    parser.add_argument(
+        "--background", action="store_true", help="run the batch here, asking nothing"
+    )
+    for name in (*ANSWERS, *SETTINGS, *DEFAULT_MODE_ONLY):
+        parser.add_argument(flag(name), dest=name, **FLAG_OPTIONS.get(name, {"type": _non_empty}))
     for name in OPTIONAL_SETTINGS:
         parser.add_argument(flag(name), dest=name)
     return parser
 
 
-def parse_batch(argv):
-    """The batch values ``argv`` gives, by name; an optional setting only when
-    given and not empty, as interactive mode leaves out an empty one."""
-    parsed = vars(batch_parser().parse_args(argv))
-    return {
-        name: value
-        for name, value in parsed.items()
-        if value is not None and (value or name not in OPTIONAL_SETTINGS)
-    }
+def parse_flags(argv):
+    """Whether ``argv`` has --background, and the values it gives a flag for, by name."""
+    parsed = vars(flag_parser().parse_args(argv))
+    background = parsed.pop("background")
+    return background, {name: value for name, value in parsed.items() if value is not None}
 
 
-def run_noninteractive(values):
-    """Non-interactive mode: runs the batch ``values`` describes. SIGTERM, as
+def background_values(given, environ, dotenv_path):
+    """The batch values of background mode, each resolved as ``resolved``
+    does; an optional setting only when not empty. A required value that is
+    empty, or one not from a flag that its flag would refuse, exits 2, naming
+    it, as does a flag of the default mode only."""
+    default_only = [flag(name) for name in DEFAULT_MODE_ONLY if name in given]
+    if default_only:
+        flag_parser().error(f"only in the default mode: {', '.join(default_only)}")
+    values = resolved(given, environ, dotenv_path, (*ANSWERS, *SETTINGS))
+    missing = [flag(n) for n, value in values.items() if not value and n != "EVAL_CONCURRENCY"]
+    if missing:
+        flag_parser().error(f"no flag, shell or .env value or default for: {', '.join(missing)}")
+    for name, value in values.items():
+        # A flag was checked when parsed.
+        if name in given:
+            continue
+        try:
+            values[name] = checked(name, value)
+        except argparse.ArgumentTypeError as exc:
+            flag_parser().error(f"{name} from the shell or .env: {exc}")
+    optional = resolved(given, environ, dotenv_path, OPTIONAL_SETTINGS)
+    values.update((name, value) for name, value in optional.items() if value)
+    return values
+
+
+def run_background(values):
+    """Background mode: runs the batch ``values`` describes. SIGTERM, as
     from docker stop, stops it with the results so far."""
     signal.signal(signal.SIGTERM, signal.default_int_handler)
     folder = Path(tempfile.mkdtemp(prefix="run-eval-configs-"))
@@ -1067,12 +1171,12 @@ def run_queue(command, queue, archive, parallel, results):
 
 
 def main(argv=()):
-    """Non-interactive mode with arguments, interactive mode without."""
-    argv = list(argv)
-    if argv:
-        return run_noninteractive(parse_batch(argv))
+    """Background mode with --background, the default mode without."""
+    background, given = parse_flags(list(argv))
+    if background:
+        return run_background(background_values(given, os.environ, ROOT / ".env"))
     try:
-        return run_interactive()
+        return run_default(given)
     except KeyboardInterrupt:
         print("\nInterrupted.")
         return 130
@@ -1218,7 +1322,7 @@ TEST_SETTINGS = {
 DOTENV = (
     f"EVAL_JUDGE_MODELS={JUDGES[0]}\nEVAL_SIMULATED_USER_MODEL=openrouter/test/user\n"
     f"EVAL_CONFIGS_REPO={REPO_URL}\nEVAL_MAX_TURNS=5\nEVAL_MODEL_RETRIES=\n"
-    + "".join(f"{name}={value}\n" for name, value in TEST_SETTINGS.items())
+    "EVAL_MODELS=m-a,m-b\n" + "".join(f"{name}={value}\n" for name, value in TEST_SETTINGS.items())
 )
 # The batch values of a launch with DOTENV and EVAL_PARALLEL_RUNS=2 that takes
 # every default, in order.
@@ -1243,38 +1347,29 @@ BATCH = {
 BATCH_SECRET_NAMES = [*SECRETS, "APP_OPENROUTER_API_KEY"]
 
 
-def launch_setup(tmp_path, monkeypatch, dotenv, outputs=(), choice=NO_LAUNCH):
+def launch_setup(tmp_path, monkeypatch, dotenv, outputs=(), choice="none"):
     """ROOT at ``tmp_path`` with ``dotenv`` as .env; the questions take their
-    defaults, and every model, and the launch is ``choice``; the VM is named
+    prefills, and the launch question is answered ``choice``; the VM is named
     weather-skills-eval-test. Returns the fake commands and the questions asked."""
     (tmp_path / ".env").write_text(dotenv)
     monkeypatch.setitem(globals(), "ROOT", tmp_path)
     monkeypatch.setitem(globals(), "openrouter_prices", lambda: PRICES)
     monkeypatch.setitem(globals(), "vm_name", lambda now: "weather-skills-eval-test")
-    for name in [
-        *DEFAULTS,
-        *PARALLEL_RUNS,
-        *IMAGE_TAG,
-        *CONFIGS_REPO,
-        *SETTINGS,
-        *OPTIONAL_SETTINGS,
-        "EVAL_JUDGE_MODELS",
-    ]:
+    for name in [*BUILT_IN, *ANSWERS, *SETTINGS, *OPTIONAL_SETTINGS]:
         monkeypatch.delenv(name, raising=False)
     asked = []
 
-    def select(message, choices):
+    def select(message, choices, default):
         asked.append(message)
-        assert choices == [VM_LAUNCH, LOCAL_LAUNCH, NO_LAUNCH]
+        assert [(c.title, c.value) for c in choices] == [(t, k) for k, t in LAUNCHES.items()]
+        assert default in LAUNCHES
         return _Answer(choice)
 
     monkeypatch.setattr(questionary, "select", select)
 
     def checkbox(message, choices, **kwargs):
         asked.append(message)
-        if message == "Judge models:":
-            return _Answer([c.value for c in choices if c.checked])
-        return _Answer(choices)
+        return _Answer([c.value for c in choices if c.checked])
 
     def text(message, default, **kwargs):
         asked.append(message)
@@ -1306,7 +1401,7 @@ def test_the_vm_launch_prints_every_command_and_runs_the_two_gcloud_commands(
     tmp_path, monkeypatch, capsys
 ):
     commands, asked = launch_setup(
-        tmp_path, monkeypatch, DOTENV + "EVAL_PARALLEL_RUNS=2\n", choice=VM_LAUNCH
+        tmp_path, monkeypatch, DOTENV + "EVAL_PARALLEL_RUNS=2\n", choice="vm"
     )
     (tmp_path / COSTS_FILE).write_text(json.dumps({"m-a": {"agent_cost_usd": 1.5}}))
     # The VM reads the secrets itself.
@@ -1323,7 +1418,13 @@ def test_the_vm_launch_prints_every_command_and_runs_the_two_gcloud_commands(
     assert fetched == ["git", "-C", folder, "rev-parse", "FETCH_HEAD"]
     # The checkout is only read for its model ids.
     assert not Path(folder).exists()
-    assert asked[-3:] == ["Pull the app image?", "EVAL_IMAGE_TAG:", "Launch:"]
+    # Every question, the launch last.
+    assert asked == [
+        *("EVAL_CONFIGS_REPO:", "Configs ref:", "Models to run:", "Judge models:"),
+        *("EVAL_SIMULATED_USER_MODEL:", "APP_IMAGE:", "RUNNER_IMAGE:", "EVAL_CONCURRENCY:"),
+        *("Repetitions:", "Runs at once:", "Pull the app image?", "EVAL_IMAGE_TAG:"),
+        "EVAL_LAUNCH:",
+    ]
     vm = "weather-skills-eval-test"
     assert create == [
         *("gcloud", "compute", "instances", "create", vm, "--zone", "us-central1-a"),
@@ -1349,7 +1450,7 @@ def test_the_vm_launch_prints_every_command_and_runs_the_two_gcloud_commands(
 def test_a_failed_gcloud_command_stops_the_vm_launch(tmp_path, monkeypatch, capsys):
     create = ["gcloud", "compute", "instances", "create"]
     commands, _ = launch_setup(
-        tmp_path, monkeypatch, DOTENV, outputs=[(create, 1, "")], choice=VM_LAUNCH
+        tmp_path, monkeypatch, DOTENV, outputs=[(create, 1, "")], choice="vm"
     )
 
     assert main() == 1
@@ -1377,7 +1478,7 @@ def test_a_running_batch_is_named_with_its_stop_command_and_nothing_starts(
         monkeypatch,
         DOTENV,
         outputs=[(["docker", "container", "inspect"], 0, "[]")],
-        choice=LOCAL_LAUNCH,
+        choice="docker",
     )
     monkeypatch.setitem(globals(), "read_secret", no_secret_read)
 
@@ -1396,7 +1497,7 @@ def test_a_local_launch_reads_empty_secrets_and_passes_each_by_name_only(
     dotenv = (
         DOTENV + "EVAL_PARALLEL_RUNS=2\nLANGFUSE_SECRET_KEY=\nLANGFUSE_PUBLIC_KEY=from-dotenv\n"
     )
-    commands, _ = launch_setup(tmp_path, monkeypatch, dotenv, choice=LOCAL_LAUNCH)
+    commands, _ = launch_setup(tmp_path, monkeypatch, dotenv, choice="docker")
     # Set in .env and in the shell; every other secret is empty, so it is read.
     given = {"LANGFUSE_PUBLIC_KEY": "from-dotenv", "OPENROUTER_API_KEY": "from-shell"}
     for name in BATCH_SECRET_NAMES:
@@ -1420,10 +1521,11 @@ def test_a_local_launch_reads_empty_secrets_and_passes_each_by_name_only(
         *("--name", "weather-skills-eval-batch", "--stop-timeout", "120"),
         *("--volume", "/var/run/docker.sock:/var/run/docker.sock", "-e"),
     ]
-    assert docker[-len(BATCH) - 3 :] == [
+    assert docker[-len(BATCH) - 4 :] == [
         "ghcr.io/rhiza-research/weather-skills-eval:main",
         "/opt/run-eval/bin/python",
         "/app/scripts/run-eval.py",
+        "--background",
         *(f"--{metadata_key(name)}={value}" for name, value in BATCH.items()),
     ]
     empty = [name for name in BATCH_SECRET_NAMES if name not in given]
@@ -1435,23 +1537,225 @@ def test_a_local_launch_reads_empty_secrets_and_passes_each_by_name_only(
     assert "docker stop weather-skills-eval-batch" in capsys.readouterr().out
 
 
-def test_a_missing_flag_exits_2_naming_it_and_nothing_runs(monkeypatch, capsys):
+def test_a_flag_skips_its_question_and_the_rest_are_asked(tmp_path, monkeypatch, capsys):
+    # EVAL_MODELS in .env ticks only m-b.
+    dotenv = DOTENV.replace("EVAL_MODELS=m-a,m-b\n", "EVAL_MODELS=m-b\n")
+    commands, asked = launch_setup(tmp_path, monkeypatch, dotenv)
+    monkeypatch.setitem(globals(), "read_secret", no_secret_read)
+
+    assert main(["--eval-launch", "vm", "--eval-repetitions", "3"]) == 0
+
+    assert asked == [
+        *("EVAL_CONFIGS_REPO:", "Configs ref:", "Models to run:", "Judge models:"),
+        *("EVAL_SIMULATED_USER_MODEL:", "APP_IMAGE:", "RUNNER_IMAGE:", "EVAL_CONCURRENCY:"),
+        *("Runs at once:", "Pull the app image?", "EVAL_IMAGE_TAG:"),
+    ]
+    add = commands.commands()[-1]
+    assert add[:4] == ["gcloud", "compute", "instances", "add-metadata"]
+    pairs = add[-1].removeprefix("^;^").split(";")
+    assert "eval-repetitions=3" in pairs
+    assert "eval-models=m-b" in pairs
+    # Default mode only, never a batch value.
+    assert not any(pair.startswith(("eval-launch=", "eval-configs-ref=")) for pair in pairs)
+
+
+def test_with_every_value_as_a_flag_nothing_is_asked_and_none_prints_only(
+    tmp_path, monkeypatch, capsys
+):
+    # No .env: every value comes from its flag.
+    commands, asked = launch_setup(tmp_path, monkeypatch, "")
+
+    assert main([*batch_flags(BATCH), "--eval-launch=none"]) == 0
+
+    assert asked == []
+    # The given commit is fetched, to check it and its models; nothing is launched.
+    init, fetch, checkout, fetched = commands.commands()
+    assert fetch[-1] == CONFIGS_COMMIT
+    out = capsys.readouterr().out
+    for command in (
+        *vm_commands("weather-skills-eval-test", BATCH),
+        docker_command(BATCH, BATCH_SECRET_NAMES),
+    ):
+        assert f"  {shlex.join(command)}\n" in out
+
+
+def test_a_configs_commit_flag_skips_the_ref_and_is_fetched(tmp_path, monkeypatch, capsys):
+    commands, asked = launch_setup(tmp_path, monkeypatch, DOTENV)
+    commit = "a" * 40
+
+    assert main([f"--eval-configs-commit={commit}"]) == 0
+
+    assert "Configs ref:" not in asked
+    assert "Models to run:" in asked
+    init, fetch, checkout, fetched = commands.commands()
+    assert fetch == ["git", "-C", init[-1], "fetch", "-q", "--depth", "1", REPO_URL, commit]
+    # Used as is in the batch.
+    assert f"--eval-configs-commit={commit} " in capsys.readouterr().out
+
+
+def test_a_configs_commit_the_repo_lacks_fails_before_the_launch(tmp_path, monkeypatch, capsys):
+    fetch = ["git", "-C", str(tmp_path / "configs"), "fetch"]
+    commands, _ = launch_setup(tmp_path, monkeypatch, DOTENV, outputs=[(fetch, 1, "")])
+
+    assert main([f"--eval-configs-commit={'a' * 40}", "--eval-models=m-a", "--eval-launch=vm"]) == 1
+
+    assert commands.commands()[-1][:4] == fetch
+    assert "gcloud" not in capsys.readouterr().out
+
+
+def test_a_model_flag_the_commit_lacks_exits_2_naming_it(tmp_path, monkeypatch, capsys):
+    commands, _ = launch_setup(tmp_path, monkeypatch, DOTENV)
+
+    assert main(["--eval-models=m-a,m-z", "--eval-launch=vm"]) == 2
+
+    assert capsys.readouterr().out.endswith(f"Not a model of commit {CONFIGS_COMMIT}: m-z\n")
+    assert not any(command[0] == "gcloud" for command in commands.commands())
+
+
+def test_a_judge_models_flag_is_cleaned_costed_and_passed(tmp_path, monkeypatch, capsys):
+    launch_setup(tmp_path, monkeypatch, DOTENV)
+    costed = []
+    monkeypatch.setitem(globals(), "show_estimate", lambda *args: costed.append(args[2]))
+    judges = f" {JUDGES[1]} , ,{JUDGES[1]},{JUDGES[0]} "
+
+    assert main([f"--eval-judge-models={judges}"]) == 0
+
+    assert costed == [[JUDGES[1], JUDGES[0]]]
+    assert f"--eval-judge-models={JUDGES[1]},{JUDGES[0]} " in capsys.readouterr().out
+    # A flag naming no judge model.
+    assert main(["--eval-judge-models=,"]) == 2
+    assert capsys.readouterr().out.endswith("--eval-judge-models names no judge model\n")
+
+
+def test_a_flag_wins_over_dotenv_in_the_default_mode(tmp_path, monkeypatch, capsys):
+    _, asked = launch_setup(tmp_path, monkeypatch, DOTENV + "APP_IMAGE=dotenv:app\n")
+
+    assert main(["--app-image=flag:app"]) == 0
+
+    assert "APP_IMAGE:" not in asked
+    assert "--app-image=flag:app " in capsys.readouterr().out
+
+
+def test_a_flag_wins_over_dotenv_in_background_mode(tmp_path):
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("APP_IMAGE=dotenv:app\nEVAL_REPETITIONS=5\n")
+    _, given = parse_flags(["--background", *batch_flags(BATCH)])
+
+    values = background_values(given, {}, dotenv)
+
+    assert values["APP_IMAGE"] == BATCH["APP_IMAGE"]
+    assert values["EVAL_REPETITIONS"] == BATCH["EVAL_REPETITIONS"]
+
+
+def test_eval_launch_in_dotenv_prefills_the_launch_question(tmp_path, monkeypatch):
+    launch_setup(tmp_path, monkeypatch, DOTENV + "EVAL_LAUNCH=docker\n")
+    prefills = []
+
+    def select(message, choices, default):
+        prefills.append(default)
+        return _Answer("none")
+
+    monkeypatch.setattr(questionary, "select", select)
+
+    assert main() == 0
+
+    assert prefills == ["docker"]
+
+
+def test_eval_pull_app_image_in_dotenv_reaches_the_printed_commands(tmp_path, monkeypatch, capsys):
+    launch_setup(tmp_path, monkeypatch, DOTENV + "EVAL_PULL_APP_IMAGE=false\n")
+
+    assert main() == 0
+
+    out = capsys.readouterr().out
+    assert ";eval-pull-app-image=false;" in out
+    assert "--eval-pull-app-image=false " in out
+
+
+def test_an_invalid_dotenv_prefill_stops_the_default_mode_naming_it(tmp_path, monkeypatch, capsys):
+    for line, message in (
+        (
+            "EVAL_PULL_APP_IMAGE=yes\n",
+            "EVAL_PULL_APP_IMAGE from the shell or .env: one of true, false",
+        ),
+        ("EVAL_LAUNCH=local\n", "EVAL_LAUNCH from the shell or .env: one of vm, docker, none"),
+    ):
+        commands, asked = launch_setup(tmp_path, monkeypatch, DOTENV + line)
+
+        assert main() == 2
+
+        assert asked == []
+        assert commands.calls == []
+        assert capsys.readouterr().out == f"{message}\n"
+
+
+def test_background_mode_refuses_the_default_mode_only_flags(tmp_path, monkeypatch, capsys):
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
     commands = FakeCommands()
     monkeypatch.setattr(subprocess, "run", commands)
     monkeypatch.setattr(subprocess, "Popen", commands)
+    for extra in ("--eval-launch=vm", "--eval-configs-ref=main"):
+        try:
+            main(["--background", *batch_flags(BATCH), extra])
+        except SystemExit as exc:
+            assert exc.code == 2, extra
+        else:
+            raise AssertionError(f"expected SystemExit for {extra}")
+        assert f"only in the default mode: {extra.partition('=')[0]}" in capsys.readouterr().err
+    assert commands.calls == []
+
+
+def test_background_mode_without_a_value_exits_2_naming_it_and_nothing_runs(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    for name in [*BUILT_IN, *ANSWERS, *SETTINGS, *OPTIONAL_SETTINGS]:
+        monkeypatch.delenv(name, raising=False)
+    commands = FakeCommands()
+    monkeypatch.setattr(subprocess, "run", commands)
+    monkeypatch.setattr(subprocess, "Popen", commands)
+    argv = ["--background", *batch_flags({n: v for n, v in BATCH.items() if n != "EVAL_MODELS"})]
 
     try:
-        main(batch_flags({name: value for name, value in BATCH.items() if name != "EVAL_MODELS"}))
+        main(argv)
     except SystemExit as exc:
         assert exc.code == 2
     else:
         raise AssertionError("expected SystemExit")
+    assert "--eval-models" in capsys.readouterr().err
 
-    assert "the following arguments are required: --eval-models" in capsys.readouterr().err
+    # A value from the shell is checked as its flag would check it.
+    monkeypatch.setenv("EVAL_MODELS", ",")
+    try:
+        main(argv)
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("expected SystemExit")
+    assert "EVAL_MODELS from the shell or .env:" in capsys.readouterr().err
     assert commands.calls == []
 
 
-def test_an_invalid_flag_value_exits_2_naming_it_and_nothing_runs(monkeypatch, capsys):
+def test_background_values_come_from_the_flag_then_the_shell_then_the_default(tmp_path):
+    taken = ("EVAL_MODELS", "EVAL_REPETITIONS", "APP_IMAGE", "EVAL_MAX_TURNS")
+    background, given = parse_flags(
+        ["--background", *batch_flags({n: v for n, v in BATCH.items() if n not in taken})]
+    )
+    environ = {"EVAL_MODELS": " m-x , m-y ", "APP_IMAGE": "shell:app"}
+
+    values = background_values(given, environ, tmp_path / "missing")
+
+    assert background
+    assert values["EVAL_MODELS"] == "m-x,m-y"
+    assert values["APP_IMAGE"] == "shell:app"
+    assert values["EVAL_REPETITIONS"] == "1"
+    assert "EVAL_MAX_TURNS" not in values
+    assert {n: v for n, v in values.items() if n not in taken} == {
+        n: v for n, v in BATCH.items() if n not in taken
+    }
+
+
+def test_an_invalid_flag_value_exits_2_naming_it_and_nothing_runs(tmp_path, monkeypatch, capsys):
     commands = FakeCommands()
     monkeypatch.setattr(subprocess, "run", commands)
     monkeypatch.setattr(subprocess, "Popen", commands)
@@ -1462,22 +1766,29 @@ def test_an_invalid_flag_value_exits_2_naming_it_and_nothing_runs(monkeypatch, c
         ("EVAL_MODELS", ","),
         ("EVAL_IMAGE_TAG", ""),
         ("EVAL_CONFIGS_COMMIT", "main"),
+        ("EVAL_LAUNCH", "local"),
+        # Whitespace only is blank.
+        ("EVAL_DATASET", "  "),
     ):
-        try:
-            main(batch_flags({**BATCH, name: value}))
-        except SystemExit as exc:
-            assert exc.code == 2, name
-        else:
-            raise AssertionError(f"expected SystemExit for {name}")
-        assert f"argument {flag(name)}:" in capsys.readouterr().err, name
+        for background in ([], ["--background"]):
+            try:
+                main([*background, *batch_flags({**BATCH, name: value})])
+            except SystemExit as exc:
+                assert exc.code == 2, name
+            else:
+                raise AssertionError(f"expected SystemExit for {name}")
+            assert f"argument {flag(name)}:" in capsys.readouterr().err, name
     assert commands.calls == []
     # Spaces around a whole number are ignored, and an empty optional setting is left out.
-    parsed = parse_batch(batch_flags({**BATCH, "EVAL_REPETITIONS": " 2", "EVAL_MODEL_RETRIES": ""}))
-    assert parsed["EVAL_REPETITIONS"] == "2"
-    assert "EVAL_MODEL_RETRIES" not in parsed
+    _, given = parse_flags(
+        batch_flags({**BATCH, "EVAL_REPETITIONS": " 2", "EVAL_MODEL_RETRIES": ""})
+    )
+    values = background_values(given, {}, tmp_path / "missing")
+    assert values["EVAL_REPETITIONS"] == "2"
+    assert "EVAL_MODEL_RETRIES" not in values
 
 
-def test_an_unset_setting_stops_interactive_mode_before_asking(tmp_path, monkeypatch, capsys):
+def test_an_unset_setting_stops_the_default_mode_before_asking(tmp_path, monkeypatch, capsys):
     dotenv = DOTENV.replace("EVAL_DATASET=weather-eval-tasks\n", "")
     commands, asked = launch_setup(tmp_path, monkeypatch, dotenv)
 
@@ -1485,7 +1796,7 @@ def test_an_unset_setting_stops_interactive_mode_before_asking(tmp_path, monkeyp
 
     assert asked == []
     assert commands.calls == []
-    assert capsys.readouterr().out == "Not set in the shell or .env: EVAL_DATASET\n"
+    assert capsys.readouterr().out == "Not set by flag, in the shell or .env: EVAL_DATASET\n"
 
 
 def test_the_metadata_delimiter_is_one_no_value_holds():
@@ -1508,17 +1819,23 @@ def test_the_batch_settings_are_the_non_secret_settings_of_env_example():
     # EVAL_DOCKER_NETWORK is set by compose.yaml, EVAL_HARNESS_COMMIT by the image.
     assert commented == {
         *OPTIONAL_SETTINGS,
+        "EVAL_MODELS",
         "EVAL_PARALLEL_RUNS",
         "EVAL_IMAGE_TAG",
+        "EVAL_LAUNCH",
         "EVAL_DOCKER_NETWORK",
         "EVAL_HARNESS_COMMIT",
     }
 
 
-def noninteractive_setup(tmp_path, monkeypatch, **values):
+def background_setup(tmp_path, monkeypatch, **values):
     """ROOT at ``tmp_path``, each secret set in the environment and the configs
-    repo download faked; returns the fake commands, the flags of BATCH with
-    models a and b, one run at once, and ``values``, and the downloads made."""
+    repo download faked; returns the fake commands, --background and the flags
+    of BATCH with models a and b, one run at once, and ``values``, and the
+    downloads made."""
+    # An optional setting from the shell would be a batch value too.
+    for name in OPTIONAL_SETTINGS:
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setitem(globals(), "ROOT", tmp_path)
     monkeypatch.setitem(globals(), "new_batch", lambda: "2026-10-22T20:00:00Z")
     monkeypatch.setitem(globals(), "read_secret", no_secret_read)
@@ -1541,7 +1858,7 @@ def noninteractive_setup(tmp_path, monkeypatch, **values):
     commands = FakeCommands()
     monkeypatch.setattr(subprocess, "run", commands)
     values = {**BATCH, "EVAL_MODELS": "a,b", "EVAL_PARALLEL_RUNS": "1", **values}
-    return commands, batch_flags(values), downloads
+    return commands, ["--background", *batch_flags(values)], downloads
 
 
 def model_of(command):
@@ -1551,7 +1868,7 @@ def model_of(command):
 
 
 def test_the_batch_runs_each_model_once_per_round_and_saves_its_cost(tmp_path, monkeypatch, capsys):
-    commands, argv, downloads = noninteractive_setup(tmp_path, monkeypatch, EVAL_REPETITIONS="2")
+    commands, argv, downloads = background_setup(tmp_path, monkeypatch, EVAL_REPETITIONS="2")
     # A saved cost for a, from an earlier run.
     (tmp_path / COSTS_FILE).write_text(
         json.dumps({"a": {"served_model": "provider/model", "agent_cost_usd": 1.5}})
@@ -1616,7 +1933,7 @@ def test_the_batch_runs_each_model_once_per_round_and_saves_its_cost(tmp_path, m
 
 def test_sigterm_stops_the_batch_with_the_results_so_far(tmp_path, monkeypatch, capsys):
     install, previous = signal.signal, signal.getsignal(signal.SIGTERM)
-    _, argv, downloads = noninteractive_setup(tmp_path, monkeypatch)
+    _, argv, downloads = background_setup(tmp_path, monkeypatch)
     # The real handler, this once.
     monkeypatch.setattr(signal, "signal", install)
 

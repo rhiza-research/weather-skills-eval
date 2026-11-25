@@ -10,50 +10,43 @@ The harness never sends run data to LangWatch. Before Scenario starts, `run` rem
 
 ## Running
 
-Everything runs in Docker.
+Run evals with `scripts/run-eval.py`:
 
 ```sh
-cp .env.example .env        # fill in the harness settings and secrets
-HARNESS_COMMIT=$(git rev-parse HEAD) docker compose build eval
-git -C <configs repo checkout> archive <commit SHA> | docker compose run --rm -T --entrypoint sh \
-  -e EVAL_CONFIGS_REPO=<configs repo URL> -e EVAL_CONFIGS_COMMIT=<commit SHA> \
-  -e EVAL_CONFIGS_DIR=/configs-repo -e EVAL_MODEL=<model id> \
-  -e APP_IMAGE=<image> -e RUNNER_IMAGE=<image> [-e EVAL_CONCURRENCY=<n>] \
-  eval -c 'mkdir -p /configs-repo && tar -x -f - -C /configs-repo && exec weather-skills-eval run'
+cp .env.example .env        # fill in the harness settings; leave a secret empty to read it from Secret Manager
+uv run scripts/run-eval.py
 ```
 
-The configs repo files reach the run as a tar on stdin, which the container unpacks at `/configs-repo` before the harness starts, so it works with a remote Docker context, where a bind mount from this machine would not reach the daemon.
-
-`.env.example` sets `EVAL_PULL_APP_IMAGE=false`, so run `docker pull <APP_IMAGE>` first when running by hand. A batch (below) does all of this for you.
-
-`APP_IMAGE`, `RUNNER_IMAGE` and `EVAL_CONCURRENCY` are chosen per run with `-e`, as is `EVAL_BATCH`, optional. An empty or absent `EVAL_CONCURRENCY` means the harness's default. `EVAL_JUDGE_MODELS` and `EVAL_SIMULATED_USER_MODEL` are read from `.env` unless passed with `-e`.
+To run one model, run a batch with `--eval-models <id>`. To start one run by hand while debugging, see [Debugging one run](#debugging-one-run).
 
 ### A batch
 
-`scripts/run-eval.py` runs a batch of runs for the models you pick from one configs repo commit. It has two modes. Interactive mode, `uv run scripts/run-eval.py` with no arguments, runs on a member's machine: it asks its questions and prints two ways to launch the batch, on a new VM or on the current Docker context's host, and runs the one you pick. Non-interactive mode, with every batch value as a flag, runs in the eval image `ghcr.io/rhiza-research/weather-skills-eval` and runs the batch on the Docker host whose socket it has. Once launched, a batch depends on nothing on the member's machine, which can close. `uv run scripts/run-eval.py --help` lists the flags.
+`scripts/run-eval.py` runs a batch of runs for the models you pick from one configs repo commit. It has two modes, which take the same flags. The default mode, `uv run scripts/run-eval.py`, runs on a member's machine: it asks for each value given no flag, prints two ways to launch the batch, on a new VM or on the current Docker context's host, and runs the launch `EVAL_LAUNCH` names. Background mode, `--background`, asks nothing: it runs in the eval image `ghcr.io/rhiza-research/weather-skills-eval` and runs the batch on the Docker host whose socket it has. Once launched, a batch depends on nothing on the member's machine, which can close. `uv run scripts/run-eval.py --help` lists the flags.
 
 #### Batch values
 
-A batch is described by its batch values. A variable `NAME` is the flag `--name-lowercase-dashes` and the VM metadata key `name-lowercase-dashes` (`EVAL_IMAGE_TAG` is `--eval-image-tag` and `eval-image-tag`). They are:
+A batch is described by its batch values. A variable `NAME` is the flag `--name-lowercase-dashes` and the VM metadata key `name-lowercase-dashes` (`EVAL_IMAGE_TAG` is `--eval-image-tag` and `eval-image-tag`). Each value comes from its flag, else the shell, else `.env`, else its built-in default. They are:
 
 - The answers: `EVAL_CONFIGS_REPO`, `EVAL_CONFIGS_COMMIT` (the commit SHA), `EVAL_MODELS` (the model ids, comma-separated), `EVAL_JUDGE_MODELS`, `EVAL_SIMULATED_USER_MODEL`, `APP_IMAGE`, `RUNNER_IMAGE`, `EVAL_CONCURRENCY` (empty for the harness's default), `EVAL_REPETITIONS`, `EVAL_PARALLEL_RUNS`, `EVAL_PULL_APP_IMAGE` (`true` or `false`: whether the batch pulls `APP_IMAGE` once, before the runs) and `EVAL_IMAGE_TAG`, the eval image tag the batch runs in.
 - The non-secret settings `.env.example` sets: `EVAL_SECRETS_PROJECT`, `LANGFUSE_BASE_URL`, `LANGFUSE_TRACING_ENVIRONMENT`, `EVAL_CONNECTION_KEYS`, `EVAL_DATASET` and `EVAL_ADMIN_EMAIL`.
 - The settings `.env.example` leaves commented out, `EVAL_APP_START_TIMEOUT_SECONDS` to `EVAL_MAX_TURNS`, each only when set.
 
-Non-interactive mode has no defaults: a missing flag, other than those commented-out settings, or an invalid `EVAL_MODELS`, `EVAL_REPETITIONS`, `EVAL_PARALLEL_RUNS` or `EVAL_PULL_APP_IMAGE` exits 2, naming it, before anything runs.
+The built-in defaults are `ghcr.io/rhiza-research/weather-skills-chat:prod` for `APP_IMAGE`, `ghcr.io/rhiza-research/weather-skills-sandbox-runner:prod` for `RUNNER_IMAGE`, blank for `EVAL_CONCURRENCY`, 1 for `EVAL_REPETITIONS` and `EVAL_PARALLEL_RUNS`, `true` for `EVAL_PULL_APP_IMAGE`, `main` for `EVAL_IMAGE_TAG`, and, in the default mode only, `main` for `EVAL_CONFIGS_REF` and `vm` for `EVAL_LAUNCH`; the others have none. An invalid flag value, such as `--eval-repetitions 0`, or a value of only whitespace where one is required, exits 2, naming the flag, before anything runs. Secrets are never flags (see below).
 
-#### Interactive mode
+#### The default mode
 
-1. When `EVAL_JUDGE_MODELS` names no judge model in the shell or `.env`, it prints `EVAL_JUDGE_MODELS names no judge model; set it in the shell or .env` and exits 2 before asking anything. When one of the non-secret settings above is set in neither, it prints `Not set in the shell or .env: <names>` and exits 2.
-2. It asks for `EVAL_CONFIGS_REPO`, an HTTPS URL prefilled from the shell, else from `.env`, and a ref, default `main`: a branch, a tag or a full commit SHA. It fetches that ref with `git fetch --depth 1` into a new repository in a temporary folder, with this machine's git access, checks it out there, and prints `Configs <repo> at <ref> is commit <SHA>`. A failed git command prints its error and exits 1. It offers the ids of the commit's model files as a checklist; none picked exits 0. It removes the folder once it has asked its questions. Then it offers the judge models `EVAL_JUDGE_MODELS` names in the shell, else in `.env` (comma-separated; spaces trimmed, empty names and repeats dropped), as a checklist with each ticked. At least one must be picked.
-3. It asks for `EVAL_SIMULATED_USER_MODEL`, `APP_IMAGE`, `RUNNER_IMAGE` and `EVAL_CONCURRENCY`, each prefilled from the shell, else from `.env`, else from its default: blank for the simulated user model, `ghcr.io/rhiza-research/weather-skills-chat:prod`, `ghcr.io/rhiza-research/weather-skills-sandbox-runner:prod`, and blank for the concurrency. A blank simulated user model is not accepted.
-4. It asks for the number of repetitions, a whole number of at least 1, default 1, and "Runs at once:", how many runs the batch keeps going at once, a whole number of at least 1, prefilled from `EVAL_PARALLEL_RUNS` in the shell, else in `.env`, else 1.
-5. It prints the batch's estimated cost (see [Cost estimate](#cost-estimate)), then asks "Pull the app image?", default yes, and for `EVAL_IMAGE_TAG`, prefilled from the shell, else from `.env`, else `main`.
-6. It prints the two launch commands, with every batch value, and asks "Launch:": "On a new VM", "On the current Docker context's host" or "Neither".
+The default mode also takes two values that are not batch values: `EVAL_CONFIGS_REF`, the configs ref, and `EVAL_LAUNCH`, the launch: `vm`, `docker` or `none`. A flag skips its question; every other value is asked, prefilled from the shell, else `.env`, else its built-in default. A prefill from the shell or `.env` that its flag would refuse, such as `EVAL_PULL_APP_IMAGE=yes`, prints `<NAME> from the shell or .env: <why>` and exits 2 before asking anything. With every value as a flag, nothing is asked. A `--eval-judge-models` flag is trimmed as `EVAL_JUDGE_MODELS` in `.env` is (spaces trimmed, empty names and repeats dropped); one naming no model exits 2.
 
-The VM launch is two commands, `gcloud compute instances create weather-skills-eval-<UTC time> --zone us-central1-a --source-instance-template weather-skills-eval`, then `gcloud compute instances add-metadata weather-skills-eval-<UTC time> --zone us-central1-a --metadata ^;^<key>=<value>;...` with every batch value. The create command has no `--metadata`, since that would replace the template's metadata, its cloud-init included; `add-metadata` adds to it. The metadata list is split on the first of `;`, `|`, `#` and `~` that no value holds (`gcloud topic escaping`). On "On a new VM", it runs the two commands; a failed one prints `Failed, exit <code>: <command>` after gcloud's own error and exits with its code, and the second is not run. Then it prints the VM's name and `Stop it with: gcloud compute instances delete <VM> --zone us-central1-a`. Neither command reads a secret: the VM reads them itself.
+1. When `EVAL_JUDGE_MODELS` has no flag and names no judge model in the shell or `.env`, it prints `EVAL_JUDGE_MODELS names no judge model; set it in the shell or .env` and exits 2 before asking anything. When one of the non-secret settings above has no flag and is set in neither, it prints `Not set by flag, in the shell or .env: <names>` and exits 2.
+2. It asks for `EVAL_CONFIGS_REPO`, an HTTPS URL, and the ref (`EVAL_CONFIGS_REF`): a branch, a tag or a full commit SHA. It fetches that ref with `git fetch --depth 1` into a new repository in a temporary folder, with this machine's git access, checks it out there, and prints `Configs <repo> at <ref> is commit <SHA>`. A failed git command prints its error and exits 1. A `--eval-configs-commit` flag skips the ref question: the commit is used as is, and fetched the same way, so a commit the repo lacks exits 1 before the launch. It offers the ids of the commit's model files as a checklist, each ticked when `EVAL_MODELS` in the shell or `.env` names it; none picked exits 0. A `--eval-models` flag naming an id that is not one of them prints `Not a model of commit <SHA>: <ids>` and exits 2. It removes the folder once it has asked its questions. Then it offers the judge models `EVAL_JUDGE_MODELS` names in the shell, else in `.env` (comma-separated; spaces trimmed, empty names and repeats dropped), as a checklist with each ticked. At least one must be picked.
+3. It asks for `EVAL_SIMULATED_USER_MODEL`, `APP_IMAGE`, `RUNNER_IMAGE` and `EVAL_CONCURRENCY`. A blank simulated user model is not accepted.
+4. It asks for the number of repetitions (`EVAL_REPETITIONS`) and "Runs at once:" (`EVAL_PARALLEL_RUNS`), how many runs the batch keeps going at once, each a whole number of at least 1.
+5. It prints the batch's estimated cost (see [Cost estimate](#cost-estimate)), then asks "Pull the app image?" (`EVAL_PULL_APP_IMAGE`) and for `EVAL_IMAGE_TAG`.
+6. It prints the two launch commands, with every batch value, and asks last for `EVAL_LAUNCH`: "On a new VM" (`vm`), "On the current Docker context's host" (`docker`) or "Neither" (`none`). With `none` it only prints the commands.
 
-The local launch is `docker run --detach --rm --pull always --name weather-skills-eval-batch --stop-timeout 120 --volume /var/run/docker.sock:/var/run/docker.sock -e <secret>... ghcr.io/rhiza-research/weather-skills-eval:<EVAL_IMAGE_TAG> /opt/run-eval/bin/python /app/scripts/run-eval.py --<flag>=<value>...`. The socket is the Docker host's own, so no path from this machine is mounted and a remote Docker context works. On "On the current Docker context's host":
+The VM launch is two commands, `gcloud compute instances create weather-skills-eval-<UTC time> --zone us-central1-a --source-instance-template weather-skills-eval`, then `gcloud compute instances add-metadata weather-skills-eval-<UTC time> --zone us-central1-a --metadata ^;^<key>=<value>;...` with every batch value. The create command has no `--metadata`, since that would replace the template's metadata, its cloud-init included; `add-metadata` adds to it. The metadata list is split on the first of `;`, `|`, `#` and `~` that no value holds (`gcloud topic escaping`). With `vm`, it runs the two commands; a failed one prints `Failed, exit <code>: <command>` after gcloud's own error and exits with its code, and the second is not run. Then it prints the VM's name and `Stop it with: gcloud compute instances delete <VM> --zone us-central1-a`. Neither command reads a secret: the VM reads them itself.
+
+The local launch is `docker run --detach --rm --pull always --name weather-skills-eval-batch --stop-timeout 120 --volume /var/run/docker.sock:/var/run/docker.sock -e <secret>... ghcr.io/rhiza-research/weather-skills-eval:<EVAL_IMAGE_TAG> /opt/run-eval/bin/python /app/scripts/run-eval.py --background --<flag>=<value>...`. The socket is the Docker host's own, so no path from this machine is mounted and a remote Docker context works. With `docker`:
 
 1. When the container `weather-skills-eval-batch` exists on the Docker host, it prints `A batch is running: container weather-skills-eval-batch` and `Stop it with: docker stop weather-skills-eval-batch` and exits 1, starting nothing. One batch runs at a time on a Docker host.
 2. It takes `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `OPENROUTER_API_KEY`, `APP_WEBUI_SECRET_KEY`, `APP_ADMIN_PASSWORD`, `APP_ADMIN_API_KEY`, and each variable `EVAL_CONNECTION_KEYS` names, from the shell, else from `.env`. Each one left empty is read from Secret Manager in the project `EVAL_SECRETS_PROJECT` names: the latest version of the secret `weather-skills-eval-<name>` (the variable name lowercased, underscores as dashes: `APP_OPENROUTER_API_KEY` is `weather-skills-eval-app-openrouter-api-key`), with the application default credentials: run `gcloud auth application-default login` first. A secret that cannot be read exits 1, naming it, before the batch starts.
@@ -63,11 +56,11 @@ A printed `docker run` command run by hand takes each secret it names from the s
 
 `docker stop weather-skills-eval-batch` stops the batch (see below) and removes the container.
 
-#### Non-interactive mode
+#### Background mode
 
-It runs in the eval image, with each secret in its environment or none, and removes the configs repo files and their tar when it ends. It:
+It runs in the eval image, with each secret in its environment or none, and removes the configs repo files and their tar when it ends. It asks nothing: a required batch value with no flag, shell or `.env` value or built-in default, or a shell or `.env` value its flag would refuse, exits 2, naming it, before anything runs. `EVAL_CONCURRENCY` may be empty, and so may each commented-out setting, which is then left out. `--eval-launch` and `--eval-configs-ref`, of the default mode only, exit 2, naming them. It:
 
-1. Takes each secret interactive mode takes from its environment. Each one left empty is read from Secret Manager in the project `EVAL_SECRETS_PROJECT` names, with the application default credentials. That works only on a batch VM, through its service account: the container has no Google login elsewhere. A local launch needs each secret set in the shell or `.env`, or read by interactive mode, which passes it in. A secret that cannot be read ends the batch, naming it, before any run starts.
+1. Takes each secret the default mode takes from its environment. Each one left empty is read from Secret Manager in the project `EVAL_SECRETS_PROJECT` names, with the application default credentials. That works only on a batch VM, through its service account: the container has no Google login elsewhere. A local launch needs each secret set in the shell or `.env`, or read by the default mode, which passes it in. A secret that cannot be read ends the batch, naming it, before any run starts.
 2. Downloads the files of `EVAL_CONFIGS_REPO`, which must be `https://github.com/<owner>/<repo>`, at `EVAL_CONFIGS_COMMIT` through GitHub's tarball API, without git or a token, so the repo must be public. A failed download ends the batch.
 3. Pulls `APP_IMAGE` with `docker pull` when `EVAL_PULL_APP_IMAGE` is `true`, and reads the app image's labels `org.opencontainers.image.revision` and `weather-skills-chat.pr-number` (absent on an image not built for a PR) with `docker image inspect`. A failed command ends the batch.
 4. Prints `Batch <batch id>`, the batch id being the UTC time (`2026-10-22T20:07:57Z`), and queues the models in rounds, each model once per round, as many rounds as the repetitions, and starts them in that order, keeping the runs at once going: when one ends, the next starts. Each run is `docker compose run --rm -T --entrypoint sh` of the eval service, in the eval image of `EVAL_IMAGE_TAG` (compose's `EVAL_IMAGE`), already on the Docker host, with the command `-c 'mkdir -p /configs-repo && tar -x -f - -C /configs-repo && exec weather-skills-eval run'`, given on stdin a tar of the configs repo files, written once, so no host path is mounted. Each run gets with `-e` every batch value but `EVAL_MODELS`, `EVAL_REPETITIONS`, `EVAL_PARALLEL_RUNS` and `EVAL_IMAGE_TAG`, with `EVAL_PULL_APP_IMAGE=false`, and `EVAL_BATCH`, `EVAL_CONFIGS_DIR=/configs-repo`, `EVAL_APP_IMAGE_REVISION` and `EVAL_APP_IMAGE_PR_NUMBER` (empty when the label is absent), and `EVAL_MODEL`, the run's model id. Each secret is passed by name only.
@@ -79,7 +72,7 @@ SIGTERM, which `docker stop` sends, stops the batch: it starts no further run, s
 
 #### A batch VM
 
-The infrastructure repository's instance template `weather-skills-eval` (Container-Optimized OS) runs a batch with no SSH session. At boot its cloud-init blocks containers on Docker bridge networks from the metadata server's HTTP port, waits until the metadata key `eval-image-tag` exists, and reads every metadata key but `user-data` and `ssh-keys`. `add-metadata` adds every key at once, so the others are there by then. It runs the eval image of that tag as the container `weather-skills-eval-batch`, with the host network and the Docker socket, with the command `/opt/run-eval/bin/python /app/scripts/run-eval.py`, non-interactive mode, given each key as `--<key>=<value>`. When the container exits, with any exit code, a missing value included, cloud-init deletes the VM through the Compute Engine API with the VM's service account, and also when the metadata could not be read. A failed delete is printed on the VM's serial console. The template's maximum run duration, 24 hours, deletes a VM whose batch never ends or whose `eval-image-tag` is never set. The batch's output is on the serial console while the VM lives.
+The infrastructure repository's instance template `weather-skills-eval` (Container-Optimized OS) runs a batch with no SSH session. At boot its cloud-init blocks containers on Docker bridge networks from the metadata server's HTTP port, waits until the metadata key `eval-image-tag` exists, and reads every metadata key but `user-data` and `ssh-keys`. `add-metadata` adds every key at once, so the others are there by then. It runs the eval image of that tag as the container `weather-skills-eval-batch`, with the host network and the Docker socket, with the command `/opt/run-eval/bin/python /app/scripts/run-eval.py --background`, background mode, given each key as `--<key>=<value>`. When the container exits, with any exit code, a missing value included, cloud-init deletes the VM through the Compute Engine API with the VM's service account, and also when the metadata could not be read. A failed delete is printed on the VM's serial console. The template's maximum run duration, 24 hours, deletes a VM whose batch never ends or whose `eval-image-tag` is never set. The batch's output is on the serial console while the VM lives.
 
 #### The eval image
 
@@ -104,7 +97,7 @@ The finished line gives the task's outcome (see [Outcomes](#outcomes)), followed
 {"weather-agent-opus": {"served_model": "anthropic/claude-opus-5.5", "agent_cost_usd": 1.23}}
 ```
 
-`run-eval.py` writes it from the cost line each run's summary ends with, and is the only reader. Non-interactive mode writes it in the batch container, where it goes with the container; interactive mode reads the one at the repository root of the checkout it runs in. Only a run that prints its model's cost line, one that exits 0, updates it; a failed run leaves that model's saved cost as it was. The estimate for the batch is printed as one line, with the agents' cost and the judges' and simulated user's cost apart:
+`run-eval.py` writes it from the cost line each run's summary ends with, and is the only reader. Background mode writes it in the batch container, where it goes with the container; the default mode reads the one at the repository root of the checkout it runs in. Only a run that prints its model's cost line, one that exits 0, updates it; a failed run leaves that model's saved cost as it was. The estimate for the batch is printed as one line, with the agents' cost and the judges' and simulated user's cost apart:
 
 ```
 Estimated cost: $4.29 (agents $3.00, judges and simulated user $1.29)
@@ -158,6 +151,7 @@ A run's summary on stdout ends with its cost line, after the experiment URL: `Co
 ### Deleting a run
 
 ```sh
+docker compose build eval
 docker compose run --rm -it eval delete <experiment-id>
 docker compose run --rm eval delete --yes <experiment-id>
 ```
@@ -202,7 +196,7 @@ Once the app answers `/health`, as a platform admin (`X-Organization-Id: platfor
 
 ## Harness settings
 
-`.env.example` lists them. `EVAL_CONCURRENCY`, `EVAL_JUDGE_MODELS` and `EVAL_SIMULATED_USER_MODEL` are chosen per run (see [Running](#running)). `EVAL_SIMULATED_USER_MODEL` is the simulated user's model. `EVAL_JUDGE_MODELS` is the judge panel: one or more models, comma-separated; spaces around a name are ignored, and an empty name or a model named twice stops the run. Each experiment records both, and a `comparability_hash` that matches only between runs graded the same way (see [Scores](#scores)). `EVAL_SIMULATED_USER_MODEL` must accept image input: the simulated user is shown the presented images. Each judge model must accept image input when a task has an `image` deliverable: each judge's verdict call holds the presented images (see [Judging](#judging)). Each of their calls is a Langfuse trace with user id `simulated-user` or `judge`, session id = the chat id, in the environment set by `LANGFUSE_TRACING_ENVIRONMENT`, which must not be `production`.
+`.env.example` lists them. `EVAL_CONCURRENCY`, `EVAL_JUDGE_MODELS` and `EVAL_SIMULATED_USER_MODEL` are chosen per batch (see [A batch](#a-batch)). `EVAL_SIMULATED_USER_MODEL` is the simulated user's model. `EVAL_JUDGE_MODELS` is the judge panel: one or more models, comma-separated; spaces around a name are ignored, and an empty name or a model named twice stops the run. Each experiment records both, and a `comparability_hash` that matches only between runs graded the same way (see [Scores](#scores)). `EVAL_SIMULATED_USER_MODEL` must accept image input: the simulated user is shown the presented images. Each judge model must accept image input when a task has an `image` deliverable: each judge's verdict call holds the presented images (see [Judging](#judging)). Each of their calls is a Langfuse trace with user id `simulated-user` or `judge`, session id = the chat id, in the environment set by `LANGFUSE_TRACING_ENVIRONMENT`, which must not be `production`.
 
 Every simulated-user and judge call, including the answer-quality rating, sends `max_tokens` = `EVAL_MODEL_MAX_TOKENS` (a whole number, at least 1, default 16384) unless the call sets its own `max_tokens` or `max_completion_tokens`; a call that sets `max_completion_tokens` and no `max_tokens` is sent without `max_tokens`. Without a limit, OpenRouter reserves the model's whole output window against the account balance and refuses calls with HTTP 402 when the balance is low. A simulated-user reply cut off at that limit stops the play as `error`, naming the limit; a judge's verdict cut off at that limit makes that judge errored, naming the limit, and the play ends as `error` only when no judge ruled (see [Judging](#judging)); a cut-off answer-quality rating does not stop the play, and `answer_quality` is recorded as not rated.
 
@@ -309,6 +303,25 @@ The experiment's metadata holds the resolved configuration: the model id as `con
 After reading the base model and before the plays, the harness sends one short request for it to OpenRouter with its own `OPENROUTER_API_KEY` (not the app's key), retried as `EVAL_MODEL_RETRIES` says and, when rate-limited, as `EVAL_RATE_LIMIT_RETRIES` says, and names the experiment after the model named in the reply, recorded in the metadata as `served_model`, followed by ` (<variant>)` when the model's `eval.variant` is set; the base model must therefore be an OpenRouter model id. A floating alias such as `~anthropic/claude-opus-latest` resolves this way to the model it points to, such as `anthropic/claude-opus-5.5`, as it was when the run started. When that request fails, or its reply names no model or only the alias, the run stops before the experiment is created (exit 1). The models that served each play's calls are in each item's `provider_models`.
 
 A run plays each task once: Langfuse expects each dataset item to appear once per experiment (Langfuse issue #5855).
+
+## Debugging one run
+
+To debug, one run of one model can be started by hand, without `scripts/run-eval.py`:
+
+```sh
+HARNESS_COMMIT=$(git rev-parse HEAD) docker compose build eval
+git -C <configs repo checkout> archive <commit SHA> | docker compose run --rm -T --entrypoint sh \
+  -e EVAL_CONFIGS_REPO=<configs repo URL> -e EVAL_CONFIGS_COMMIT=<commit SHA> \
+  -e EVAL_CONFIGS_DIR=/configs-repo -e EVAL_MODEL=<model id> \
+  -e APP_IMAGE=<image> -e RUNNER_IMAGE=<image> [-e EVAL_CONCURRENCY=<n>] \
+  eval -c 'mkdir -p /configs-repo && tar -x -f - -C /configs-repo && exec weather-skills-eval run'
+```
+
+The configs repo files reach the run as a tar on stdin, which the container unpacks at `/configs-repo` before the harness starts, so it works with a remote Docker context, where a bind mount from this machine would not reach the daemon.
+
+With `EVAL_PULL_APP_IMAGE=true`, as `.env.example` sets it, the run pulls the app image before it starts. A run started this way reads every secret from `.env`, since only `scripts/run-eval.py` reads Secret Manager.
+
+`APP_IMAGE`, `RUNNER_IMAGE` and `EVAL_CONCURRENCY` are chosen per run with `-e`, as is `EVAL_BATCH`, optional. An empty or absent `EVAL_CONCURRENCY` means the harness's default. `EVAL_JUDGE_MODELS` and `EVAL_SIMULATED_USER_MODEL` are read from `.env` unless passed with `-e`.
 
 ## Development
 
