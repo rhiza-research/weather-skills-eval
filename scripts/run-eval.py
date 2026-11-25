@@ -146,8 +146,6 @@ SECRETS = (
     "APP_ADMIN_PASSWORD",
     "APP_ADMIN_API_KEY",
 )
-# The secrets the batch needs and no run does: the configs repo read token.
-BATCH_SECRETS = ("GIT_READ_TOKEN",)
 # Secret Manager secret id of an environment variable: this prefix, then the
 # name lowercased with underscores as dashes. Shared with the VM's Terraform.
 SECRET_PREFIX = "weather-skills-eval-"
@@ -334,9 +332,9 @@ def _open(request):
     return urllib.request.urlopen(request, timeout=120)
 
 
-def download_configs(url, commit, token, folder):
-    """Downloads the files of the GitHub repository ``url`` at ``commit`` with
-    the read token ``token``, through GitHub's tarball API, into ``folder``.
+def download_configs(url, commit, folder):
+    """Downloads the files of the public GitHub repository ``url`` at
+    ``commit``, through GitHub's tarball API, into ``folder``.
     Returns the folder holding them, or None after printing why it failed."""
     path = github_repo(url)
     if path is None:
@@ -345,9 +343,6 @@ def download_configs(url, commit, token, folder):
         f"https://api.github.com/repos/{path}/tarball/{commit}",
         headers={"Accept": "application/vnd.github+json"},
     )
-    # Unredirected: GitHub sends the download to codeload.github.com with its
-    # own token in the URL, and the read token never follows a redirect.
-    request.add_unredirected_header("Authorization", f"Bearer {token}")
     try:
         with _open(request) as response, tarfile.open(fileobj=response, mode="r|gz") as tar:
             # "data" refuses absolute paths, links out of the folder and device files.
@@ -615,7 +610,7 @@ def run_interactive():
 
 def launch(values, dotenv):
     """Prints the batch's two launch commands and runs the one picked."""
-    secrets = [*run_secrets(values["EVAL_CONNECTION_KEYS"]), *BATCH_SECRETS]
+    secrets = run_secrets(values["EVAL_CONNECTION_KEYS"])
     vm = vm_name(datetime.now(UTC))
     try:
         gcloud = vm_commands(vm, values)
@@ -826,14 +821,9 @@ def run_batch(values, folder, results):
     run`` of the eval service in the eval image this batch runs."""
     # Each secret is passed by name, so its value is never on a command line.
     secrets = run_secrets(values["EVAL_CONNECTION_KEYS"])
-    if load_secrets([*secrets, *BATCH_SECRETS], values["EVAL_SECRETS_PROJECT"], {}) is None:
+    if load_secrets(secrets, values["EVAL_SECRETS_PROJECT"], {}) is None:
         return 1
-    files = download_configs(
-        values["EVAL_CONFIGS_REPO"],
-        values["EVAL_CONFIGS_COMMIT"],
-        os.environ["GIT_READ_TOKEN"],
-        folder,
-    )
+    files = download_configs(values["EVAL_CONFIGS_REPO"], values["EVAL_CONFIGS_COMMIT"], folder)
     if files is None:
         return 1
     if values["EVAL_PULL_APP_IMAGE"] == "true":
@@ -1250,7 +1240,7 @@ BATCH = {
     "EVAL_MAX_TURNS": "5",
 }
 # The secrets a batch of BATCH needs.
-BATCH_SECRET_NAMES = [*SECRETS, "APP_OPENROUTER_API_KEY", "GIT_READ_TOKEN"]
+BATCH_SECRET_NAMES = [*SECRETS, "APP_OPENROUTER_API_KEY"]
 
 
 def launch_setup(tmp_path, monkeypatch, dotenv, outputs=(), choice=NO_LAUNCH):
@@ -1507,7 +1497,7 @@ def test_the_metadata_delimiter_is_one_no_value_holds():
 def test_the_batch_settings_are_the_non_secret_settings_of_env_example():
     text = (Path(__file__).resolve().parent.parent / ".env.example").read_text()
     uncommented = dotenv_values(stream=io.StringIO(text), interpolate=False)
-    secrets = {*run_secrets(uncommented["EVAL_CONNECTION_KEYS"]), *BATCH_SECRETS}
+    secrets = set(run_secrets(uncommented["EVAL_CONNECTION_KEYS"]))
     names = {name for name in uncommented if name not in secrets}
     assert set(SETTINGS) <= names <= {*ANSWERS, *SETTINGS}
     commented = {
@@ -1540,8 +1530,8 @@ def noninteractive_setup(tmp_path, monkeypatch, **values):
         monkeypatch.setenv(name, f"test-{name}")
     downloads = []
 
-    def download(url, commit, token, folder):
-        downloads.append((url, commit, token, folder))
+    def download(url, commit, folder):
+        downloads.append((url, commit, folder))
         files = Path(folder) / "rhiza-research-weather-skills-configs-ccccccc"
         files.mkdir()
         (files / "settings.yaml").write_text("schema_version: 1\n")
@@ -1585,9 +1575,9 @@ def test_the_batch_runs_each_model_once_per_round_and_saves_its_cost(tmp_path, m
 
     assert main(argv) == 1
 
-    # The configs repo files at the commit, read with the read token.
-    [(url, commit, token, folder)] = downloads
-    assert (url, commit, token) == (REPO_URL, CONFIGS_COMMIT, "test-GIT_READ_TOKEN")
+    # The configs repo files at the commit.
+    [(url, commit, folder)] = downloads
+    assert (url, commit) == (REPO_URL, CONFIGS_COMMIT)
     pull, inspect = commands.commands()
     assert pull == ["docker", "pull", DEFAULTS["APP_IMAGE"]]
     assert inspect[-1] == DEFAULTS["APP_IMAGE"]
@@ -1600,10 +1590,10 @@ def test_the_batch_runs_each_model_once_per_round_and_saves_its_cost(tmp_path, m
         "EVAL_APP_IMAGE_REVISION": "8dd46ed4",
         "EVAL_APP_IMAGE_PR_NUMBER": "42",
     }
-    # No host path is mounted into a run, and the read token is not passed.
+    # No host path is mounted into a run.
     command = ["docker", "compose", "run", "--rm", "-T", "--entrypoint", "sh"]
     command += env_args(values)
-    command += [arg for name in [*SECRETS, "APP_OPENROUTER_API_KEY"] for arg in ("-e", name)]
+    command += [arg for name in BATCH_SECRET_NAMES for arg in ("-e", name)]
     # Two rounds of every model.
     assert [run for run, _ in runs] == [
         [*command, "-e", f"EVAL_MODEL={model}", "eval", "-c", UNPACK_AND_RUN]
@@ -1644,12 +1634,10 @@ def test_sigterm_stops_the_batch_with_the_results_so_far(tmp_path, monkeypatch, 
         install(signal.SIGTERM, previous)
 
     assert capsys.readouterr().out.endswith("\nStopped. Results so far:\na run 1: exit 0\n")
-    assert not Path(downloads[0][3]).exists()
+    assert not Path(downloads[0][2]).exists()
 
 
-def test_the_configs_repo_files_are_downloaded_at_the_commit_with_the_token(
-    tmp_path, monkeypatch, capsys
-):
+def test_the_configs_repo_files_are_downloaded_at_the_commit(tmp_path, monkeypatch, capsys):
     data = b"schema_version: 1\n"
     tarball = io.BytesIO()
     with tarfile.open(fileobj=tarball, mode="w:gz") as tar:
@@ -1665,33 +1653,17 @@ def test_the_configs_repo_files_are_downloaded_at_the_commit_with_the_token(
 
     monkeypatch.setitem(globals(), "_open", fake_open)
 
-    files = download_configs(f"{REPO_URL}.git", CONFIGS_COMMIT, "t0ken", tmp_path / "configs")
+    files = download_configs(f"{REPO_URL}.git", CONFIGS_COMMIT, tmp_path / "configs")
 
     assert (files / "settings.yaml").read_bytes() == data
     [request] = requests
     assert request.full_url == (
         f"https://api.github.com/repos/rhiza-research/weather-skills-configs/tarball/{CONFIGS_COMMIT}"
     )
-    assert download_configs("https://example.com/a/b", CONFIGS_COMMIT, "t0ken", tmp_path) is None
+    assert not request.has_header("Authorization")
+    assert download_configs("https://example.com/a/b", CONFIGS_COMMIT, tmp_path) is None
     assert "is not https://github.com/<owner>/<repo>" in capsys.readouterr().out
     assert len(requests) == 1
-
-
-def test_the_read_token_is_an_unredirected_header(tmp_path, monkeypatch):
-    requests = []
-
-    def fake_open(request):
-        requests.append(request)
-        raise OSError("offline")
-
-    monkeypatch.setitem(globals(), "_open", fake_open)
-
-    assert download_configs(REPO_URL, CONFIGS_COMMIT, "t0ken", tmp_path) is None
-
-    [request] = requests
-    # urllib copies only request.headers to a redirect's request.
-    assert request.unredirected_hdrs == {"Authorization": "Bearer t0ken"}
-    assert "Authorization" not in request.headers
 
 
 def test_read_secret_reads_the_latest_version_and_strips_it(monkeypatch):
