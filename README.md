@@ -8,16 +8,16 @@ The harness talks to the app only over HTTP and Docker. Fetches use live data.
 
 The harness never sends run data to LangWatch. Before Scenario starts, `run` removes every casing of `LANGWATCH_API_KEY` from the harness's environment, so Scenario neither posts its run events nor exports its spans to LangWatch.
 
-## Running
+## Running an eval
 
-Run evals with `scripts/run-eval.py`:
+An eval tests one build of the chat app with one or more models from the configs repo. Each model's run plays every task of the dataset.
 
-```sh
-cp .env.example .env        # fill in the harness settings; leave a secret empty to read it from Secret Manager
-uv run scripts/run-eval.py
-```
+1. Copy the settings file once: `cp .env.example .env`. Leave a secret empty to read it from Secret Manager.
+2. Run `uv run scripts/run-eval.py`. It asks for each value, such as the models and the app image to test, prefilled with a default. It prints the estimated cost, and last asks where to run the batch: on a VM it creates for this batch, on your Docker host, or neither, which only prints the commands. A launch on your Docker host needs `gcloud auth application-default login` first.
+3. On a VM, it prints the VM's name and two commands: one to view the batch's output, and one to stop the VM. The VM deletes itself when the batch ends. The batch keeps running when you close your machine.
+4. Each run's results are a Langfuse experiment, named after the model that answered, followed by the model's variant in parentheses when it sets one. The runs of one batch record the same `batch` in their metadata.
 
-To run one model, run a batch with `--eval-models <id>`. To start one run by hand while debugging, see [Debugging one run](#debugging-one-run).
+To change a default, set its value in `.env`, such as `APP_IMAGE`, `RUNNER_IMAGE` or `EVAL_MODELS` (see [Batch values](#batch-values)). To start one run by hand while debugging, see [Debugging one run](#debugging-one-run). The sections below describe each step in detail.
 
 ### A batch
 
