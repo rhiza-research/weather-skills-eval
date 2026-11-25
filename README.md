@@ -10,23 +10,14 @@ The harness never sends run data to LangWatch. Before Scenario starts, `run` rem
 
 ## Running
 
-Everything runs in Docker.
+Run evals with `scripts/run-eval.py`:
 
 ```sh
-cp .env.example .env        # fill in the harness settings and secrets
-HARNESS_COMMIT=$(git rev-parse HEAD) docker compose build eval
-git -C <configs repo checkout> archive <commit SHA> | docker compose run --rm -T --entrypoint sh \
-  -e EVAL_CONFIGS_REPO=<configs repo URL> -e EVAL_CONFIGS_COMMIT=<commit SHA> \
-  -e EVAL_CONFIGS_DIR=/configs-repo -e EVAL_MODEL=<model id> \
-  -e APP_IMAGE=<image> -e RUNNER_IMAGE=<image> [-e EVAL_CONCURRENCY=<n>] \
-  eval -c 'mkdir -p /configs-repo && tar -x -f - -C /configs-repo && exec weather-skills-eval run'
+cp .env.example .env        # fill in the harness settings; leave a secret empty to read it from Secret Manager
+uv run scripts/run-eval.py
 ```
 
-The configs repo files reach the run as a tar on stdin, which the container unpacks at `/configs-repo` before the harness starts, so it works with a remote Docker context, where a bind mount from this machine would not reach the daemon.
-
-`.env.example` sets `EVAL_PULL_APP_IMAGE=true`, so a run by hand pulls the app image before it starts. A batch (below) does all of this for you.
-
-`APP_IMAGE`, `RUNNER_IMAGE` and `EVAL_CONCURRENCY` are chosen per run with `-e`, as is `EVAL_BATCH`, optional. An empty or absent `EVAL_CONCURRENCY` means the harness's default. `EVAL_JUDGE_MODELS` and `EVAL_SIMULATED_USER_MODEL` are read from `.env` unless passed with `-e`.
+To run one model, run a batch with `--eval-models <id>`. To start one run by hand while debugging, see [Debugging one run](#debugging-one-run).
 
 ### A batch
 
@@ -160,6 +151,7 @@ A run's summary on stdout ends with its cost line, after the experiment URL: `Co
 ### Deleting a run
 
 ```sh
+docker compose build eval
 docker compose run --rm -it eval delete <experiment-id>
 docker compose run --rm eval delete --yes <experiment-id>
 ```
@@ -204,7 +196,7 @@ Once the app answers `/health`, as a platform admin (`X-Organization-Id: platfor
 
 ## Harness settings
 
-`.env.example` lists them. `EVAL_CONCURRENCY`, `EVAL_JUDGE_MODELS` and `EVAL_SIMULATED_USER_MODEL` are chosen per run (see [Running](#running)). `EVAL_SIMULATED_USER_MODEL` is the simulated user's model. `EVAL_JUDGE_MODELS` is the judge panel: one or more models, comma-separated; spaces around a name are ignored, and an empty name or a model named twice stops the run. Each experiment records both, and a `comparability_hash` that matches only between runs graded the same way (see [Scores](#scores)). `EVAL_SIMULATED_USER_MODEL` must accept image input: the simulated user is shown the presented images. Each judge model must accept image input when a task has an `image` deliverable: each judge's verdict call holds the presented images (see [Judging](#judging)). Each of their calls is a Langfuse trace with user id `simulated-user` or `judge`, session id = the chat id, in the environment set by `LANGFUSE_TRACING_ENVIRONMENT`, which must not be `production`.
+`.env.example` lists them. `EVAL_CONCURRENCY`, `EVAL_JUDGE_MODELS` and `EVAL_SIMULATED_USER_MODEL` are chosen per batch (see [A batch](#a-batch)). `EVAL_SIMULATED_USER_MODEL` is the simulated user's model. `EVAL_JUDGE_MODELS` is the judge panel: one or more models, comma-separated; spaces around a name are ignored, and an empty name or a model named twice stops the run. Each experiment records both, and a `comparability_hash` that matches only between runs graded the same way (see [Scores](#scores)). `EVAL_SIMULATED_USER_MODEL` must accept image input: the simulated user is shown the presented images. Each judge model must accept image input when a task has an `image` deliverable: each judge's verdict call holds the presented images (see [Judging](#judging)). Each of their calls is a Langfuse trace with user id `simulated-user` or `judge`, session id = the chat id, in the environment set by `LANGFUSE_TRACING_ENVIRONMENT`, which must not be `production`.
 
 Every simulated-user and judge call, including the answer-quality rating, sends `max_tokens` = `EVAL_MODEL_MAX_TOKENS` (a whole number, at least 1, default 16384) unless the call sets its own `max_tokens` or `max_completion_tokens`; a call that sets `max_completion_tokens` and no `max_tokens` is sent without `max_tokens`. Without a limit, OpenRouter reserves the model's whole output window against the account balance and refuses calls with HTTP 402 when the balance is low. A simulated-user reply cut off at that limit stops the play as `error`, naming the limit; a judge's verdict cut off at that limit makes that judge errored, naming the limit, and the play ends as `error` only when no judge ruled (see [Judging](#judging)); a cut-off answer-quality rating does not stop the play, and `answer_quality` is recorded as not rated.
 
@@ -311,6 +303,25 @@ The experiment's metadata holds the resolved configuration: the model id as `con
 After reading the base model and before the plays, the harness sends one short request for it to OpenRouter with its own `OPENROUTER_API_KEY` (not the app's key), retried as `EVAL_MODEL_RETRIES` says and, when rate-limited, as `EVAL_RATE_LIMIT_RETRIES` says, and names the experiment after the model named in the reply, recorded in the metadata as `served_model`, followed by ` (<variant>)` when the model's `eval.variant` is set; the base model must therefore be an OpenRouter model id. A floating alias such as `~anthropic/claude-opus-latest` resolves this way to the model it points to, such as `anthropic/claude-opus-5.5`, as it was when the run started. When that request fails, or its reply names no model or only the alias, the run stops before the experiment is created (exit 1). The models that served each play's calls are in each item's `provider_models`.
 
 A run plays each task once: Langfuse expects each dataset item to appear once per experiment (Langfuse issue #5855).
+
+## Debugging one run
+
+To debug, one run of one model can be started by hand, without `scripts/run-eval.py`:
+
+```sh
+HARNESS_COMMIT=$(git rev-parse HEAD) docker compose build eval
+git -C <configs repo checkout> archive <commit SHA> | docker compose run --rm -T --entrypoint sh \
+  -e EVAL_CONFIGS_REPO=<configs repo URL> -e EVAL_CONFIGS_COMMIT=<commit SHA> \
+  -e EVAL_CONFIGS_DIR=/configs-repo -e EVAL_MODEL=<model id> \
+  -e APP_IMAGE=<image> -e RUNNER_IMAGE=<image> [-e EVAL_CONCURRENCY=<n>] \
+  eval -c 'mkdir -p /configs-repo && tar -x -f - -C /configs-repo && exec weather-skills-eval run'
+```
+
+The configs repo files reach the run as a tar on stdin, which the container unpacks at `/configs-repo` before the harness starts, so it works with a remote Docker context, where a bind mount from this machine would not reach the daemon.
+
+With `EVAL_PULL_APP_IMAGE=true`, as `.env.example` sets it, the run pulls the app image before it starts. A run started this way reads every secret from `.env`, since only `scripts/run-eval.py` reads Secret Manager.
+
+`APP_IMAGE`, `RUNNER_IMAGE` and `EVAL_CONCURRENCY` are chosen per run with `-e`, as is `EVAL_BATCH`, optional. An empty or absent `EVAL_CONCURRENCY` means the harness's default. `EVAL_JUDGE_MODELS` and `EVAL_SIMULATED_USER_MODEL` are read from `.env` unless passed with `-e`.
 
 ## Development
 
