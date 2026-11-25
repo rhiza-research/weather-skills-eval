@@ -117,7 +117,6 @@ ANSWERS = (
 )
 # The non-secret settings .env.example sets that are not answers.
 SETTINGS = (
-    "EVAL_SECRETS_PROJECT",
     "LANGFUSE_BASE_URL",
     "LANGFUSE_TRACING_ENVIRONMENT",
     "EVAL_CONNECTION_KEYS",
@@ -149,10 +148,15 @@ IMAGE_SCRIPT = "/app/scripts/run-eval.py"
 BATCH_CONTAINER = "weather-skills-eval-batch"
 # Seconds docker stop waits for the batch to stop its runs before it kills it.
 STOP_TIMEOUT = "120"
-# A batch VM: created from this instance template, named this prefix and the time.
+# A batch VM: created from this instance template, named this prefix and the
+# time, in this zone and in PROJECT, whatever the member's default project.
 INSTANCE_TEMPLATE = "weather-skills-eval"
 VM_PREFIX = "weather-skills-eval-"
 VM_ZONE = "us-central1-a"
+# The project that holds the instance template, the batch VMs and the eval secrets.
+# Shared with the infrastructure Terraform, which creates the instance template,
+# the VM service account and the secrets there.
+PROJECT = "rhiza-shared"
 
 # The app image labels each run records.
 REVISION_LABEL = "org.opencontainers.image.revision"
@@ -286,9 +290,9 @@ def vm_commands(vm, values):
     pairs = delimiter.join(f"{metadata_key(name)}={value}" for name, value in values.items())
     return [
         ["gcloud", "compute", "instances", "create", vm, "--zone", VM_ZONE]
-        + ["--source-instance-template", INSTANCE_TEMPLATE],
+        + ["--project", PROJECT, "--source-instance-template", INSTANCE_TEMPLATE],
         ["gcloud", "compute", "instances", "add-metadata", vm, "--zone", VM_ZONE]
-        + ["--metadata", f"^{delimiter}^{pairs}"],
+        + ["--project", PROJECT, "--metadata", f"^{delimiter}^{pairs}"],
     ]
 
 
@@ -571,25 +575,21 @@ def run_secrets(connection_keys):
     return list(dict.fromkeys([*SECRETS, *(name for name in keys if name)]))
 
 
-def load_secrets(names, project, dotenv):
+def load_secrets(names, dotenv):
     """Puts each secret ``names`` lists into this process's environment: its
     value from the environment, else from ``dotenv``, when one sets it, else its
-    latest version from Secret Manager in ``project``. Returns ``names``; None,
+    latest version from Secret Manager in PROJECT. Returns ``names``; None,
     after printing why, when one cannot be read."""
-    project = (project or "").strip()
     for name in names:
         value = os.environ.get(name) or dotenv.get(name)
         if value:
             os.environ[name] = value
             continue
-        if not project:
-            print(f"Secret {name} is empty and EVAL_SECRETS_PROJECT is not set", flush=True)
-            return None
         try:
-            os.environ[name] = read_secret(project, secret_id(name))
+            os.environ[name] = read_secret(PROJECT, secret_id(name))
         except Exception as exc:
             print(
-                f"Secret {secret_id(name)} could not be read from project {project}: "
+                f"Secret {secret_id(name)} could not be read from project {PROJECT}: "
                 f"{type(exc).__name__}: {exc}",
                 flush=True,
             )
@@ -686,6 +686,7 @@ def launch(values, dotenv, given):
             default=prefill,
         ).unsafe_ask()
     if choice == "vm":
+        delete = f"gcloud compute instances delete {vm} --zone {VM_ZONE} --project {PROJECT}"
         for index, command in enumerate(gcloud):
             done = subprocess.run(command)
             if done.returncode != 0:
@@ -693,10 +694,10 @@ def launch(values, dotenv, given):
                 if index > 0:
                     # The VM exists and waits for metadata that will not come.
                     print(f"VM {vm} was created; delete it with:", flush=True)
-                    print(f"  gcloud compute instances delete {vm} --zone {VM_ZONE}", flush=True)
+                    print(f"  {delete}", flush=True)
                 return done.returncode
         print(f"VM {vm} runs the batch and deletes itself when the batch ends.", flush=True)
-        print(f"Stop it with: gcloud compute instances delete {vm} --zone {VM_ZONE}", flush=True)
+        print(f"Stop it with: {delete}", flush=True)
         return 0
     if choice == "docker":
         if batch_running():
@@ -704,7 +705,7 @@ def launch(values, dotenv, given):
             print(f"Stop it with: docker stop {BATCH_CONTAINER}", flush=True)
             return 1
         # Each secret is passed by name, so its value is never on a command line.
-        if load_secrets(secrets, values["EVAL_SECRETS_PROJECT"], _dotenv(dotenv)) is None:
+        if load_secrets(secrets, _dotenv(dotenv)) is None:
             return 1
         done = subprocess.run(docker)
         if done.returncode != 0:
@@ -925,7 +926,7 @@ def run_batch(values, folder, results):
     run`` of the eval service in the eval image this batch runs."""
     # Each secret is passed by name, so its value is never on a command line.
     secrets = run_secrets(values["EVAL_CONNECTION_KEYS"])
-    if load_secrets(secrets, values["EVAL_SECRETS_PROJECT"], {}) is None:
+    if load_secrets(secrets, {}) is None:
         return 1
     files = download_configs(values["EVAL_CONFIGS_REPO"], values["EVAL_CONFIGS_COMMIT"], folder)
     if files is None:
@@ -1312,7 +1313,6 @@ class FakeCommands:
 CONNECTION_KEYS = "https://openrouter.ai/api/v1=APP_OPENROUTER_API_KEY"
 # The settings of the tests' .env, by name.
 TEST_SETTINGS = {
-    "EVAL_SECRETS_PROJECT": "test-project",
     "LANGFUSE_BASE_URL": "https://us.cloud.langfuse.com",
     "LANGFUSE_TRACING_ENVIRONMENT": "eval",
     "EVAL_CONNECTION_KEYS": CONNECTION_KEYS,
@@ -1428,11 +1428,11 @@ def test_the_vm_launch_prints_every_command_and_runs_the_two_gcloud_commands(
     vm = "weather-skills-eval-test"
     assert create == [
         *("gcloud", "compute", "instances", "create", vm, "--zone", "us-central1-a"),
-        *("--source-instance-template", "weather-skills-eval"),
+        *("--project", "rhiza-shared", "--source-instance-template", "weather-skills-eval"),
     ]
     assert add[:-1] == [
         *("gcloud", "compute", "instances", "add-metadata", vm, "--zone", "us-central1-a"),
-        "--metadata",
+        *("--project", "rhiza-shared", "--metadata"),
     ]
     # Every batch value under its metadata key, split on a character no value holds.
     assert add[-1].startswith("^;^")
@@ -1444,7 +1444,8 @@ def test_the_vm_launch_prints_every_command_and_runs_the_two_gcloud_commands(
     assert "Estimated cost:" in out
     for command in (create, add, docker_command(BATCH, BATCH_SECRET_NAMES)):
         assert f"  {shlex.join(command)}\n" in out
-    assert f"gcloud compute instances delete {vm} --zone us-central1-a" in out
+    delete = f"gcloud compute instances delete {vm} --zone us-central1-a --project rhiza-shared"
+    assert f"Stop it with: {delete}\n" in out
 
 
 def test_a_failed_gcloud_command_stops_the_vm_launch(tmp_path, monkeypatch, capsys):
@@ -1457,6 +1458,18 @@ def test_a_failed_gcloud_command_stops_the_vm_launch(tmp_path, monkeypatch, caps
 
     assert commands.commands()[-1][:4] == create
     assert "Failed, exit 1: gcloud compute instances create" in capsys.readouterr().out
+
+
+def test_a_failed_add_metadata_prints_how_to_delete_the_created_vm(tmp_path, monkeypatch, capsys):
+    add = ["gcloud", "compute", "instances", "add-metadata"]
+    commands, _ = launch_setup(tmp_path, monkeypatch, DOTENV, outputs=[(add, 1, "")], choice="vm")
+
+    assert main() == 1
+
+    assert commands.commands()[-1][:4] == add
+    vm = "weather-skills-eval-test"
+    delete = f"gcloud compute instances delete {vm} --zone us-central1-a --project rhiza-shared"
+    assert f"VM {vm} was created; delete it with:\n  {delete}\n" in capsys.readouterr().out
 
 
 def test_without_judge_models_the_script_stops_before_asking_more(tmp_path, monkeypatch, capsys):
@@ -1529,7 +1542,7 @@ def test_a_local_launch_reads_empty_secrets_and_passes_each_by_name_only(
         *(f"--{metadata_key(name)}={value}" for name, value in BATCH.items()),
     ]
     empty = [name for name in BATCH_SECRET_NAMES if name not in given]
-    assert read == [("test-project", secret_id(name)) for name in empty]
+    assert read == [("rhiza-shared", secret_id(name)) for name in empty]
     for name in BATCH_SECRET_NAMES:
         assert os.environ[name] == given.get(name, f"value-of-{secret_id(name)}")
         assert docker[docker.index(name) - 1] == "-e"
@@ -1952,6 +1965,25 @@ def test_sigterm_stops_the_batch_with_the_results_so_far(tmp_path, monkeypatch, 
 
     assert capsys.readouterr().out.endswith("\nStopped. Results so far:\na run 1: exit 0\n")
     assert not Path(downloads[0][2]).exists()
+
+
+def test_the_batch_reads_an_empty_secret_from_rhiza_shared(tmp_path, monkeypatch):
+    _, argv, _ = background_setup(tmp_path, monkeypatch)
+    # Every other secret is set by background_setup, so it is not read.
+    monkeypatch.setenv("OPENROUTER_API_KEY", "")
+    read = []
+
+    def reader(project, secret):
+        read.append((project, secret))
+        return f"value-of-{secret}"
+
+    monkeypatch.setitem(globals(), "read_secret", reader)
+    monkeypatch.setattr(subprocess, "Popen", lambda command, **kwargs: FakeRun(""))
+
+    assert main(argv) == 0
+
+    assert read == [("rhiza-shared", secret_id("OPENROUTER_API_KEY"))]
+    assert os.environ["OPENROUTER_API_KEY"] == f"value-of-{secret_id('OPENROUTER_API_KEY')}"
 
 
 def test_the_configs_repo_files_are_downloaded_at_the_commit(tmp_path, monkeypatch, capsys):
