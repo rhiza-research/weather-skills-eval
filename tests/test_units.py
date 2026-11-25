@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -6,127 +7,17 @@ from fakes import display_image, display_page, tool_call
 from weather_skills_eval import runner
 from weather_skills_eval.app_client import highest_skill_versions, version_key, visible_text
 from weather_skills_eval.checks import ReplyFiles, reply_files
-from weather_skills_eval.config import DEFAULT_APP_PORT, ConfigError, pack_name, parse_config
+from weather_skills_eval.config import RunConfig, pack_name
 from weather_skills_eval.judge import JudgeRuling, PanelRuling
 from weather_skills_eval.runner import comparability_hash
 from weather_skills_eval.scoring import split_usage, trace_metrics
 from weather_skills_eval.settings import SettingsError, _number, _whole, load_settings
 from weather_skills_eval.tasks import TaskError, parse_task, parse_tasks
 
-BASE_ENV = {
-    "WEBUI_SECRET_KEY": "${S}",
-    "BOOTSTRAP_ADMIN_EMAIL": "eval@example.invalid",
-    "BOOTSTRAP_ADMIN_PASSWORD": "${P}",
-    "BOOTSTRAP_ADMIN_API_KEY": "${K}",
-}
-ENVIRON = {"S": "secret", "P": "password", "K": "sk-key"}
-
-
-def config(**overrides):
-    raw = {
-        "image": "img:tag",
-        "runner_image": "runner:tag",
-        "model": "m",
-        "dataset": "d",
-        "env": dict(BASE_ENV),
-    }
-    raw.update(overrides)
-    return raw
-
-
-def test_config_resolves_references_and_defaults_name():
-    result = parse_config(config(), default_name="prod", environ=ENVIRON)
-    assert result.name == "prod"
-    assert result.env["BOOTSTRAP_ADMIN_API_KEY"] == "sk-key"
-    assert result.api_key == "sk-key"
-    assert result.port == DEFAULT_APP_PORT
-
-
-def test_config_pull_defaults_to_true_and_accepts_booleans():
-    assert parse_config(config(), default_name="x", environ=ENVIRON).pull is True
-    assert parse_config(config(pull=True), default_name="x", environ=ENVIRON).pull is True
-    assert parse_config(config(pull=False), default_name="x", environ=ENVIRON).pull is False
-
-
-@pytest.mark.parametrize("value", ["no", "false", 0, 1, None])
-def test_config_pull_must_be_a_boolean(value):
-    with pytest.raises(ConfigError) as error:
-        parse_config(config(pull=value), default_name="x", environ=ENVIRON)
-    assert error.value.field == "pull"
-
-
-@pytest.mark.parametrize(
-    "value, variant",
-    [("reasoning_high", "reasoning_high"), ("  low  ", "low"), (None, ""), ("", ""), ("   ", "")],
-    ids=repr,
-)
-def test_config_variant_is_stripped_and_empty_when_null_or_blank(value, variant):
-    assert parse_config(config(variant=value), default_name="x", environ=ENVIRON).variant == variant
-
-
-def test_config_variant_defaults_to_empty():
-    assert parse_config(config(), default_name="x", environ=ENVIRON).variant == ""
-
-
-def test_config_variant_must_be_a_string():
-    with pytest.raises(ConfigError) as error:
-        parse_config(config(variant=3), default_name="x", environ=ENVIRON)
-    assert error.value.field == "variant"
-
-
-APP_IMAGE = "weather-skills-chat:40be9ee"
-
-
-def test_a_reference_resolves_from_the_environment_and_an_unset_or_empty_one_names_the_field():
-    # image, runner_image and every env value resolve references the same way.
-    environ = {**ENVIRON, "APP_IMAGE": APP_IMAGE, "APP_TAG": "40be9ee", "BLANK": ""}
-    for image in ("${APP_IMAGE}", "weather-skills-chat:${APP_TAG}", APP_IMAGE):
-        result = parse_config(config(image=image), default_name="x", environ=environ)
-        assert result.image == APP_IMAGE
-    for image, name in (
-        ("${MISSING}", "MISSING"),
-        ("weather-skills-chat:${MISSING}", "MISSING"),
-        ("${BLANK}", "BLANK"),
-        ("weather-skills-chat:${BLANK}", "BLANK"),
-    ):
-        with pytest.raises(ConfigError) as error:
-            parse_config(config(image=image), default_name="x", environ=environ)
-        assert error.value.field == "image"
-        assert f"${{{name}}}" in str(error.value)
-
-
-def test_config_requires_the_admin_api_key():
-    env = {k: v for k, v in BASE_ENV.items() if k != "BOOTSTRAP_ADMIN_API_KEY"}
-    with pytest.raises(ConfigError) as error:
-        parse_config(config(env=env), default_name="x", environ=ENVIRON)
-    assert error.value.field == "env.BOOTSTRAP_ADMIN_API_KEY"
-
-
-def test_config_rejects_secret_embedded_in_text():
-    raw = config(env={**BASE_ENV, "WEBUI_SECRET_KEY": "prefix-${S}"})
-    with pytest.raises(ConfigError) as error:
-        parse_config(raw, default_name="x", environ=ENVIRON)
-    assert error.value.field == "env.WEBUI_SECRET_KEY"
-
-
-def test_config_serializes_structured_values_as_json():
-    raw = config(
-        env={**BASE_ENV, "OPENAI_API_CONFIGS": {"0": {"model_call_tracing": "openrouter"}}}
-    )
-    result = parse_config(raw, default_name="x", environ=ENVIRON)
-    assert result.env["OPENAI_API_CONFIGS"] == '{"0": {"model_call_tracing": "openrouter"}}'
-
-
-def test_config_rejects_non_string_scalars():
-    raw = config(env={**BASE_ENV, "ENABLE_SIGNUP": False})
-    with pytest.raises(ConfigError) as error:
-        parse_config(raw, default_name="x", environ=ENVIRON)
-    assert error.value.field == "env.ENABLE_SIGNUP"
-
 
 def with_skill_packs(packs):
-    raw = config(env={**BASE_ENV, "SKILL_PACKS": packs})
-    return parse_config(raw, default_name="x", environ=ENVIRON)
+    text = packs if isinstance(packs, str) else json.dumps(packs)
+    return RunConfig("x", "img:tag", "runner:tag", "m", "d", {"SKILL_PACKS": text})
 
 
 def test_skill_packs_on_are_named_by_repository():
@@ -152,24 +43,7 @@ def test_skill_packs_on_are_named_by_repository():
 def test_pack_name_is_the_repository_name(git_url):
     assert pack_name(git_url) == "chc-skills"
     assert with_skill_packs([{"git_url": git_url}]).skill_packs_on == ["chc-skills"]
-    assert parse_config(config(), default_name="x", environ=ENVIRON).skill_packs_on == []
-
-
-@pytest.mark.parametrize(
-    "packs",
-    [
-        "not json",
-        {"git_url": "https://example.invalid/pack.git"},
-        ["https://example.invalid/pack.git"],
-        [{"ref": "main"}],
-        [{"git_url": ""}],
-        [{"git_url": "https://example.invalid/pack.git", "enabled_by_default": "no"}],
-    ],
-)
-def test_config_rejects_invalid_skill_packs(packs):
-    with pytest.raises(ConfigError) as error:
-        with_skill_packs(packs)
-    assert error.value.field == "env.SKILL_PACKS"
+    assert RunConfig("x", "img:tag", "runner:tag", "m", "d", {}).skill_packs_on == []
 
 
 def settings_env(**overrides):

@@ -2,6 +2,7 @@
 replies the app stores. No test reaches a live service."""
 
 import asyncio
+import copy
 import hashlib
 import html
 import io
@@ -184,24 +185,76 @@ class FakeApp:
                 "meta": {"manifest": {"kind": "skill", "skill_name": "fetch", "version": "2"}},
             },
         ]
+        # The env the app container was started with; the packs it lists
+        # come from it.
+        self.app_env: Callable[[], dict] = dict
+        # Each pack's state, by git_url: is_active and its skills.
+        self.pack_state: dict[str, dict] = {}
+        # Skills each pack holds when first listed.
+        self.skills = [
+            {"name": "plot", "tool_id": "skill_plot", "is_active": True, "enabled_by_default": True}
+        ]
+        # (route, pack id, tool id, body) of each skill state change.
+        self.skill_changes: list[tuple] = []
         self.transport = httpx.MockTransport(self._handle)
+
+    def _packs(self) -> list[dict]:
+        packs = []
+        for index, entry in enumerate(json.loads(self.app_env().get("SKILL_PACKS", "[]"))):
+            state = self.pack_state.setdefault(
+                entry["git_url"],
+                {"id": f"pack-{index}", "is_active": True, "skills": copy.deepcopy(self.skills)},
+            )
+            packs.append(
+                {
+                    "git_url": entry["git_url"],
+                    "git_ref": entry.get("ref"),
+                    "commit_sha": "1234567",
+                    **state,
+                }
+            )
+        return packs
+
+    def _skill_route(self, request: httpx.Request, path: str) -> httpx.Response | None:
+        """The platform admin's skill state routes; None for another path."""
+        match = re.fullmatch(
+            r"/api/v1/skills/([^/]+)(?:/skills/([^/]+))?/(toggle|enabled-by-default)", path
+        )
+        if not match:
+            return None
+        assert request.headers["x-organization-id"] == "platform"
+        pack_id, tool_id, route = match.groups()
+        body = json.loads(request.content) if request.content else None
+        self.skill_changes.append((route, pack_id, tool_id, body))
+        [state] = [s for s in self.pack_state.values() if s["id"] == pack_id]
+        if tool_id is None:
+            state["is_active"] = not state["is_active"]
+            return httpx.Response(200, json={})
+        [skill] = [s for s in state["skills"] if s["tool_id"] == tool_id]
+        if route == "toggle":
+            skill["is_active"] = not skill["is_active"]
+        else:
+            skill["enabled_by_default"] = body["enabled"]
+        return httpx.Response(200, json={})
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         assert request.headers["authorization"] == "Bearer sk-test-key"
         if path == "/api/v1/tool_summary":
-            return httpx.Response(200, json=self.tools)
+            # As the app, which leaves out the tools of skills switched off,
+            # or of a pack switched off.
+            off = {
+                skill["name"]
+                for state in self.pack_state.values()
+                for skill in state["skills"]
+                if not (skill["is_active"] and state["is_active"])
+            }
+            return httpx.Response(200, json=[t for t in self.tools if t["name"] not in off])
         if path == "/api/v1/skills/":
-            return httpx.Response(
-                200,
-                json=[
-                    {
-                        "git_url": "https://example.invalid/pack.git",
-                        "git_ref": "main",
-                        "commit_sha": "1234567",
-                    }
-                ],
-            )
+            return httpx.Response(200, json=self._packs())
+        changed = self._skill_route(request, path)
+        if changed is not None:
+            return changed
         if path == "/api/v1/models/model":
             model_id = request.url.params["id"]
             self.catalog_model_requests.append(model_id)

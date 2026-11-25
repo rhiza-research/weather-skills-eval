@@ -7,7 +7,6 @@ import io
 import json
 import random
 import tarfile
-import textwrap
 import threading
 from collections import Counter
 from datetime import UTC, datetime
@@ -52,7 +51,8 @@ from weather_skills_eval import runner as runner_module
 from weather_skills_eval import simulated_user as simulated_user_module
 from weather_skills_eval.app_client import ChatError
 from weather_skills_eval.checks import NOTHING_PRESENTED, Evidence, PresentedFile
-from weather_skills_eval.config import RUNNER_ENV, ConfigError
+from weather_skills_eval.config import RUNNER_ENV
+from weather_skills_eval.configs_repo import ConfigsRepoError
 from weather_skills_eval.instance import (
     APP_DATA_DIR,
     ARTIFACTS_SUBPATH,
@@ -99,34 +99,79 @@ ENVIRON = {
     "EVAL_JUDGE_MODELS": "openrouter/test/judge",
     "EVAL_DOCKER_NETWORK": "weather-skills-eval",
     "EVAL_TRACE_SETTLE_SECONDS": "1",
-    "APP_SECRET": "webui-secret",
+    "LANGFUSE_BASE_URL": "https://langfuse.invalid",
+    "APP_WEBUI_SECRET_KEY": "webui-secret",
     "APP_ADMIN_PASSWORD": "admin-password",
-    "APP_API_KEY": "sk-test-key",
+    "APP_ADMIN_API_KEY": "sk-test-key",
     "APP_OPENROUTER_KEY": "or-app",
+    "EVAL_ADMIN_EMAIL": "eval@example.invalid",
+    "EVAL_DATASET": "weather-tasks",
+    "APP_IMAGE": "ghcr.io/rhiza-research/weather-skills-chat:test",
+    "RUNNER_IMAGE": RUNNER_IMAGE,
+    "EVAL_CONFIGS_REPO": "https://github.com/rhiza-research/weather-skills-configs",
+    "EVAL_CONFIGS_COMMIT": "4d174dae" + "0" * 32,
+    "EVAL_CONNECTION_KEYS": "https://openrouter.ai/api/v1=APP_OPENROUTER_KEY",
 }
 
-CONFIG = textwrap.dedent(
-    """\
-    name: production-agent
-    image: ghcr.io/rhiza-research/weather-skills-chat:test
-    runner_image: ghcr.io/rhiza-research/weather-skills-sandbox-runner:src-171514bbb4e1
-    model: weather-agent
-    dataset: weather-tasks
-    env:
-      WEBUI_SECRET_KEY: ${APP_SECRET}
-      BOOTSTRAP_ADMIN_EMAIL: eval@example.invalid
-      BOOTSTRAP_ADMIN_PASSWORD: ${APP_ADMIN_PASSWORD}
-      BOOTSTRAP_ADMIN_API_KEY: ${APP_API_KEY}
-      OPENAI_API_BASE_URLS: https://openrouter.ai/api/v1
-      OPENAI_API_KEYS: ${APP_OPENROUTER_KEY}
-      OPENAI_API_CONFIGS:
-        "0":
-          prefix_id: open-router-
-      SKILL_PACKS:
-        - git_url: https://example.invalid/pack.git
-          ref: main
-    """
-)
+MODEL = "weather-agent"
+PACK_URL = "https://example.invalid/pack.git"
+PACK_REF = "a" * 40
+CHC_URL = "https://github.com/rhiza-research/chc-skills.git"
+OPENROUTER = "https://openrouter.ai/api/v1"
+SCHEMAS = ("model", "skill-packs", "connections", "settings")
+
+
+def pack(git_url=PACK_URL, *, enabled_by_default=True, is_active=True, skills=()):
+    """A skill-packs.yaml entry."""
+    return {
+        "git_url": git_url,
+        "ref": PACK_REF,
+        "enabled_by_default": enabled_by_default,
+        "is_active": is_active,
+        "skills": list(skills),
+    }
+
+
+def write_data(path: Path, key: str, value, version=1) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"schema_version": version, key: value}))
+
+
+class ConfigsRepo:
+    """A copy of the configs repo at one commit: one model by default, the
+    pack https://example.invalid/pack.git, the OpenRouter connection."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        for name in SCHEMAS:
+            path = root / "schemas" / f"{name}.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"x-schema-version": 1}))
+        self.model(MODEL)
+        self.packs([pack()])
+        write_data(
+            root / "connections.yaml", "connections", {OPENROUTER: {"prefix_id": "open-router-"}}
+        )
+        write_data(
+            root / "settings.yaml", "settings", {"TASK_MODEL": "", "TASK_MODEL_EXTERNAL": ""}
+        )
+
+    def model(self, model_id, variant=None) -> None:
+        entry = {
+            "id": model_id,
+            "base_model_id": "open-router-.anthropic/claude-haiku-5.5",
+            "name": model_id,
+            "meta": {},
+            "params": {},
+        }
+        path = self.root / "models" / f"{model_id}.yaml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"schema_version": 1, "model": entry, "eval": {"variant": variant}})
+        )
+
+    def packs(self, packs) -> None:
+        write_data(self.root / "skill-packs.yaml", "skill_packs", packs)
 
 
 def task(
@@ -202,22 +247,30 @@ class Harness:
         self.gateway = FakeGateway(items, self.models)
         self.container = container or FakeContainer(["running"])
         self.docker = FakeDocker(self.container, **docker_options)
-        self.config_path = tmp_path / "production-agent.yaml"
-        self.config_path.write_text(CONFIG)
+        self.repo = ConfigsRepo(tmp_path / "configs-repo")
+        self.model = MODEL
+        # Harness settings every run of this harness adds to ENVIRON.
+        self.settings: dict[str, str] = {}
+        # The app serves its catalog and packs from the env it was started with.
+        self.app.app_env = lambda: self.docker.run_calls[-1]["environment"]
         self.health_checks = 0
 
     def health(self, url):
         self.health_checks += 1
         return True
 
-    def run(self, health=None, config_path=None, stdin=None, rng=None, keep_order=True, **settings):
+    def run(self, health=None, rng=None, keep_order=True, **settings):
         """``settings`` are harness settings to add to ENVIRON. The tasks are
         played in the dataset's order unless ``rng`` is given, or with
         ``keep_order`` false, in the order of run's own random source."""
         return run(
-            config_path or self.config_path,
-            {**ENVIRON, **settings},
-            stdin=stdin,
+            {
+                **ENVIRON,
+                "EVAL_CONFIGS_DIR": str(self.repo.root),
+                "EVAL_MODEL": self.model,
+                **self.settings,
+                **settings,
+            },
             docker_client_factory=lambda: self.docker,
             gateway_factory=lambda settings: self.gateway,
             app_transport=self.app.transport,
@@ -266,9 +319,9 @@ def test_run_plays_every_task_into_one_experiment_and_removes_the_container(tmp_
     call = harness.docker.run_calls[0]
     assert call["network"] == "weather-skills-eval"
     assert call["environment"]["BOOTSTRAP_ADMIN_API_KEY"] == "sk-test-key"
-    assert call["environment"]["SKILL_PACKS"] == (
-        '[{"git_url": "https://example.invalid/pack.git", "ref": "main"}]'
-    )
+    assert json.loads(call["environment"]["SKILL_PACKS"]) == [
+        {"git_url": PACK_URL, "ref": PACK_REF, "enabled_by_default": True}
+    ]
     assert harness.container.removed
     assert harness.docker.runner.removed
     assert harness.docker.volume().removed
@@ -278,7 +331,8 @@ def test_run_plays_every_task_into_one_experiment_and_removes_the_container(tmp_
     assert harness.gateway.served_requests == ["anthropic/claude-haiku-5.5"]
     assert experiment["name"] == "anthropic/claude-haiku-5.5"
     assert experiment["metadata"]["served_model"] == "anthropic/claude-haiku-5.5"
-    assert experiment["metadata"]["config_name"] == "production-agent"
+    # A run's config name is its model id.
+    assert experiment["metadata"]["config_name"] == MODEL
     assert summary.experiment_name == "anthropic/claude-haiku-5.5"
     assert len(experiment["items"]) == 3
     for index in range(3):
@@ -356,21 +410,18 @@ def test_the_batch_is_recorded_in_the_experiment_metadata(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))
 
-    harness.run(EVAL_BATCH=" 2026-10-22T20:07:57Z ", EVAL_HARNESS_COMMIT="7f454f0")
+    harness.run(
+        EVAL_BATCH=" 2026-10-22T20:07:57Z ",
+        EVAL_HARNESS_COMMIT="7f454f0",
+        EVAL_APP_IMAGE_REVISION="8dd46ed4",
+        EVAL_APP_IMAGE_PR_NUMBER="42",
+    )
 
     metadata = harness.gateway.experiments[0]["metadata"]
     assert metadata["batch"] == "2026-10-22T20:07:57Z"
     assert metadata["harness_commit"] == "7f454f0"
-
-
-def test_config_read_from_stdin(tmp_path):
-    items = [task("t1", "rain forecast kenya")]
-    harness = Harness(tmp_path, items, reply_done_on(1))
-
-    harness.run(config_path=Path("-"), stdin=io.BytesIO(CONFIG.encode()))
-
-    assert harness.gateway.experiments[0]["metadata"]["config_name"] == "production-agent"
-    assert harness.scores()["goal_reached"] == 1.0
+    assert metadata["app_image_revision"] == "8dd46ed4"
+    assert metadata["app_image_pr_number"] == "42"
 
 
 def test_an_alias_names_the_experiment_after_the_model_it_points_to(tmp_path):
@@ -390,29 +441,16 @@ def test_an_alias_names_the_experiment_after_the_model_it_points_to(tmp_path):
     assert summary.experiment_name == "anthropic/claude-opus-5.5"
 
 
-NAME_LINE = "name: production-agent\n"
-
-
-def with_variant(line: str) -> str:
-    """CONFIG with ``line`` after its name."""
-    assert CONFIG.startswith(NAME_LINE)
-    return CONFIG.replace(NAME_LINE, NAME_LINE + line, 1)
-
-
 @pytest.mark.parametrize(
-    "variant_line, name",
-    [
-        ("variant: reasoning_high\n", "z-ai/glm-5.3 (reasoning_high)"),
-        ("", "z-ai/glm-5.3"),
-        ('variant: ""\n', "z-ai/glm-5.3"),
-    ],
-    ids=["set", "absent", "empty"],
+    "variant, name",
+    [("reasoning_high", "z-ai/glm-5.3 (reasoning_high)"), (None, "z-ai/glm-5.3")],
+    ids=["set", "null"],
 )
-def test_a_variant_is_appended_to_the_experiment_name(tmp_path, variant_line, name):
+def test_the_models_variant_is_appended_to_the_experiment_name(tmp_path, variant, name):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))
     harness.gateway.served = "z-ai/glm-5.3"
-    harness.config_path.write_text(with_variant(variant_line))
+    harness.repo.model(MODEL, variant=variant)
 
     summary = harness.run()
 
@@ -429,10 +467,10 @@ def test_the_cli_prints_a_cost_line_with_the_bare_model(tmp_path, monkeypatch, c
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))
     harness.gateway.served = "z-ai/glm-5.3"
-    harness.config_path.write_text(with_variant("variant: reasoning_high\n"))
+    harness.repo.model(MODEL, variant="reasoning_high")
     monkeypatch.setattr(cli, "run", lambda *args, **kwargs: harness.run())
 
-    assert cli.main(["run", str(harness.config_path)]) == 0
+    assert cli.main(["run"]) == 0
 
     lines = capsys.readouterr().out.splitlines()
     assert lines[-1].startswith(cli.COST_LINE)
@@ -457,9 +495,6 @@ def test_a_failed_served_model_request_stops_the_run_before_the_experiment(tmp_p
 def test_image_reference_is_pulled_and_recorded_resolved(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))
-    literal = "image: ghcr.io/rhiza-research/weather-skills-chat:test"
-    assert literal in CONFIG
-    harness.config_path.write_text(CONFIG.replace(literal, "image: ${APP_IMAGE}"))
     image = f"{APP_REPOSITORY}:40be9ee"
 
     harness.run(APP_IMAGE=image)
@@ -471,16 +506,61 @@ def test_image_reference_is_pulled_and_recorded_resolved(tmp_path):
     assert metadata["image_digest"] == f"{APP_REPOSITORY}@sha256:abc"
 
 
-def test_config_from_stdin_must_name_the_experiment(tmp_path):
+# The configs repo
+
+
+def test_the_app_runs_as_the_configs_commit_defines_it(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))
-    unnamed = CONFIG.replace("name: production-agent\n", "")
+    harness.repo.model("other-agent")
 
-    with pytest.raises(ConfigError) as error:
-        harness.run(config_path=Path("-"), stdin=io.BytesIO(unnamed.encode()))
+    harness.run()
 
-    assert error.value.field == "name"
-    assert harness.docker.run_calls == []
+    env = harness.docker.run_calls[0]["environment"]
+    # Every model at the commit, so references between them resolve in the app.
+    assert sorted(m["id"] for m in json.loads(env["CATALOG_MODELS"])) == ["other-agent", MODEL]
+    assert env["OPENAI_API_BASE_URLS"] == OPENROUTER
+    assert json.loads(env["OPENAI_API_CONFIGS"]) == {"0": {"prefix_id": "open-router-"}}
+    # The key of the variable EVAL_CONNECTION_KEYS names for the connection.
+    assert env["OPENAI_API_KEYS"] == ENVIRON["APP_OPENROUTER_KEY"]
+    assert env["TASK_MODEL"] == env["TASK_MODEL_EXTERNAL"] == ""
+    metadata = harness.gateway.experiments[0]["metadata"]
+    # The repo, the SHA, and the model id.
+    assert metadata["configs_repo"] == "https://github.com/rhiza-research/weather-skills-configs"
+    assert metadata["configs_commit"] == ENVIRON["EVAL_CONFIGS_COMMIT"]
+    assert metadata["catalog_model"] == MODEL
+
+
+def test_configs_of_another_schema_version_do_not_start_the_run(tmp_path):
+    for change in (
+        lambda root: write_data(root / "settings.yaml", "settings", {}, version=2),
+        lambda root: (root / "schemas" / "model.json").write_text('{"x-schema-version": 2}'),
+    ):
+        harness = Harness(tmp_path, [task("t1", "rain forecast kenya")], reply_done_on(1))
+        change(harness.repo.root)
+
+        with pytest.raises(ConfigsRepoError, match="version 2"):
+            harness.run()
+
+        assert harness.docker.pulled == []
+
+
+def test_skill_state_is_set_only_where_it_differs_from_the_commit(tmp_path):
+    harness = Harness(tmp_path, [task("t1", "rain forecast kenya")], reply_done_on(1))
+    plot = {"name": "plot", "is_active": False, "enabled_by_default": False}
+    harness.repo.packs([pack(is_active=False, skills=[plot]), pack(CHC_URL)])
+
+    harness.run()
+
+    # The first pack and its skill were toggled and set; the second matched.
+    assert harness.app.skill_changes == [
+        ("toggle", "pack-0", None, None),
+        ("toggle", "pack-0", "skill_plot", None),
+        ("enabled-by-default", "pack-0", "skill_plot", {"enabled": False}),
+    ]
+    assert harness.output()["outcome"] == "goal_reached"
+    # The chats get no tool of the skill switched off.
+    assert harness.app.completions[0]["tool_ids"] == ["fetch"]
 
 
 def test_goal_met_records_turns_cost_tokens_and_time(tmp_path):
@@ -1378,11 +1458,11 @@ def test_what_is_under_test_does_not_change_the_comparability_hash(tmp_path):
 
     def other_agent(harness):
         harness.app.base_model_id = "open-router-.anthropic/claude-opus-5.5"
-        harness.config_path.write_text(
-            CONFIG.replace(APP_IMAGE_LINE, f"image: {APP_REPOSITORY}:other")
-            .replace(RUNNER_IMAGE, f"{RUNNER_REPOSITORY}:other")
-            .replace("model: weather-agent", "model: other-agent")
+        harness.settings.update(
+            APP_IMAGE=f"{APP_REPOSITORY}:other", RUNNER_IMAGE=f"{RUNNER_REPOSITORY}:other"
         )
+        harness.repo.model("other-agent")
+        harness.model = "other-agent"
 
     second = run_metadata(tmp_path, change=other_agent)
 
@@ -2587,7 +2667,7 @@ def test_image_pull_failure_stops_the_run(tmp_path):
 def test_pull_false_runs_a_local_image_without_a_digest(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1), local=local_image())
-    harness.config_path.write_text(CONFIG + "pull: false\n")
+    harness.settings["EVAL_PULL_APP_IMAGE"] = "false"
 
     summary = harness.run()
 
@@ -2611,7 +2691,7 @@ def test_pull_false_records_the_local_image_repo_digest(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     local = local_image(["ghcr.io/other/mirror@sha256:111", f"{APP_REPOSITORY}@sha256:def"])
     harness = Harness(tmp_path, items, reply_done_on(1), local=local)
-    harness.config_path.write_text(CONFIG + "pull: false\n")
+    harness.settings["EVAL_PULL_APP_IMAGE"] = "false"
 
     harness.run()
 
@@ -2621,18 +2701,13 @@ def test_pull_false_records_the_local_image_repo_digest(tmp_path):
     assert metadata["image_id"] == "sha256:local"
 
 
-APP_IMAGE_LINE = "image: ghcr.io/rhiza-research/weather-skills-chat:test"
-
-
 def test_pull_false_records_the_pinned_digest(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     pinned = f"{APP_REPOSITORY}@sha256:second"
     local = local_image([f"{APP_REPOSITORY}@sha256:first", pinned])
     harness = Harness(tmp_path, items, reply_done_on(1), local=local)
-    config = CONFIG.replace(APP_IMAGE_LINE, f"image: {pinned}") + "pull: false\n"
-    harness.config_path.write_text(config)
 
-    harness.run()
+    harness.run(APP_IMAGE=pinned, EVAL_PULL_APP_IMAGE="false")
 
     assert harness.docker.looked_up == [pinned]
     metadata = harness.gateway.experiments[0]["metadata"]
@@ -2644,9 +2719,8 @@ def test_a_pulled_image_records_the_pinned_digest(tmp_path):
     pinned = f"{APP_REPOSITORY}@sha256:second"
     digests = [f"{APP_REPOSITORY}@sha256:first", pinned]
     harness = Harness(tmp_path, items, reply_done_on(1), image_digests=digests)
-    harness.config_path.write_text(CONFIG.replace(APP_IMAGE_LINE, f"image: {pinned}"))
 
-    harness.run()
+    harness.run(APP_IMAGE=pinned)
 
     assert harness.docker.pulled == [pinned, RUNNER_IMAGE]
     metadata = harness.gateway.experiments[0]["metadata"]
@@ -2656,7 +2730,7 @@ def test_a_pulled_image_records_the_pinned_digest(tmp_path):
 def test_pull_false_with_missing_image_stops_the_run(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1), local=None)
-    harness.config_path.write_text(CONFIG + "pull: false\n")
+    harness.settings["EVAL_PULL_APP_IMAGE"] = "false"
 
     with pytest.raises(AppStartError) as error:
         harness.run()
@@ -2678,7 +2752,7 @@ def test_pull_false_with_failing_image_lookup_stops_the_run(tmp_path):
         reply_done_on(1),
         get_error=docker.errors.APIError("daemon unavailable"),
     )
-    harness.config_path.write_text(CONFIG + "pull: false\n")
+    harness.settings["EVAL_PULL_APP_IMAGE"] = "false"
 
     with pytest.raises(AppStartError):
         harness.run()
@@ -2751,15 +2825,6 @@ def test_empty_dataset_does_not_start_the_run(tmp_path):
 
 # Skill packs a dataset needs
 
-PACKS_BLOCK = "  SKILL_PACKS:\n    - git_url: https://example.invalid/pack.git\n      ref: main\n"
-CHC_PACK = "    - git_url: https://github.com/rhiza-research/chc-skills.git\n"
-
-
-def with_skill_packs(block: str) -> str:
-    """CONFIG with its SKILL_PACKS replaced by ``block``."""
-    assert CONFIG.endswith(PACKS_BLOCK)
-    return CONFIG.removesuffix(PACKS_BLOCK) + block
-
 
 @pytest.mark.parametrize("metadata", [None, {}, {"skill_packs": []}])
 def test_dataset_needing_no_pack_plays_every_item(tmp_path, metadata):
@@ -2777,7 +2842,7 @@ def test_dataset_packs_that_the_config_turns_on_play_every_item(tmp_path):
     items = [task("t1", "rain forecast kenya"), task("t2", "weekly rain")]
     harness = Harness(tmp_path, items, reply_done_on(1))
     harness.gateway.dataset_metadata = {"skill_packs": ["chc-skills"]}
-    harness.config_path.write_text(CONFIG + CHC_PACK)
+    harness.repo.packs([pack(), pack(CHC_URL)])
 
     summary = harness.run()
 
@@ -2790,7 +2855,7 @@ def test_only_the_packs_the_config_does_not_turn_on_are_named(tmp_path):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))
     harness.gateway.dataset_metadata = {"skill_packs": ["chc-skills", "a-skills", "b-skills"]}
-    harness.config_path.write_text(CONFIG + CHC_PACK)
+    harness.repo.packs([pack(), pack(CHC_URL)])
 
     with pytest.raises(DatasetError) as error:
         harness.run()
@@ -2813,19 +2878,15 @@ def test_dataset_metadata_that_is_not_an_object_does_not_start_the_run(tmp_path)
 
 
 @pytest.mark.parametrize(
-    "config",
-    [
-        CONFIG + CHC_PACK + "      enabled_by_default: false\n",
-        CONFIG,
-        with_skill_packs(""),
-    ],
-    ids=["pack-off", "pack-not-listed", "skill-packs-unset"],
+    "packs",
+    [[pack(), pack(CHC_URL, enabled_by_default=False)], [pack()], []],
+    ids=["pack-off", "pack-not-listed", "no-packs"],
 )
-def test_dataset_pack_the_config_does_not_turn_on_does_not_start_the_run(tmp_path, config):
+def test_dataset_pack_the_commit_does_not_turn_on_does_not_start_the_run(tmp_path, packs):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))
     harness.gateway.dataset_metadata = {"skill_packs": ["chc-skills"]}
-    harness.config_path.write_text(config)
+    harness.repo.packs(packs)
 
     with pytest.raises(DatasetError):
         harness.run()
@@ -2841,28 +2902,6 @@ def test_bad_dataset_skill_packs_does_not_start_the_run(tmp_path):
 
     with pytest.raises(DatasetError):
         harness.run()
-    assert harness.docker.run_calls == []
-
-
-@pytest.mark.parametrize(
-    "packs",
-    [
-        '  SKILL_PACKS: "{}"\n',
-        "  SKILL_PACKS:\n    - ref: main\n",
-        "  SKILL_PACKS:\n    - git_url: https://example.invalid/pack.git\n"
-        '      enabled_by_default: "no"\n',
-    ],
-    ids=["not-a-list", "no-git-url", "enabled-not-boolean"],
-)
-def test_bad_skill_packs_config_does_not_start_the_run(tmp_path, packs):
-    items = [task("t1", "rain forecast kenya")]
-    harness = Harness(tmp_path, items, reply_done_on(1))
-    harness.config_path.write_text(with_skill_packs(packs))
-
-    with pytest.raises(ConfigError) as error:
-        harness.run()
-
-    assert error.value.field == "env.SKILL_PACKS"
     assert harness.docker.run_calls == []
 
 
@@ -2900,58 +2939,26 @@ def test_app_never_healthy_stops_the_run_with_logs(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "edit, field",
+    "setting, value",
     [
-        (
-            lambda text: text.replace(
-                "image: ghcr.io/rhiza-research/weather-skills-chat:test\n", ""
-            ),
-            "image",
-        ),
-        (
-            lambda text: text.replace("${APP_OPENROUTER_KEY}", "sk-or-literal"),
-            "env.OPENAI_API_KEYS",
-        ),
-        (lambda text: text + "replicas: 2\n", "replicas"),
-        (lambda text: text + 'pull: "no"\n', "pull"),
-        (lambda text: text.replace(RUNNER_IMAGE, '""'), "runner_image"),
-        (lambda text: text.replace(RUNNER_IMAGE, "${UNSET_RUNNER}"), "runner_image"),
-        (lambda text: text + "variant: 3\n", "variant"),
+        ("APP_IMAGE", ""),
+        ("EVAL_DATASET", ""),
+        ("APP_ADMIN_API_KEY", " "),
     ],
 )
-def test_bad_config_does_not_start_the_run(tmp_path, edit, field):
+def test_a_missing_or_bad_eval_setting_does_not_start_the_run(tmp_path, setting, value):
     items = [task("t1", "rain forecast kenya")]
     harness = Harness(tmp_path, items, reply_done_on(1))
-    harness.config_path.write_text(edit(CONFIG))
 
-    with pytest.raises(ConfigError) as error:
-        harness.run()
+    with pytest.raises(SettingsError, match=setting):
+        harness.run(**{setting: value})
 
-    assert error.value.field == field
     assert harness.docker.run_calls == []
     assert harness.gateway.experiments == []
     assert harness.docker.pulled == []
 
 
 # The sandbox runner
-
-
-def with_env(text: str, block: str) -> str:
-    """CONFIG with ``block`` added to its env, before SKILL_PACKS."""
-    return text.replace("  SKILL_PACKS:\n", block + "  SKILL_PACKS:\n")
-
-
-def test_config_setting_a_runner_variable_does_not_start_the_run(tmp_path):
-    items = [task("t1", "rain forecast kenya")]
-    harness = Harness(tmp_path, items, reply_done_on(1))
-    name = RUNNER_ENV[0]
-    harness.config_path.write_text(with_env(CONFIG, f'  {name}: "x"\n'))
-
-    with pytest.raises(ConfigError) as error:
-        harness.run()
-
-    assert error.value.field == f"env.{name}"
-    assert harness.docker.pulled == []
 
 
 def archive_files(data: bytes) -> dict[str, bytes]:
@@ -3062,7 +3069,7 @@ def test_run_starts_the_runner_and_its_volume_before_the_app(tmp_path):
     assert env["BOOTSTRAP_ADMIN_API_KEY"] == "sk-test-key"
     # The token is not recorded.
     metadata = harness.gateway.experiments[0]["metadata"]
-    # The harness adds exactly the variables a configuration may not set.
+    # Only the sandbox runner variables are left out of the recorded names.
     assert set(env) - set(metadata["env_var_names"].split(",")) == set(RUNNER_ENV)
     assert token not in json.dumps(metadata)
     assert "SKILL_K8S_BIND_TOKEN" not in metadata["env_var_names"]
@@ -3129,7 +3136,7 @@ def test_runner_image_pull_failure_stops_the_run_before_the_app(tmp_path):
         local=local_image(),
         runner_pull_error=docker.errors.ImageNotFound("manifest unknown"),
     )
-    harness.config_path.write_text(CONFIG + "pull: false\n")
+    harness.settings["EVAL_PULL_APP_IMAGE"] = "false"
 
     with pytest.raises(RunnerStartError):
         harness.run()

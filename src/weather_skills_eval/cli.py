@@ -1,4 +1,5 @@
-"""``weather-skills-eval run <config>``; ``run -`` reads the configuration from stdin.
+"""``weather-skills-eval run`` runs one model of a configs repo commit, as its
+environment describes it.
 
 Exit codes:
 
@@ -6,17 +7,20 @@ Exit codes:
   were not scored because the sandbox runner restarted during them; the
   summary gives their number.
 - 1: the run failed for any other reason.
-- 2: the run did not start: a harness setting, the configuration file, the
-  dataset or a dataset item is invalid, the dataset is missing, empty or
+- 2: the run did not start: a harness setting is invalid, a configs repo
+  file cannot be read or parsed or is of another schema version, a connection at the
+  commit has no key, the dataset or a dataset item is
+  invalid, the dataset is missing, empty or
   could not be read from Langfuse (any error, a Langfuse error included), or
-  the dataset needs a skill pack the configuration does not turn on.
+  the dataset needs a skill pack the configs repo commit does not turn on.
 - 3: the app or the sandbox runner did not start (an app image without the
   sandbox emulator, image pull, a pulled image with no digest for its
   repository, image not on the Docker host, container start, or /health), the runner was not running steadily by the start
   timeout before a task, or after the last task when no task waited for it
   after it was lost, the runner was found exited with code 0, dead,
   disappeared or unreadable before or after a task, or Docker failed.
-- 4: the app failed while the harness read its catalog model, tools and
+- 4: the app's skill state could not be made to match the configs repo, or
+  the app failed while the harness read its catalog model, tools and
   skill packs, or reported no base model for the catalog model, or, after
   the dataset was read, a network error (an httpx error, such as a
   connection error or timeout) reaching the app or Langfuse stopped the run.
@@ -42,14 +46,13 @@ import os
 import signal
 import sys
 import warnings
-from pathlib import Path
 
 import docker.errors
 import httpx
 from langfuse.api.core.api_error import ApiError as LangfuseApiError
 
 from .app_client import ChatError
-from .config import ConfigError
+from .configs_repo import ConfigsRepoError, SkillStateError
 from .instance import AppStartError, RunnerStartError
 from .langfuse_gateway import ExperimentNotFound, LangfuseRuns
 from .runner import DatasetError, run
@@ -103,8 +106,8 @@ def keep_runs_off_langwatch() -> None:
     Scenario starts. With a key, Scenario posts every run event, transcripts
     included, to LangWatch and exports its spans there; the harness records
     runs only to Langfuse. Scenario has no setting that turns either off, skips
-    both when it finds no key, and reads the key ignoring case. Configs still
-    resolve ``${LANGWATCH_API_KEY}`` from the copy ``main`` takes first."""
+    both when it finds no key, and reads the key ignoring case. The run still
+    gets the key in the copy of the environment ``main`` takes first."""
     for name in list(os.environ):
         if name.upper() == "LANGWATCH_API_KEY":
             del os.environ[name]
@@ -207,11 +210,8 @@ def main(
 ) -> int:
     parser = argparse.ArgumentParser(prog="weather-skills-eval")
     commands = parser.add_subparsers(dest="command", required=True)
-    run_parser = commands.add_parser(
-        "run", help="Play every task in the dataset against one configuration"
-    )
-    run_parser.add_argument(
-        "config", type=Path, help="Configuration file (YAML), or - to read it from stdin"
+    commands.add_parser(
+        "run", help="Play every task in the dataset against one model, as the environment says"
     )
     delete_parser = commands.add_parser("delete", help="Delete every trace of one run")
     delete_parser.add_argument(
@@ -232,9 +232,11 @@ def main(
 
     try:
         with log_to_stderr():
-            summary = run(args.config, environ, docker_client_factory=docker_client_factory)
-    except (SettingsError, ConfigError, TaskError, DatasetError) as exc:
+            summary = run(environ, docker_client_factory=docker_client_factory)
+    except (SettingsError, ConfigsRepoError, TaskError, DatasetError) as exc:
         return _fail(EXIT_NOT_STARTED, f"Run not started: {exc}")
+    except SkillStateError as exc:
+        return _fail(EXIT_APP_FAILED, f"Run stopped, the app's skill state: {exc}")
     except RunnerStartError as exc:
         return _fail(EXIT_APP_NOT_STARTED, f"Run stopped, the sandbox runner did not start: {exc}")
     except AppStartError as exc:
