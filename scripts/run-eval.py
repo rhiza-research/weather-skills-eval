@@ -687,6 +687,10 @@ def launch(values, dotenv, given):
         ).unsafe_ask()
     if choice == "vm":
         delete = f"gcloud compute instances delete {vm} --zone {VM_ZONE} --project {PROJECT}"
+        output = (
+            f"gcloud compute instances get-serial-port-output {vm} --zone {VM_ZONE} "
+            f"--project {PROJECT}"
+        )
         for index, command in enumerate(gcloud):
             done = subprocess.run(command)
             if done.returncode != 0:
@@ -697,6 +701,7 @@ def launch(values, dotenv, given):
                     print(f"  {delete}", flush=True)
                 return done.returncode
         print(f"VM {vm} runs the batch and deletes itself when the batch ends.", flush=True)
+        print(f"View its output with: {output}", flush=True)
         print(f"Stop it with: {delete}", flush=True)
         return 0
     if choice == "docker":
@@ -1444,8 +1449,12 @@ def test_the_vm_launch_prints_every_command_and_runs_the_two_gcloud_commands(
     assert "Estimated cost:" in out
     for command in (create, add, docker_command(BATCH, BATCH_SECRET_NAMES)):
         assert f"  {shlex.join(command)}\n" in out
+    output = (
+        f"gcloud compute instances get-serial-port-output {vm} --zone us-central1-a "
+        "--project rhiza-shared"
+    )
     delete = f"gcloud compute instances delete {vm} --zone us-central1-a --project rhiza-shared"
-    assert f"Stop it with: {delete}\n" in out
+    assert out.endswith(f"View its output with: {output}\nStop it with: {delete}\n")
 
 
 def test_a_failed_gcloud_command_stops_the_vm_launch(tmp_path, monkeypatch, capsys):
