@@ -62,7 +62,7 @@ To change a default, set its value in `.env`, such as `APP_IMAGE`, `RUNNER_IMAGE
 {"weather-agent-opus": {"served_model": "anthropic/claude-opus-5.5", "agent_cost_usd": 1.23}}
 ```
 
-`scripts/run-eval.py` is the only program that reads or writes it. The default mode reads the `.costs.json` at the repository root of the checkout it runs in, and never writes it. Background mode writes it: when a run ends, it saves the agent cost on the run's cost line (see [Run summary](#run-summary)) as that model's latest cost. Background mode runs in the batch container, which is started with `--rm`, so the file it writes is lost when the container is removed. The `.costs.json` in your checkout therefore holds only what you write there. Only a run that prints its model's cost line updates the saved cost, and a run prints its cost line only when it exits 0. A failed run leaves that model's saved cost as it was.
+`scripts/run-eval.py` is the only program that reads or writes it. Background mode writes it in the batch container: when a run ends, it saves the agent cost on the run's cost line (see [Run summary](#run-summary)) as that model's latest cost. The default mode reads the `.costs.json` at the repository root of the checkout it runs in. Only a run that prints its model's cost line updates the saved cost, and a run prints its cost line only when it exits 0. A failed run leaves that model's saved cost as it was.
 
 The estimate for the batch is printed as one line, with the agents' cost and the judges' and simulated user's cost apart:
 
@@ -74,7 +74,7 @@ Estimated cost: $4.29 (agents $3.00, judges and simulated user $1.29)
 - Judges and simulated user, per run of a model: each picked judge model's price times 102,000 input and 14,000 output tokens, plus the simulated user model's price times 48,000 input and 15,000 output tokens, token counts measured over the 2026-10-22 runs. This is multiplied by the number of picked models and the repetitions. The prices are `pricing.prompt` and `pricing.completion` (USD per token) from OpenRouter's public models list, `https://openrouter.ai/api/v1/models`, read without a key, for the model name without `openrouter/`.
 - A picked model with no saved cost is left out of the total and named on `Agent cost unknown, not counted: <model ids>`; a judge or simulated user model the list does not price, or prices as absent, unparsable or negative, is left out and named on `No OpenRouter price, not counted: <models>`.
 
-A `.costs.json` that does not exist, as in a fresh checkout, counts as no saved cost: the estimate is printed, and every picked model is named on the `Agent cost unknown, not counted: <model ids>` line. A `.costs.json` that cannot be read, or a models list that cannot be fetched, prints `Cost estimate unavailable: <reason>` and the script goes on; the estimate never stops a batch. A cost line is not saved into a `.costs.json` that cannot be read, and a failed write prints `Cost not saved: .costs.json could not be written: <reason>`.
+With a `.costs.json` that does not exist, the estimate is printed and every picked model is named on the `Agent cost unknown, not counted: <model ids>` line. A `.costs.json` that cannot be read, or a models list that cannot be fetched, prints `Cost estimate unavailable: <reason>` and the script goes on; the estimate never stops a batch. A cost line is not saved into a `.costs.json` that cannot be read, and a failed write prints `Cost not saved: .costs.json could not be written: <reason>`.
 
 ## Following a batch
 
