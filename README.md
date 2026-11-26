@@ -62,7 +62,7 @@ To change a default, set its value in `.env`, such as `APP_IMAGE`, `RUNNER_IMAGE
 {"weather-agent-opus": {"served_model": "anthropic/claude-opus-5.5", "agent_cost_usd": 1.23}}
 ```
 
-`scripts/run-eval.py` is the only program that reads or writes it. Background mode writes it in the batch container: when a run ends, it saves the agent cost on the run's cost line (see [Run summary](#run-summary)) as that model's latest cost. The default mode reads the `.costs.json` at the repository root of the checkout it runs in. Only a run that prints its model's cost line updates the saved cost, and a run prints its cost line only when it exits 0. A failed run leaves that model's saved cost as it was.
+`scripts/run-eval.py` is the only program that reads or writes it. When a run ends, it saves the agent cost on the run's cost line (see [Run summary](#run-summary)) as that model's latest cost. Only a run that prints its model's cost line updates the saved cost, and a run prints its cost line only when it exits 0. A failed run leaves that model's saved cost as it was.
 
 The estimate for the batch is printed as one line, with the agents' cost and the judges' and simulated user's cost apart:
 
