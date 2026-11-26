@@ -503,6 +503,22 @@ def test_presented_file_missing_from_the_listing_is_unlisted():
     assert evidence.unlisted == ["maps/rain.png"]
 
 
+def test_provenance_is_read_from_the_endpoint_when_the_listing_lacks_it():
+    detail = {"crumbs": [], "branches": [{"label": None, "steps": [], "crumbs": []}]}
+
+    def handler(request):
+        if request.url.path.endswith("/artifacts/provenance"):
+            assert request.url.params["path"] == "out.zarr"
+            return httpx.Response(200, json=detail)
+        return httpx.Response(200, json=[{"path": "out.zarr", "kind": "zarr", "provenance": []}])
+
+    evidence = asyncio.run(
+        collect_evidence(client(handler), "c1", presenting("out.zarr"), ["zarr"])
+    )
+    assert evidence.problem is None
+    assert evidence.files[0].provenance == detail
+
+
 @pytest.mark.parametrize("detail", ["{}", {"branches": []}])
 def test_provenance_detail_must_be_an_object(detail):
     entry = {"path": "out.zarr", "kind": "zarr", "provenance_detail": detail}
