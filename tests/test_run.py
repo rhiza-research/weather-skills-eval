@@ -1664,7 +1664,11 @@ def test_evidence_with_a_problem_is_not_read_again_until_a_new_reply_presents_fi
     harness.run()
 
     # Read for the user after reply 2, reused after reply 3, and read for the judge.
-    read_map = [("/artifacts", None), ("/artifacts/content", "maps/rain.png")]
+    read_map = [
+        ("/artifacts", None),
+        ("/artifacts/content", "maps/rain.png"),
+        ("/artifacts/provenance", "maps/rain.png"),
+    ]
     assert harness.app.file_requests == read_map * 2
     assert len(harness.models.user_calls()) == 3
 

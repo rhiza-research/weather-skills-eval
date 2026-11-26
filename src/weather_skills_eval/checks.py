@@ -389,6 +389,12 @@ async def collect_evidence(
                     unreadable = unreadable or f"{path} could not be read: {exc}"
                 else:
                     notes.append(f"it could not be read: {exc}")
+        if "provenance_detail" not in entry and _needs_provenance(entry, path):
+            # The listing carries only crumbs; the app serves each file's branches apart.
+            try:
+                entry["provenance_detail"] = await app.artifact_provenance(chat_id, path)
+            except ChatError:
+                pass
         provenance = entry["provenance_detail"] if _has_provenance(entry) else None
         if provenance is None:
             if path in blocks and _needs_provenance(entry, path):

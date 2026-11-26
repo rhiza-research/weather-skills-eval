@@ -148,6 +148,10 @@ class AppClient:
     async def artifacts(self, chat_id: str) -> list[dict]:
         return await self._json("GET", f"/api/v1/chats/{chat_id}/artifacts", list)
 
+    async def artifact_provenance(self, chat_id: str, path: str) -> object:
+        url = f"/api/v1/chats/{chat_id}/artifacts/provenance"
+        return await self._json("GET", url, object, params={"path": path})
+
     async def artifact_content(self, chat_id: str, path: str) -> bytes:
         try:
             response = await self._http.get(
